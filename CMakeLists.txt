@@ -157,12 +157,12 @@ option(PARSEC_DIST_PRIORITIES
   "Favor the communications that unlock the most prioritary tasks" ON)
 option(PARSEC_DIST_COLLECTIVES
   "Use optimized asynchronous operations where collective communication pattern is detected" ON)
-set   (PARSEC_DIST_SHORT_LIMIT 1 CACHE STRING
+set   (PARSEC_DIST_SHORT_LIMIT 0 CACHE STRING
   "Use the short protocol (no flow control) for messages smaller than the limit in KB. Performs better if smaller than the MTU")
 
 ### GPU engine parameters
 option(PARSEC_GPU_WITH_CUDA
-  "Enable GPU support using CUDA kernels" ON)
+  "Enable GPU support using CUDA kernels" OFF)
 option(PARSEC_GPU_CUDA_ALLOC_PER_TILE
   "Tile based allocation engine for GPU memory (instead of internal management
   of a complete allocation)" OFF)
