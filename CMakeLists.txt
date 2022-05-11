@@ -157,7 +157,7 @@ option(PARSEC_DIST_PRIORITIES
   "Favor the communications that unlock the most prioritary tasks" ON)
 option(PARSEC_DIST_COLLECTIVES
   "Use optimized asynchronous operations where collective communication pattern is detected" ON)
-set   (PARSEC_DIST_SHORT_LIMIT 1 CACHE STRING
+set   (PARSEC_DIST_SHORT_LIMIT 0 CACHE STRING
   "Use the short protocol (no flow control) for messages smaller than the limit in KB. Performs better if smaller than the MTU")
 
 ### GPU engine parameters
@@ -676,7 +676,7 @@ int main(int argc, char *argv[]) {
     return 0;
     }" MPI_AND_HWLOC_COMPATIBLE)
         if(NOT MPI_AND_HWLOC_COMPATIBLE)
-            message(FATAL_ERROR "The hwloc CMake found and the one used by MPI are incompatible!\n  Make sure you use the same hwloc used to compile your MPI library\n  The test failed with the following outputs:\n${RUN_OUTPUT}")
+            #message(FATAL_ERROR "The hwloc CMake found and the one used by MPI are incompatible!\n  Make sure you use the same hwloc used to compile your MPI library\n  The test failed with the following outputs:\n${RUN_OUTPUT}")
         endif(NOT MPI_AND_HWLOC_COMPATIBLE)
         cmake_pop_check_state()
     endif(MPI_C_FOUND AND NOT CMAKE_CROSSCOMPILING)
