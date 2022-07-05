@@ -1,0 +1,105 @@
+diff --git a/parsec/arena.c b/parsec/arena.c
+index 378c38f..805947e 100644
+--- a/parsec/arena.c
++++ b/parsec/arena.c
+@@ -55,6 +55,12 @@ extern int arena_memory_used_key, arena_memory_unused_key;
+ size_t parsec_arena_max_allocated_memory = SIZE_MAX;  /* unlimited */
+ size_t parsec_arena_max_cached_memory    = 256*1024*1024; /* limited to 256MB */
+ 
++static void parsec_arena_release_default(parsec_data_copy_t* copy);
++
++static parsec_data_copy_t *parsec_arena_get_copy_default(parsec_arena_t *arena,
++                                          size_t count, int device,
++                                          parsec_datatype_t dtt);
++
+ 
+ int parsec_arena_construct_ex(parsec_arena_t* arena,
+                              size_t elem_size,
+@@ -83,6 +89,8 @@ int parsec_arena_construct_ex(parsec_arena_t* arena,
+     arena->max_released = (max_cached_memory / elem_size > (size_t)INT32_MAX)? INT32_MAX: max_cached_memory / elem_size;
+     arena->data_malloc  = parsec_data_allocate;
+     arena->data_free    = parsec_data_free;
++    arena->arena_get_copy    = parsec_arena_get_copy_default; 
++    arena->arena_release    = parsec_arena_release_default; 
+     return PARSEC_SUCCESS;
+ }
+ 
+@@ -131,7 +139,7 @@ parsec_arena_get_chunk( parsec_arena_t *arena, size_t size, parsec_data_allocate
+             (void)parsec_atomic_fetch_dec_int32(&arena->released);
+     }
+     else {
+-        if(arena->max_used != INT32_MAX) {
++        if(arena->max_used != INT32_MAX) _default{
+             int32_t current = parsec_atomic_fetch_inc_int32(&arena->used) + 1;
+             if(current > arena->max_used) {
+                 (void)parsec_atomic_fetch_dec_int32(&arena->used);
+@@ -176,7 +184,7 @@ parsec_arena_release_chunk(parsec_arena_t* arena,
+     arena->data_free(chunk);
+ }
+ 
+-parsec_data_copy_t *parsec_arena_get_copy(parsec_arena_t *arena,
++parsec_data_copy_t *parsec_arena_get_copy_default(parsec_arena_t *arena,
+                                           size_t count, int device,
+                                           parsec_datatype_t dtt)
+ {
+@@ -244,7 +252,7 @@ parsec_data_copy_t *parsec_arena_get_copy(parsec_arena_t *arena,
+     return copy;
+ }
+ 
+-void parsec_arena_release(parsec_data_copy_t* copy)
++void parsec_arena_release_default(parsec_data_copy_t* copy)
+ {
+     parsec_data_t *data;
+     parsec_arena_chunk_t *chunk;
+diff --git a/parsec/arena.h b/parsec/arena.h
+index 66a0005..ad90ff5 100644
+--- a/parsec/arena.h
++++ b/parsec/arena.h
+@@ -39,6 +39,11 @@ extern size_t parsec_arena_max_cached_memory;
+ #define PARSEC_ALIGN_PTR(x,a,t) ((t)PARSEC_ALIGN((uintptr_t)x, a, uintptr_t))
+ #define PARSEC_ALIGN_PAD_AMOUNT(x,s) ((~((uintptr_t)(x))+1) & ((uintptr_t)(s)-1))
+ 
++typedef parsec_data_copy_t* (*parsec_arena_get_copy_t)(parsec_arena_t *arena,
++                                          size_t count, int device,
++                                          parsec_datatype_t dtt);
++typedef void (*parsec_arena_release_t)(parsec_data_copy_t* ptr);
++
+ /**
+  * A parsec_arena_s is a structure that manages temporary memory
+  * areas passed to the user code by the runtime engine.
+@@ -62,6 +67,8 @@ struct parsec_arena_s {
+      */
+     parsec_data_allocate_t data_malloc;
+     parsec_data_free_t     data_free;
++    parsec_arena_get_copy_t arena_get_copy;
++    parsec_arena_release_t arena_release;
+ };
+ PARSEC_DECLSPEC PARSEC_OBJ_CLASS_DECLARATION(parsec_arena_t);
+ 
+@@ -116,10 +123,23 @@ int parsec_arena_construct_ex(parsec_arena_t* arena,
+  * should therefore be manipulated using PARSEC_OBJ_RELEASE.
+  */
+ 
+-parsec_data_copy_t *parsec_arena_get_copy(parsec_arena_t *arena,
++static inline parsec_data_copy_t *parsec_arena_get_copy(parsec_arena_t *arena,
+                                           size_t count, int device,
+-                                          parsec_datatype_t dtt);
+-void parsec_arena_release(parsec_data_copy_t* ptr);
++                                          parsec_datatype_t dtt) {
++    return arena->arena_get_copy(arena, count, device, dtt);
++}
++
++static inline void parsec_arena_release(parsec_data_copy_t* copy) {
++    parsec_data_t *data;
++    parsec_arena_chunk_t *chunk;
++    parsec_arena_t* arena;
++
++    data  = copy->original;
++    chunk = copy->arena_chunk;
++    arena = chunk->origin;
++
++    arena->arena_release( copy );
++}
+ 
+ END_C_DECLS
+ 
