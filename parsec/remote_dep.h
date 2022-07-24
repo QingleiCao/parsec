@@ -393,7 +393,7 @@ typedef struct {
 } parsec_profile_remote_dep_mpi_info_t; // 32 bytes
 
 
-#ifdef PARSEC_PROF_TRACE
+#if 0
 extern int MPI_Activate_sk, MPI_Activate_ek;
 extern int MPI_Data_ctl_sk, MPI_Data_ctl_ek;
 extern int MPI_Data_plds_sk, MPI_Data_plds_ek;
