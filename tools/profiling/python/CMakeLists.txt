@@ -4,7 +4,7 @@ if( NOT BUILD_SHARED_LIBS )
   return()
 endif( NOT BUILD_SHARED_LIBS )
 
-FIND_PACKAGE(Python COMPONENTS Interpreter Development
+find_package(Python COMPONENTS Interpreter Development
              QUIET)
 
 if( NOT Python_Development_FOUND )
@@ -12,6 +12,9 @@ if( NOT Python_Development_FOUND )
   set(PARSEC_PYTHON_TOOLS OFF CACHE BOOL "True iff Python tools are enabled in PaRSEC")
   return()
 endif( NOT Python_Development_FOUND )
+
+# This is the path of site-packages
+set(PYTHON_SITE_PACKAGES "${Python_SITELIB}")
 
 # Python support for profiling (requires Cython 0.21.2)
 find_package(Cython 0.21.2)
