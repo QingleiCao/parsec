@@ -2,7 +2,13 @@
 # Check if there is support for 128 types
 #
 include(CheckTypeSize)
+
+# Make sure the passed flag is not polluted when CHECK_TYPE_SIZE
+message(STATUS "CMAKE_REQUIRED_FLAGS before CHECK_TYPE_SIZE: ${CMAKE_REQUIRED_FLAGS}")
+cmake_push_check_state(RESET)
 CHECK_TYPE_SIZE( __int128_t INT128 )
+cmake_pop_check_state()
+
 option(PARSEC_ENABLE_INT128 "Allow int128 support if supported by the compiler/architecture" ON)
 if(HAVE_INT128 AND PARSEC_ENABLE_INT128 )
   set(PARSEC_HAVE_INT128 1)
