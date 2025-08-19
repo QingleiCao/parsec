@@ -150,7 +150,7 @@ mark_as_advanced(MPI_HWLOC_COMPAT_CHECK)
 set(PARSEC_MAX_LOCAL_COUNT 20 CACHE STRING "Number of local variables for tasks (default 20)")
 set(PARSEC_MAX_PARAM_COUNT 20 CACHE STRING "Number of parameters for tasks (default 20)")
 set(PARSEC_MAX_DEP_IN_COUNT 10 CACHE STRING "Number of input flows for each task (default 10)")
-set(PARSEC_MAX_DEP_OUT_COUNT 10 CACHE STRING "Number of output flows for each task (default 10)")
+set(PARSEC_MAX_DEP_OUT_COUNT 16 CACHE STRING "Number of output flows for each task (default 16)")
 
 ### PaRSEC PP options
 set(PARSEC_PTGPP_FLAGS "--noline" CACHE STRING "Additional parsec-ptgpp precompiling flags (separate flags with ';')" )
