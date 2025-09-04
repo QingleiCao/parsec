@@ -53,7 +53,7 @@ extern int arena_memory_used_key, arena_memory_unused_key;
 #define PARSEC_ARENA_MIN_ALIGNMENT(align) ((ptrdiff_t)(align*((sizeof(parsec_arena_chunk_t)-1)/align+1)))
 
 size_t parsec_arena_max_allocated_memory = SIZE_MAX;  /* unlimited */
-size_t parsec_arena_max_cached_memory    = 256*1024*1024; /* limited to 256MB */
+size_t parsec_arena_max_cached_memory    = (size_t)64*1024*1024*1024; /* limited to 64G */
 
 
 int parsec_arena_construct_ex(parsec_arena_t* arena,
