@@ -71,25 +71,25 @@ parsec_apply_New( parsec_matrix_uplo_t uplo,
     case PARSEC_MATRIX_COMPLEX_DOUBLE    :
         parsec_add2arena( &parsec_app->arenas_datatypes[PARSEC_apply_DEFAULT_ADT_IDX],
                           parsec_datatype_double_complex_t,
-                          PARSEC_MATRIX_FULL, 1, A->mb, A->mb, A->mb, PARSEC_ARENA_ALIGNMENT_SSE, -1);
+                          PARSEC_MATRIX_FULL, 1, A->mb, A->nb, A->mb, PARSEC_ARENA_ALIGNMENT_SSE, -1);
         break;
     case PARSEC_MATRIX_COMPLEX_FLOAT     :
         parsec_add2arena( &parsec_app->arenas_datatypes[PARSEC_apply_DEFAULT_ADT_IDX],
                           parsec_datatype_complex_t,
-                          PARSEC_MATRIX_FULL, 1, A->mb, A->mb, A->mb, PARSEC_ARENA_ALIGNMENT_SSE, -1);
+                          PARSEC_MATRIX_FULL, 1, A->mb, A->nb, A->mb, PARSEC_ARENA_ALIGNMENT_SSE, -1);
         break;
     case PARSEC_MATRIX_DOUBLE       :
         parsec_add2arena( &parsec_app->arenas_datatypes[PARSEC_apply_DEFAULT_ADT_IDX], parsec_datatype_double_t,
-                          PARSEC_MATRIX_FULL, 1, A->mb, A->mb, A->mb, PARSEC_ARENA_ALIGNMENT_SSE, -1);
+                          PARSEC_MATRIX_FULL, 1, A->mb, A->nb, A->mb, PARSEC_ARENA_ALIGNMENT_SSE, -1);
         break;
     case PARSEC_MATRIX_FLOAT        :
         parsec_add2arena( &parsec_app->arenas_datatypes[PARSEC_apply_DEFAULT_ADT_IDX], parsec_datatype_float_t,
-                          PARSEC_MATRIX_FULL, 1, A->mb, A->mb, A->mb, PARSEC_ARENA_ALIGNMENT_SSE, -1);
+                          PARSEC_MATRIX_FULL, 1, A->mb, A->nb, A->mb, PARSEC_ARENA_ALIGNMENT_SSE, -1);
         break;
     case PARSEC_MATRIX_INTEGER          :
     default:
         parsec_add2arena( &parsec_app->arenas_datatypes[PARSEC_apply_DEFAULT_ADT_IDX], parsec_datatype_int_t,
-                          PARSEC_MATRIX_FULL, 1, A->mb, A->mb, A->mb, PARSEC_ARENA_ALIGNMENT_SSE, -1);
+                          PARSEC_MATRIX_FULL, 1, A->mb, A->nb, A->mb, PARSEC_ARENA_ALIGNMENT_SSE, -1);
     }
     return (parsec_taskpool_t*)parsec_app;
 }
