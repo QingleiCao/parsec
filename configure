@@ -200,6 +200,8 @@ while [ "x$1" != x ]; do
         --disable-doc) enable_doc=no; shift;;
         --enable-testing) enable_testing=yes; shift;;
         --disable-testing) enable_testing=no; shift;;
+        --enable-tools) enable_tools=yes; shift;;
+        --disable-tools) enable_tools=no; shift;;
 
 #debug/profiling
         --enable-debug=*) enable_debug="${1#*=}"; shift;;
@@ -452,6 +454,8 @@ CMAKE_DEFINES+=" ${prefix:+-DCMAKE_INSTALL_PREFIX=$prefix}"
 [ x$enable_doc = xno ] && CMAKE_DEFINES+=" -DBUILD_DOCUMENTATION=OFF"
 [ x$enable_testing = xyes ] && CMAKE_DEFINES+=" -DBUILD_TESTING=ON"
 [ x$enable_testing = xno ] && CMAKE_DEFINES+=" -DBUILD_TESTING=OFF"
+[ x$enable_tools = xyes ] && CMAKE_DEFINES+=" -DBUILD_TOOLS=ON"
+[ x$enable_tools = xno ] && CMAKE_DEFINES+=" -DBUILD_TOOLS=OFF"
 
 if [ -z "$enable_debug" ]; then CMAKE_DEFINES+=" -DCMAKE_BUILD_TYPE=RelWithDebInfo"
 elif [[ "$enable_debug" =~ ^no$ ]]; then

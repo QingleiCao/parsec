@@ -111,7 +111,7 @@ endif( SUPPORT_CXX )
 option(SUPPORT_C11
        "Enable support for C11 capabilities. Might not work with OpenMP support due to an OpenMP compilers restriction (default ON)." ON)
 if(SUPPORT_C11)
-  set(SUPPORT_C11 OFF)  # disable until we conirm the compiler supports it
+  set(SUPPORT_C11 OFF)  # disable until we confirm the compiler supports it
   foreach( item IN LISTS CMAKE_C_COMPILE_FEATURES )
     if( item STREQUAL "c_std_11")
       message(STATUS "Compiler support for C11 detected and enabled")
@@ -173,7 +173,7 @@ endif()
 option(PARSEC_DIST_THREAD
   "Use an extra thread to progress the data movements" ON)
 option(PARSEC_DIST_PRIORITIES
-  "Favor the communications that unlock the most prioritary tasks" ON)
+  "Favor the communications that unlock the highest priority tasks" ON)
 option(PARSEC_DIST_COLLECTIVES
   "Use optimized asynchronous operations where collective communication pattern is detected" ON)
 set   (PARSEC_DIST_SHORT_LIMIT 1 CACHE STRING
