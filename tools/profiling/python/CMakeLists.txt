@@ -27,16 +27,20 @@ endif( NOT CYTHON_EXECUTABLE )
 execute_process(
         COMMAND ${Python_EXECUTABLE} -c "import pandas"
         RESULT_VARIABLE PARSEC_PYTHON_CAN_LOAD_PREREQUISITE_MODULES_IF_THIS_IS_ZERO
-        OUTPUT_QUIET
+        ERROR_QUIET
 )
-if ( NOT PARSEC_PYTHON_CAN_LOAD_PREREQUISITE_MODULES_IF_THIS_IS_ZERO STREQUAL 0 )
+if ( NOT (PARSEC_PYTHON_CAN_LOAD_PREREQUISITE_MODULES_IF_THIS_IS_ZERO EQUAL 0) )
   message(WARNING "Prerequisite Python modules (pandas) not found. Disabling the profiling tools")
   set(PARSEC_PYTHON_TOOLS OFF CACHE BOOL "True iff Python tools are enabled in PaRSEC")
   return()
-endif ( NOT PARSEC_PYTHON_CAN_LOAD_PREREQUISITE_MODULES_IF_THIS_IS_ZERO STREQUAL 0 )
+endif ( NOT (PARSEC_PYTHON_CAN_LOAD_PREREQUISITE_MODULES_IF_THIS_IS_ZERO EQUAL 0) )
+
+if (NOT BUILD_TOOLS)
+  message(STATUS "All prerequisite available but python tools have been disabled (by command line option)")
+  return()
+endif(NOT BUILD_TOOLS)
 
 set(SRC_PYTHON_SUPPORT ${CMAKE_CURRENT_SOURCE_DIR}/common_utils.py ${CMAKE_CURRENT_SOURCE_DIR}/parsec_trace_tables.py ${CMAKE_CURRENT_SOURCE_DIR}/ptt_utils.py ${CMAKE_CURRENT_SOURCE_DIR}/profile2h5.py ${CMAKE_CURRENT_SOURCE_DIR}/pbt2ptt.pyx ${CMAKE_CURRENT_SOURCE_DIR}/pbt2ptt.pxd)
-
 set(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/build/pbt2ptt.timestamp)
 
 if(Python_VERSION_MAJOR EQUAL 2)
