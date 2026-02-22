@@ -5024,6 +5024,15 @@ jdf_generate_arena_string_from_datatype(string_arena_t *sa,
     string_arena_free(sa2);
 }
 
+static int
+jdf_datatype_is_auto(jdf_datatransfer_type_t datatype)
+{
+    if( (JDF_VAR == datatype.type->op) || (JDF_STRING == datatype.type->op) ) {
+        return (0 == strcmp(datatype.type->jdf_var, "AUTO"));
+    }
+    return 0;
+}
+
 static void
 jdf_generate_code_fillup_datatypes(string_arena_t * sa_tmp_arena,     string_arena_t * sa_arena,
                                    string_arena_t * sa_tmp_type_src,  string_arena_t * sa_type_src,
@@ -6323,18 +6332,30 @@ jdf_generate_code_datatype_lookup(const jdf_t *jdf,
                 string_arena_init(sa_tmp_arena);
                 string_arena_init(sa_tmp_type);
                 string_arena_init(sa_temp);
-                jdf_generate_arena_string_from_datatype(sa_temp, dl->datatype_remote);
-                string_arena_add_string(sa_tmp_arena, " %s->arena ", string_arena_get_string(sa_temp));
-
-                if( NULL == dl->datatype_remote.layout ) { /* no specific layout */
-                    string_arena_add_string(sa_tmp_type, "%s->opaque_dtt", string_arena_get_string(sa_temp));
+                if( jdf_datatype_is_auto(dl->datatype_remote) ) {
+                    string_arena_add_string(sa_tmp_arena, "PARSEC_REMOTE_DEP_AUTO_ALLOC");
+                    string_arena_add_string(sa_tmp_type, "PARSEC_DATATYPE_PACKED");
                 } else {
-                    string_arena_add_string(sa_tmp_type, "%s", dump_expr((void**)dl->datatype_remote.layout, &info));
+                    jdf_generate_arena_string_from_datatype(sa_temp, dl->datatype_remote);
+                    string_arena_add_string(sa_tmp_arena, " %s->arena ", string_arena_get_string(sa_temp));
+                    if( NULL == dl->datatype_remote.layout ) { /* no specific layout */
+                        string_arena_add_string(sa_tmp_type, "%s->opaque_dtt", string_arena_get_string(sa_temp));
+                    } else {
+                        string_arena_add_string(sa_tmp_type, "%s", dump_expr((void**)dl->datatype_remote.layout, &info));
+                    }
                 }
                 string_arena_init(sa_tmp_count);
-                string_arena_add_string(sa_tmp_count, "%s", dump_expr((void**)dl->datatype_remote.count, &info));
+                if( jdf_datatype_is_auto(dl->datatype_remote) ) {
+                    string_arena_add_string(sa_tmp_count, "data->remote.src_count");
+                } else {
+                    string_arena_add_string(sa_tmp_count, "%s", dump_expr((void**)dl->datatype_remote.count, &info));
+                }
                 string_arena_init(sa_tmp_displ);
-                string_arena_add_string(sa_tmp_displ, "%s", dump_expr((void**)dl->datatype_remote.displ, &info));
+                if( jdf_datatype_is_auto(dl->datatype_remote) ) {
+                    string_arena_add_string(sa_tmp_displ, "0");
+                } else {
+                    string_arena_add_string(sa_tmp_displ, "%s", dump_expr((void**)dl->datatype_remote.displ, &info));
+                }
 
                 jdf_generate_code_fillup_datatypes(sa_tmp_arena,    sa_arena,
                                                    sa_tmp_type,     sa_type,
@@ -7796,27 +7817,34 @@ jdf_generate_code_iterate_successors_or_predecessors(const jdf_t *jdf,
                 string_arena_add_string(sa_tmp_displ_r, "0");
             } else {
                 string_arena_init(sa_temp);
-                jdf_generate_arena_string_from_datatype(sa_temp, dl->datatype_remote);
-                string_arena_add_string(sa_tmp_arena_r, "%s->arena", string_arena_get_string(sa_temp));
-
-                /* We select the dtt considering [type_remote] on dependency or dtt on datacopy.
-                 */
-                if( DEP_UNDEFINED_DATATYPE == jdf_dep_undefined_type(dl->datatype_remote) /* undefined type on dependency */
-                        && (NULL == dl->datatype_remote.layout) ){ /* User didn't specify a custom layout*/
-                    /* using data dtt or using PARSEC_DATATYPE_NULL if we don't have a data (this is the case
-                     * of iterate_successors -> get_datatype to recv the data; we are running over "fake predecessor task"
-                     * and the goal is to check the successor datatype) */
-                    string_arena_add_string(sa_tmp_type_r, "(data.data != NULL ? data.data->dtt : PARSEC_DATATYPE_NULL )");
+                if( jdf_datatype_is_auto(dl->datatype_remote) ) {
+                    string_arena_add_string(sa_tmp_arena_r, "PARSEC_REMOTE_DEP_AUTO_ALLOC");
+                    string_arena_add_string(sa_tmp_type_r, "PARSEC_DATATYPE_PACKED");
+                    string_arena_add_string(sa_tmp_count_r, "data.remote.src_count");
+                    string_arena_add_string(sa_tmp_displ_r, "0");
                 } else {
-                    if( NULL == dl->datatype_remote.layout ){ /* User didn't specify a custom layout*/
-                        string_arena_add_string(sa_tmp_type_r, "%s->opaque_dtt", string_arena_get_string(sa_temp));
+                    jdf_generate_arena_string_from_datatype(sa_temp, dl->datatype_remote);
+                    string_arena_add_string(sa_tmp_arena_r, "%s->arena", string_arena_get_string(sa_temp));
+
+                    /* We select the dtt considering [type_remote] on dependency or dtt on datacopy.
+                     */
+                    if( DEP_UNDEFINED_DATATYPE == jdf_dep_undefined_type(dl->datatype_remote) /* undefined type on dependency */
+                            && (NULL == dl->datatype_remote.layout) ){ /* User didn't specify a custom layout*/
+                        /* using data dtt or using PARSEC_DATATYPE_NULL if we don't have a data (this is the case
+                         * of iterate_successors -> get_datatype to recv the data; we are running over "fake predecessor task"
+                         * and the goal is to check the successor datatype) */
+                        string_arena_add_string(sa_tmp_type_r, "(data.data != NULL ? data.data->dtt : PARSEC_DATATYPE_NULL )");
                     } else {
-                        string_arena_add_string(sa_tmp_type_r, "%s", dump_expr((void**)dl->datatype_remote.layout, &info));
+                        if( NULL == dl->datatype_remote.layout ){ /* User didn't specify a custom layout*/
+                            string_arena_add_string(sa_tmp_type_r, "%s->opaque_dtt", string_arena_get_string(sa_temp));
+                        } else {
+                            string_arena_add_string(sa_tmp_type_r, "%s", dump_expr((void**)dl->datatype_remote.layout, &info));
+                        }
                     }
+                    assert( dl->datatype_remote.count != NULL );
+                    string_arena_add_string(sa_tmp_count_r, "%s", dump_expr((void**)dl->datatype_remote.count, &info));
+                    string_arena_add_string(sa_tmp_displ_r, "%s", dump_expr((void**)dl->datatype_remote.displ, &info));
                 }
-                assert( dl->datatype_remote.count != NULL );
-                string_arena_add_string(sa_tmp_count_r, "%s", dump_expr((void**)dl->datatype_remote.count, &info));
-                string_arena_add_string(sa_tmp_displ_r, "%s", dump_expr((void**)dl->datatype_remote.displ, &info));
             }
 
             string_arena_add_string(sa_datatype,"  if (action_mask & (PARSEC_ACTION_RESHAPE_ON_RELEASE | PARSEC_ACTION_RESHAPE_REMOTE_ON_RELEASE | PARSEC_ACTION_SEND_REMOTE_DEPS)) {\n");
