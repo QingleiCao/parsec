@@ -14,7 +14,7 @@ BEGIN_C_DECLS
 
 /* Also use in *band* structure */
 void parsec_matrix_block_cyclic_key2coords(parsec_data_collection_t *desc,
-                                           parsec_data_key_t key, int *m, int *n);
+                                           parsec_data_key_t key, size_t *m, size_t *n);
 
 
 size_t parsec_matrix_sym_block_cyclic_coord2pos(

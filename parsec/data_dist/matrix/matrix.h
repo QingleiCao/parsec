@@ -101,34 +101,34 @@ typedef struct parsec_tiled_matrix_s {
     parsec_matrix_type_t     mtype;      /**< precision of the matrix */
     parsec_matrix_storage_t  storage;    /**< storage of the matrix   */
     int dtype;          /**< Distribution type of descriptor      */
-    int tileld;         /**< leading dimension of each tile (Should be a function depending on the row) */
-    int mb;             /**< number of rows in a tile */
-    int nb;             /**< number of columns in a tile */
+    size_t tileld;         /**< leading dimension of each tile (Should be a function depending on the row) */
+    size_t mb;             /**< number of rows in a tile */
+    size_t nb;             /**< number of columns in a tile */
     size_t bsiz;        /**< size in elements including padding of a tile - derived parameter */
-    int lm;             /**< number of rows of the entire matrix */
-    int ln;             /**< number of columns of the entire matrix */
-    int lmt;            /**< number of tile rows of the entire matrix - derived parameter */
-    int lnt;            /**< number of tile columns of the entire matrix - derived parameter */
-    int llm;            /**< number of rows of the matrix stored locally - derived parameter */
-    int lln;            /**< number of columns of the matrix stored locally - derived parameter */
-    int i;              /**< row index to the beginning of the submatrix */
-    int j;              /**< column index to the beginning of the submatrix */
-    int m;              /**< number of rows of the submatrix */
-    int n;              /**< number of columns of the submatrix */
-    int mt;             /**< number of tile rows of the submatrix - derived parameter */
-    int nt;             /**< number of tile columns of the submatrix - derived parameter */
-    int nb_local_tiles; /**< number of tile handled locally */
-    int slm;            /**< number of local rows of the submatrix */
-    int sln;            /**< number of local columns of the submatrix */
+    size_t lm;             /**< number of rows of the entire matrix */
+    size_t ln;             /**< number of columns of the entire matrix */
+    size_t lmt;            /**< number of tile rows of the entire matrix - derived parameter */
+    size_t lnt;            /**< number of tile columns of the entire matrix - derived parameter */
+    size_t llm;            /**< number of rows of the matrix stored locally - derived parameter */
+    size_t lln;            /**< number of columns of the matrix stored locally - derived parameter */
+    size_t i;              /**< row index to the beginning of the submatrix */
+    size_t j;              /**< column index to the beginning of the submatrix */
+    size_t m;              /**< number of rows of the submatrix */
+    size_t n;              /**< number of columns of the submatrix */
+    size_t mt;             /**< number of tile rows of the submatrix - derived parameter */
+    size_t nt;             /**< number of tile columns of the submatrix - derived parameter */
+    size_t nb_local_tiles; /**< number of tile handled locally */
+    size_t slm;            /**< number of local rows of the submatrix */
+    size_t sln;            /**< number of local columns of the submatrix */
 } parsec_tiled_matrix_t;
 
 void parsec_tiled_matrix_init( parsec_tiled_matrix_t *tdesc, parsec_matrix_type_t dtyp, parsec_matrix_storage_t storage,
                              int matrix_distribution_type, int nodes, int myrank,
-                             int mb, int nb, int lm, int ln, int i,  int j, int m,  int n);
+                             size_t mb, size_t nb, size_t lm, size_t ln, size_t i,  size_t j, size_t m,  size_t n);
 
 void parsec_tiled_matrix_destroy( parsec_tiled_matrix_t *tdesc );
 
-parsec_tiled_matrix_t *parsec_tiled_matrix_submatrix( parsec_tiled_matrix_t *tdesc, int i, int j, int m, int n);
+parsec_tiled_matrix_t *parsec_tiled_matrix_submatrix( parsec_tiled_matrix_t *tdesc, size_t i, size_t j, size_t m, size_t n);
 
 int  parsec_tiled_matrix_data_write(parsec_tiled_matrix_t *tdesc, char *filename);
 
@@ -143,14 +143,14 @@ typedef int (*parsec_operator_t)( struct parsec_execution_stream_s *es,
 typedef int (*parsec_tiled_matrix_unary_op_t )( struct parsec_execution_stream_s *es,
                                          const parsec_tiled_matrix_t *desc1,
                                          void *data1,
-                                         int uplo, int m, int n,
+                                         int uplo, size_t m, size_t n,
                                          void *args );
 
 typedef int (*parsec_tiled_matrix_binary_op_t)( struct parsec_execution_stream_s *es,
                                          const parsec_tiled_matrix_t *desc1,
                                          const parsec_tiled_matrix_t *desc2,
                                          const void *data1, void *data2,
-                                         int uplo, int m, int n,
+                                         int uplo, size_t m, size_t n,
                                          void *args );
 
 extern struct parsec_taskpool_s*
@@ -296,7 +296,7 @@ int parsec_redistribute_dtd(parsec_context_t *parsec,
 parsec_data_t*
 parsec_tiled_matrix_create_data(parsec_tiled_matrix_t* matrix,
                          void* ptr,
-                         int pos,
+                         size_t pos,
                          parsec_data_key_t key);
 
 void

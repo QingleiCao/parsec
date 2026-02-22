@@ -72,8 +72,8 @@ typedef struct parsec_matrix_sym_block_cyclic {
 void parsec_matrix_sym_block_cyclic_init( parsec_matrix_sym_block_cyclic_t * dc,
                                     parsec_matrix_type_t mtype,
                                     int myrank,
-                                    int mb, int nb, int lm, int ln,
-                                    int i, int j, int m, int n,
+                                    size_t mb, size_t nb, size_t lm, size_t ln,
+                                    size_t i, size_t j, size_t m, size_t n,
                                     int P, int Q, /* process process grid */
                                     parsec_matrix_uplo_t uplo );
 

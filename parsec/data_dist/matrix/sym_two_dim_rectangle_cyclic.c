@@ -158,7 +158,7 @@ static parsec_data_t* sym_twoDBC_data_of(parsec_data_collection_t *desc, ...)
 
     return parsec_tiled_matrix_create_data( &dc->super,
                                      (char*)dc->mat + pos * dc->super.bsiz * parsec_datadist_getsizeoftype(dc->super.mtype),
-                                     position, (n * dc->super.lmt) + m );
+                                     (size_t)position, (n * dc->super.lmt) + m );
 }
 
 static parsec_data_t* sym_twoDBC_data_of_key(parsec_data_collection_t *desc, parsec_data_key_t key)

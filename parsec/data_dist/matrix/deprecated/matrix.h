@@ -108,7 +108,7 @@ static inline
 parsec_data_t*
 parsec_matrix_create_data(parsec_tiled_matrix_t* matrix,
                          void* ptr,
-                         int pos,
+                         size_t pos,
                          parsec_data_key_t key)
     __parsec_attribute_deprecated__("Use parsec_tiled_matrix_create_data");
 
@@ -116,7 +116,7 @@ static inline
 parsec_data_t*
 parsec_matrix_create_data(parsec_tiled_matrix_t* matrix,
                          void* ptr,
-                         int pos,
+                         size_t pos,
                          parsec_data_key_t key)
 {
     return parsec_tiled_matrix_create_data(matrix, ptr, pos, key);

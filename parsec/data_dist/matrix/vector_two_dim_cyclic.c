@@ -264,7 +264,7 @@ static parsec_data_t* vector_twoDBC_data_of(parsec_data_collection_t *desc, ...)
 
     return parsec_tiled_matrix_create_data(&dc->super,
                                     (char*)dc->mat + pos,
-                                    local_m, m);
+                                    (size_t)local_m, m);
 }
 
 /*

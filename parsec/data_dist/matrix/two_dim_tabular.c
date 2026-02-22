@@ -110,7 +110,7 @@ static parsec_data_t* twoDTD_data_of(parsec_data_collection_t* dc, ...)
     elem = &(tdc->tiles_table->elems[res]);
     assert(elem->pos >= 0);
 
-    return parsec_tiled_matrix_create_data( &tdc->super, elem->data, elem->pos, res );
+    return parsec_tiled_matrix_create_data( &tdc->super, elem->data, (size_t)elem->pos, res );
 }
 
 static parsec_data_t* twoDTD_data_of_key(parsec_data_collection_t *dc, parsec_data_key_t key)
@@ -120,7 +120,7 @@ static parsec_data_t* twoDTD_data_of_key(parsec_data_collection_t *dc, parsec_da
     assert( key < (parsec_data_key_t)( tdc->tiles_table->nbelem ) );
 
     elem = &(tdc->tiles_table->elems[key]);
-    return parsec_tiled_matrix_create_data( &tdc->super, elem->data, elem->pos, key );
+    return parsec_tiled_matrix_create_data( &tdc->super, elem->data, (size_t)elem->pos, key );
 }
 
 void parsec_matrix_tabular_init(parsec_matrix_tabular_t * dc,

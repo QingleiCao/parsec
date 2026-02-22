@@ -25,8 +25,8 @@ typedef struct parsec_matrix_block_cyclic {
     parsec_tiled_matrix_t super;
     parsec_grid_2Dcyclic_t   grid;
     void *mat;      /**< pointer to the beginning of the matrix */
-    int nb_elem_r;  /**< number of row of tiles  handled by this process - derived parameter */
-    int nb_elem_c;  /**< number of column of tiles handled by this process - derived parameter */
+    size_t nb_elem_r;  /**< number of row of tiles handled by this process - derived parameter */
+    size_t nb_elem_c;  /**< number of column of tiles handled by this process - derived parameter */
 } parsec_matrix_block_cyclic_t;
 
 /************************************************
@@ -74,26 +74,26 @@ void parsec_matrix_block_cyclic_init(parsec_matrix_block_cyclic_t * twoDBCdesc,
                                parsec_matrix_type_t mtype,
                                parsec_matrix_storage_t storage,
                                int myrank,
-                               int mb,    int nb,   /* Tile size */
-                               int lm,    int ln,   /* Global matrix size (what is stored)*/
-                               int i,     int j,    /* Staring point in the global matrix */
-                               int m,     int n,    /* Submatrix size (the one concerned by the computation */
-                               int p,     int q,    /* process process grid*/
-                               int kp,    int kq,   /* k-cyclicity */
-                               int ip,    int jq);   /* starting point on the process grid*/
+                               size_t mb,    size_t nb,
+                               size_t lm,    size_t ln,
+                               size_t i,     size_t j,
+                               size_t m,     size_t n,
+                               int p,     int q,
+                               int kp,    int kq,
+                               int ip,    int jq);
 
 void parsec_matrix_block_cyclic_lapack_init(parsec_matrix_block_cyclic_t * twoDBCdesc,
                                       parsec_matrix_type_t mtype,
                                       parsec_matrix_storage_t storage,
                                       int myrank,
-                                      int mb,   int nb,   /* Tile size */
-                                      int lm,   int ln,   /* Global matrix size (what is stored)*/
-                                      int i,    int j,    /* Staring point in the global matrix */
-                                      int m,    int n,    /* Submatrix size (the one concerned by the computation */
-                                      int p,     int q,   /* process process grid*/
-                                      int kp,    int kq,  /* k-cyclicity */
-                                      int ip,    int jq,  /* starting point on the process grid*/
-                                      int mloc, int nloc);/* number of local rows and cols of the matrix */
+                                      size_t mb,   size_t nb,
+                                      size_t lm,   size_t ln,
+                                      size_t i,    size_t j,
+                                      size_t m,    size_t n,
+                                      int p,     int q,
+                                      int kp,    int kq,
+                                      int ip,    int jq,
+                                      size_t mloc, size_t nloc);
 
 /**
  * kcyclic _view_ of the 2-D Block cyclic distributed matrix. The goal is to

@@ -29,7 +29,7 @@ static int      tiled_matrix_key_to_string(struct parsec_data_collection_s * des
 parsec_data_t*
 parsec_tiled_matrix_create_data(parsec_tiled_matrix_t* matrix,
                          void* ptr,
-                         int pos,
+                         size_t pos,
                          parsec_data_key_t key)
 {
     assert( pos <= matrix->nb_local_tiles );
@@ -45,7 +45,7 @@ parsec_tiled_matrix_destroy_data( parsec_tiled_matrix_t* matrix )
     if ( matrix->data_map != NULL ) {
         parsec_data_t **data = matrix->data_map;
 
-        for(int i = 0; i < matrix->nb_local_tiles; i++, data++) {
+        for(size_t i = 0; i < matrix->nb_local_tiles; i++, data++) {
             if( NULL == *data ) continue;
             parsec_data_destroy( *data );
         }
@@ -63,10 +63,10 @@ void parsec_tiled_matrix_init( parsec_tiled_matrix_t *tdesc,
                              parsec_matrix_type_t    mtyp,
                              parsec_matrix_storage_t storage,
                              int dtype, int nodes, int myrank,
-                             int mb, int nb,
-                             int lm, int ln,
-                             int i,  int j,
-                             int m,  int n)
+                             size_t mb, size_t nb,
+                             size_t lm, size_t ln,
+                             size_t i,  size_t j,
+                             size_t m,  size_t n)
 {
     parsec_data_collection_t *o = (parsec_data_collection_t*)tdesc;
 
@@ -128,7 +128,7 @@ void parsec_tiled_matrix_init( parsec_tiled_matrix_t *tdesc,
 
     /* finish to update the main object properties */
     o->key_to_string = tiled_matrix_key_to_string;
-    if( asprintf(&(o->key_dim), "(%d, %d)", tdesc->lmt, tdesc->lnt) <= 0 ) {
+    if( asprintf(&(o->key_dim), "(%zu, %zu)", tdesc->lmt, tdesc->lnt) <= 0 ) {
         o->key_dim = NULL;
     }
 
@@ -156,27 +156,27 @@ parsec_tiled_matrix_destroy( parsec_tiled_matrix_t *tdesc )
 
 parsec_tiled_matrix_t *
 parsec_tiled_matrix_submatrix( parsec_tiled_matrix_t *tdesc,
-                        int i, int j, int m, int n)
+                        size_t i, size_t j, size_t m, size_t n)
 {
-    int mb, nb;
+    size_t mb, nb;
     parsec_tiled_matrix_t *newdesc;
 
     mb = tdesc->mb;
     nb = tdesc->nb;
 
-    if ( (i < 0) || ( (i%mb) != 0 ) ) {
+    if ( (i == (size_t)-1) || (i%mb) != 0 ) {
         parsec_warning("Invalid value of i");
         return NULL;
     }
-    if ( (j < 0) || ( (j%nb) != 0 ) ) {
+    if ( (j == (size_t)-1) || (j%nb) != 0 ) {
         parsec_warning("Invalid value of j");
         return NULL;
     }
-    if ( (m < 0) || ((m+i) > tdesc->lm) ) {
+    if ( (m == (size_t)-1) || ((m+i) > tdesc->lm) ) {
         parsec_warning("Invalid value of m");
         return NULL;
     }
-    if ( (n < 0) || ((n+j) > tdesc->ln) ) {
+    if ( (n == (size_t)-1) || ((n+j) > tdesc->ln) ) {
         parsec_warning("Invalid value of n");
         return NULL;
     }
@@ -256,7 +256,7 @@ int parsec_tiled_matrix_data_write(parsec_tiled_matrix_t *tdesc, char *filename)
     parsec_data_t* data;
     FILE *tmpf;
     char *buf;
-    int i, j, k;
+    size_t i, j, k;
     uint32_t myrank = tdesc->super.myrank;
     int eltsize =  parsec_datadist_getsizeoftype( tdesc->mtype );
 
@@ -268,20 +268,24 @@ int parsec_tiled_matrix_data_write(parsec_tiled_matrix_t *tdesc, char *filename)
 
     if ( tdesc->storage == PARSEC_MATRIX_TILE ) {
         for (i = 0 ; i < tdesc->mt ; i++)
-            for ( j = 0 ; j< tdesc->nt ; j++) {
-                if ( dc->rank_of( dc, i, j ) == myrank ) {
-                    data = dc->data_of( dc, i, j );
+            for ( j = 0 ; j < tdesc->nt ; j++) {
+                unsigned int ui = (unsigned int)i;
+                unsigned int uj = (unsigned int)j;
+                if ( dc->rank_of( dc, ui, uj ) == myrank ) {
+                    data = dc->data_of( dc, ui, uj );
                     buf = parsec_data_get_ptr(data, 0);
                     fwrite(buf, eltsize, tdesc->bsiz, tmpf );
                 }
             }
     } else {
         for (i = 0 ; i < tdesc->mt ; i++)
-            for ( j = 0 ; j< tdesc->nt ; j++) {
-                if ( dc->rank_of( dc, i, j ) == myrank ) {
-                    data = dc->data_of( dc, i, j );
+            for ( j = 0 ; j < tdesc->nt ; j++) {
+                unsigned int ui = (unsigned int)i;
+                unsigned int uj = (unsigned int)j;
+                if ( dc->rank_of( dc, ui, uj ) == myrank ) {
+                    data = dc->data_of( dc, ui, uj );
                     buf = parsec_data_get_ptr(data, 0);
-                    for (k=0; k<tdesc->nb; k++) {
+                    for (k = 0; k < tdesc->nb; k++) {
                         fwrite(buf, eltsize, tdesc->mb, tmpf );
                         buf += eltsize * tdesc->lm;
                     }
@@ -304,7 +308,7 @@ int parsec_tiled_matrix_data_read(parsec_tiled_matrix_t *tdesc, char *filename)
     parsec_data_t* data;
     FILE *tmpf;
     char *buf;
-    int i, j, k;
+    size_t i, j, k;
     size_t ret;
     uint32_t myrank = tdesc->super.myrank;
     int eltsize =  parsec_datadist_getsizeoftype( tdesc->mtype );
@@ -317,9 +321,11 @@ int parsec_tiled_matrix_data_read(parsec_tiled_matrix_t *tdesc, char *filename)
 
     if ( tdesc->storage == PARSEC_MATRIX_TILE ) {
         for (i = 0 ; i < tdesc->mt ; i++)
-            for ( j = 0 ; j< tdesc->nt ; j++) {
-                if ( dc->rank_of( dc, i, j ) == myrank ) {
-                    data = dc->data_of( dc, i, j );
+            for ( j = 0 ; j < tdesc->nt ; j++) {
+                unsigned int ui = (unsigned int)i;
+                unsigned int uj = (unsigned int)j;
+                if ( dc->rank_of( dc, ui, uj ) == myrank ) {
+                    data = dc->data_of( dc, ui, uj );
                     buf = parsec_data_get_ptr(data, 0);
                     ret = fread(buf, eltsize, tdesc->bsiz, tmpf );
                     if ( ret !=  tdesc->bsiz ) {
@@ -332,14 +338,16 @@ int parsec_tiled_matrix_data_read(parsec_tiled_matrix_t *tdesc, char *filename)
             }
     } else {
         for (i = 0 ; i < tdesc->mt ; i++)
-            for ( j = 0 ; j< tdesc->nt ; j++) {
-                if ( dc->rank_of( dc, i, j ) == myrank ) {
-                    data = dc->data_of( dc, i, j );
+            for ( j = 0 ; j < tdesc->nt ; j++) {
+                unsigned int ui = (unsigned int)i;
+                unsigned int uj = (unsigned int)j;
+                if ( dc->rank_of( dc, ui, uj ) == myrank ) {
+                    data = dc->data_of( dc, ui, uj );
                     buf = parsec_data_get_ptr(data, 0);
-                    for (k=0; k < tdesc->nb; k++) {
+                    for (k = 0; k < tdesc->nb; k++) {
                         ret = fread(buf, eltsize, tdesc->mb, tmpf );
                         if ( ret !=  (size_t)tdesc->mb ) {
-                            parsec_warning("The read on tile(%d, %d) read %zu elements instead of %d",
+                            parsec_warning("The read on tile(%d, %d) read %zu elements instead of %zu",
                                     i, j, ret, tdesc->mb);
                             fclose(tmpf);
                             return PARSEC_ERR_TRUNCATE;

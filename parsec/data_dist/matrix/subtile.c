@@ -122,7 +122,7 @@ static parsec_data_t* subtile_data_of(parsec_data_collection_t *desc, ...)
 
     return parsec_tiled_matrix_create_data( &sdesc->super,
                                      (char*)sdesc->mat + pos,
-                                     position, position );
+                                     (size_t)position, position );
 }
 
 static parsec_data_t* subtile_data_of_key(parsec_data_collection_t *desc, parsec_data_key_t key)
