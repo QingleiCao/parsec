@@ -15,6 +15,7 @@
 #include "parsec/utils/debug.h"
 #include "parsec/debug_marks.h"
 #include "parsec/data.h"
+#include "parsec/data_internal.h"
 #include "parsec/papi_sde.h"
 #include "parsec/interfaces/dtd/insert_function_internal.h"
 #include "parsec/remote_dep.h"
@@ -198,7 +199,7 @@ static void remote_dep_mpi_release_delayed_deps(parsec_execution_stream_t* es,
 static int remote_dep_nothread_memcpy(parsec_execution_stream_t* es,
                                       dep_cmd_item_t *item);
 static void remote_dep_auto_fallback_copy_release(parsec_data_copy_t *copy, int device);
-static void remote_dep_auto_gpu_copy_release(parsec_data_copy_t *copy, int device);
+static void remote_dep_auto_gpu_memory_release(parsec_data_copy_t *copy, int device);
 static int remote_dep_auto_pick_gpu_device(const parsec_task_t *task);
 
 int remote_dep_ce_reconfigure(parsec_context_t* context);
@@ -623,31 +624,53 @@ static void remote_dep_auto_fallback_copy_release(parsec_data_copy_t *copy, int 
     copy->device_private = NULL;
 }
 
-static void remote_dep_auto_gpu_copy_release(parsec_data_copy_t *copy, int device)
+static void remote_dep_auto_gpu_memory_release(parsec_data_copy_t *copy, int device)
 {
-    parsec_device_module_t *dev = parsec_mca_device_get((uint32_t)device);
+    parsec_device_module_t *dev = parsec_mca_device_get((uint32_t)copy->device_index);
     if( NULL != dev && PARSEC_DEV_IS_GPU(dev->type) ) {
         parsec_device_gpu_module_t *gpu = (parsec_device_gpu_module_t*)dev;
         (void)gpu->set_device(gpu);
         (void)gpu->memory_free(gpu, copy->device_private);
     }
+    (void)device;
     copy->device_private = NULL;
 }
 
 static int remote_dep_auto_pick_gpu_device(const parsec_task_t *task)
 {
+    parsec_data_ref_t ref;
+    parsec_data_t *data = NULL;
+    parsec_device_module_t *dev = NULL;
+
     if( 0 == parsec_param_auto_gpu_enable ) {
         return 0;
     }
-    parsec_task_t tmp = *task;
-    tmp.selected_device = NULL;
-    if( PARSEC_SUCCESS != parsec_select_best_device(&tmp) ) {
+    if( NULL == task || NULL == task->task_class || NULL == task->task_class->data_affinity ) {
         return 0;
     }
-    if( NULL == tmp.selected_device || !PARSEC_DEV_IS_GPU(tmp.selected_device->type) ) {
+    if( 0 == task->task_class->data_affinity(task, &ref) ) {
         return 0;
     }
-    return tmp.selected_device->device_index;
+    if( NULL == ref.dc || NULL == ref.dc->data_of_key ) {
+        return 0;
+    }
+    data = ref.dc->data_of_key(ref.dc, ref.key);
+    if( NULL == data ) {
+        return 0;
+    }
+    if( data->preferred_device >= 0 ) {
+        dev = parsec_mca_device_get((uint32_t)data->preferred_device);
+        if( NULL != dev && PARSEC_DEV_IS_GPU(dev->type) ) {
+            return dev->device_index;
+        }
+    }
+    if( data->owner_device >= 0 ) {
+        dev = parsec_mca_device_get((uint32_t)data->owner_device);
+        if( NULL != dev && PARSEC_DEV_IS_GPU(dev->type) ) {
+            return dev->device_index;
+        }
+    }
+    return 0;
 }
 
 static inline parsec_data_copy_t*
@@ -705,7 +728,7 @@ remote_dep_auto_copy_allocate_gpu(parsec_dep_type_description_t* data)
         return NULL;
     }
     dc->coherency_state = PARSEC_DATA_COHERENCY_EXCLUSIVE;
-    dc->release_cb = remote_dep_auto_gpu_copy_release;
+    dc->release_cb = remote_dep_auto_gpu_memory_release;
     dc->original->nb_elts = bytes;
     return dc;
 }
@@ -949,8 +972,6 @@ remote_dep_mpi_retrieve_datatype(parsec_execution_stream_t *eu,
 
     if( PARSEC_REMOTE_DEP_AUTO_ALLOC == output->data.remote.arena ) {
         uint64_t remote_size = output->data.remote.src_count;
-        output->data.remote.src_datatype = PARSEC_DATATYPE_PACKED;
-        output->data.remote.dst_datatype = PARSEC_DATATYPE_PACKED;
         output->data.remote.src_count = remote_size;
         output->data.remote.dst_count = remote_size;
         output->data.remote.src_displ = 0;
