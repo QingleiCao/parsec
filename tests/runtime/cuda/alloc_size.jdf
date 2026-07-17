@@ -1,0 +1,177 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026 The University of Tennessee and The University
+ *                        of Tennessee Research Foundation. All rights
+ *                        reserved.
+ */
+#include "parsec/parsec_config.h"
+
+#include "parsec/data_distribution.h"
+#include "parsec/data_dist/matrix/matrix.h"
+#include "parsec/data_dist/matrix/two_dim_rectangle_cyclic.h"
+#include <stdint.h>
+#if defined(DISTRIBUTED)
+#include <mpi.h>
+#endif
+
+#include "alloc_size.h"
+
+static inline void alloc_size_expected_spans(int m, int n, size_t total,
+                                             size_t *logical, size_t *span_alloc_set)
+{
+    /*
+     * Per-tile coverage for allocation sizing paths:
+     *   case 0 ((m+n)%3==0): explicit over-allocation request (span_alloc > span).
+     *     Verifies non-zero span_alloc is preserved end-to-end.
+     *   case 1 ((m+n)%3==1): partial logical span with span_alloc == 0.
+     *     Verifies fallback path where allocator must use the logical span.
+     *   case 2 ((m+n)%3==2): full logical span with span_alloc == 0.
+     *     Verifies zero span_alloc remains valid for full-span transfers too.
+     */
+    const int tile_case = (m + n) % 3;
+    if(tile_case == 0) {
+        *logical = total / 2;
+        *span_alloc_set = *logical + 64;
+        if(*span_alloc_set > total) *span_alloc_set = total;
+    } else if(tile_case == 1) {
+        *logical = (3 * total) / 4;
+        *span_alloc_set = 0;
+    } else {
+        *logical = total;
+        *span_alloc_set = 0;
+    }
+}
+
+%}
+
+%option no_taskpool_instance = true
+
+descA [type = "parsec_tiled_matrix_t*"]
+info  [type = "int*"]
+
+set_sizes_cpu(m, n)
+
+m = 0 .. descA->mt-1
+n = 0 .. descA->nt-1
+
+: descA(m, n)
+
+RW A <- descA(m, n)
+     -> A task_gpu(m, n)
+
+BODY
+{
+    size_t total = (size_t)descA->mb * (size_t)descA->nb * parsec_datadist_getsizeoftype(descA->mtype);
+    size_t logical = 0;
+    size_t span_alloc_set = 0;
+    uint32_t marker = (uint32_t)(0x11110000u | ((uint32_t)(m & 0xFF) << 8) | (uint32_t)(n & 0xFF));
+    int nelems = descA->mb * descA->nb;
+
+    alloc_size_expected_spans(m, n, total, &logical, &span_alloc_set);
+    if(nelems > 0) {
+        ((uint32_t*)A)[0] = marker;
+        ((uint32_t*)A)[nelems - 1] = marker ^ 0x00FF00FFu;
+    }
+
+    this_task->data._f_A.data_out->original->span = logical;
+    this_task->data._f_A.data_out->original->span_alloc = span_alloc_set;
+}
+END
+
+task_gpu(m, n)
+
+m = 0 .. descA->mt-1
+n = 0 .. descA->nt-1
+
+: descA(m, n)
+
+RW A <- A set_sizes_cpu(m, n)
+     -> A check(m, n)
+
+BODY [type=CUDA]
+{
+    (void)A;
+}
+END
+
+check(m, n)
+
+m = 0 .. descA->mt-1
+n = 0 .. descA->nt-1
+
+: descA(m, n)
+
+READ A <- A task_gpu(m, n)
+
+BODY
+{
+    size_t total = (size_t)descA->mb * (size_t)descA->nb * parsec_datadist_getsizeoftype(descA->mtype);
+    size_t logical = 0;
+    size_t span_alloc_set = 0;
+    uint32_t marker = (uint32_t)(0x11110000u | ((uint32_t)(m & 0xFF) << 8) | (uint32_t)(n & 0xFF));
+    int nelems = descA->mb * descA->nb;
+
+    alloc_size_expected_spans(m, n, total, &logical, &span_alloc_set);
+
+    if(this_task->data._f_A.data_in->original->span != logical) {
+        info[es->th_id]++;
+    }
+    if(this_task->data._f_A.data_in->original->span_alloc != span_alloc_set) {
+        info[es->th_id]++;
+    }
+    if(nelems > 0) {
+        if(((uint32_t*)A)[0] != marker) {
+            info[es->th_id]++;
+        }
+        if(((uint32_t*)A)[nelems - 1] != (marker ^ 0x00FF00FFu)) {
+            info[es->th_id]++;
+        }
+    }
+}
+END
+
+extern "C" %{
+
+static parsec_taskpool_t* parsec_alloc_size_test_New(parsec_tiled_matrix_t *dcA, int *info)
+{
+    parsec_alloc_size_taskpool_t *taskpool = parsec_alloc_size_new(dcA, info);
+    parsec_matrix_arena_datatype_define_type(&taskpool->arenas_datatypes[PARSEC_alloc_size_DEFAULT_ADT_IDX],
+                                             parsec_datatype_int32_t, PARSEC_MATRIX_FULL,
+                                             1, dcA->mb, dcA->nb, dcA->mb,
+                                             PARSEC_ARENA_ALIGNMENT_SSE, -1);
+    return (parsec_taskpool_t*)taskpool;
+}
+
+static void __parsec_taskpool_alloc_size_destructor(parsec_alloc_size_taskpool_t *tp)
+{
+    parsec_matrix_arena_datatype_destruct_free_type(&tp->arenas_datatypes[PARSEC_alloc_size_DEFAULT_ADT_IDX]);
+}
+
+PARSEC_OBJ_CLASS_INSTANCE(parsec_alloc_size_taskpool_t, parsec_taskpool_t,
+                          NULL, __parsec_taskpool_alloc_size_destructor);
+
+int parsec_alloc_size_test(parsec_context_t *parsec, parsec_tiled_matrix_t *A)
+{
+    int info = 0;
+    int nb_threads = parsec->virtual_processes[0]->nb_cores;
+    int *info_tmp = (int *)calloc((size_t)nb_threads, sizeof(int));
+    parsec_taskpool_t *tp = parsec_alloc_size_test_New(A, info_tmp);
+
+    parsec_enqueue(parsec, tp);
+    parsec_context_start(parsec);
+    parsec_context_wait(parsec);
+    parsec_taskpool_free(tp);
+
+    for(int i = 1; i < nb_threads; i++) info_tmp[0] += info_tmp[i];
+
+#if defined(DISTRIBUTED)
+    MPI_Allreduce(&info_tmp[0], &info, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+#else
+    info = info_tmp[0];
+#endif
+
+    free(info_tmp);
+    return info;
+}
+
+%}

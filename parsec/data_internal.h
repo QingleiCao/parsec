@@ -39,7 +39,10 @@ struct parsec_data_s {
     int32_t                    nb_copies;        /* How many valid copies are attached to this data */
     parsec_data_key_t          key;
     struct parsec_data_collection_s*     dc;
-    size_t                     span;          /* size in bytes of the memory layout */
+    size_t                     span;          /* logical size in bytes of the memory layout */
+    size_t                     span_alloc;    /* allocated capacity in bytes for device buffers.
+                                               * 0 means "unset" and should fallback to span.
+                                               */
     struct parsec_data_copy_s *device_copies[];  /* this array allocated according to the number of devices
                                                   * (parsec_nb_devices). It points to the most recent
                                                   * version of the data.

@@ -748,6 +748,9 @@ parsec_device_data_advise(parsec_device_module_t *dev, parsec_data_t *data, int 
             gpu_task->nb_flows = 1;
             gpu_task->flow_info[0].flow = &parsec_device_data_prefetch_flow;
             gpu_task->flow_info[0].flow_span = data->device_copies[ data->owner_device ]->original->span;
+            gpu_task->flow_info[0].flow_span_alloc = (0 == data->device_copies[ data->owner_device ]->original->span_alloc) ?
+                                                     gpu_task->flow_info[0].flow_span :
+                                                     data->device_copies[ data->owner_device ]->original->span_alloc;
             gpu_task->stage_in  = parsec_default_gpu_stage_in;
             gpu_task->stage_out = parsec_default_gpu_stage_out;
             PARSEC_DEBUG_VERBOSE(20, parsec_debug_output, "Retain data copy %p [ref_count %d]",
@@ -1244,6 +1247,7 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
         /* Skip CTL flows only */
         if(PARSEC_FLOW_ACCESS_NONE == (PARSEC_FLOW_ACCESS_MASK & flow->flow_flags)) {
             gpu_task->flow_info[i].flow_span = 0;  /* assume there is nothing to transfer to the GPU */
+            gpu_task->flow_info[i].flow_span_alloc = 0;
             continue;
         }
 
@@ -1315,15 +1319,21 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
 
 #if !defined(PARSEC_GPU_ALLOC_PER_TILE)
         gpu_elem = PARSEC_OBJ_NEW(parsec_data_copy_t);
+        size_t master_span_alloc = (0 == master->span_alloc) ? master->span : master->span_alloc;
+        size_t flow_span_alloc = (0 == gpu_task->flow_info[i].flow_span_alloc) ? gpu_task->flow_info[i].flow_span : gpu_task->flow_info[i].flow_span_alloc;
+        size_t alloc_span = (flow_span_alloc > master_span_alloc) ? flow_span_alloc : master_span_alloc;
+        assert(master->span <= master_span_alloc);
+        assert(gpu_task->flow_info[i].flow_span <= flow_span_alloc);
         PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
-                             "GPU[%d:%s]:%s: Allocate GPU copy %p sz %zu [ref_count %d] for data %p",
+                             "GPU[%d:%s]:%s: Allocate GPU copy %p flow_sz %zu alloc_sz %zu [ref_count %d] for data %p",
                              gpu_device->super.device_index, gpu_device->super.name, task_name,
-                             gpu_elem, gpu_task->flow_info[i].flow_span, gpu_elem->super.super.obj_reference_count, master);
+                             gpu_elem, gpu_task->flow_info[i].flow_span, alloc_span,
+                             gpu_elem->super.super.obj_reference_count, master);
         gpu_elem->flags = PARSEC_DATA_FLAG_PARSEC_OWNED | PARSEC_DATA_FLAG_PARSEC_MANAGED;
     malloc_data:
         copy_readers_update = 0;
         assert(0 != (gpu_elem->flags & PARSEC_DATA_FLAG_PARSEC_OWNED) );
-        gpu_elem->device_private = zone_malloc(gpu_device->memory, gpu_task->flow_info[i].flow_span);
+        gpu_elem->device_private = zone_malloc(gpu_device->memory, alloc_span);
         gpu_elem->arena_chunk = (parsec_arena_chunk_t *)gpu_device->memory;
         if( NULL == gpu_elem->device_private ) {
 #endif
@@ -1537,7 +1547,7 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
             parsec_profiling_trace_flags(gpu_device->exec_stream[0]->profiling,
                                          parsec_gpu_allocate_memory_key, (int64_t)gpu_elem->device_private,
                                          gpu_device->super.device_index,
-                                         &gpu_task->flow_info[i].flow_span, PARSEC_PROFILING_EVENT_COUNTER|PARSEC_PROFILING_EVENT_HAS_INFO);
+                                         &alloc_span, PARSEC_PROFILING_EVENT_COUNTER|PARSEC_PROFILING_EVENT_HAS_INFO);
         }
 #endif
 #else
@@ -2335,6 +2345,9 @@ parsec_device_send_transfercomplete_cmd_to_device(parsec_data_copy_t *copy,
     gpu_task->nb_flows = 1;
     gpu_task->flow_info[0].flow = &parsec_device_d2d_complete_flow;
     gpu_task->flow_info[0].flow_span = copy->original->span;
+    gpu_task->flow_info[0].flow_span_alloc = (0 == copy->original->span_alloc) ?
+                                             gpu_task->flow_info[0].flow_span :
+                                             copy->original->span_alloc;
     gpu_task->stage_in  = parsec_default_gpu_stage_in;
     gpu_task->stage_out = parsec_default_gpu_stage_out;
     gpu_task->ec->data[0].data_in = copy;  /* We need to set not-null in data_in, so that the fake flow is

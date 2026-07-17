@@ -6619,6 +6619,7 @@ static void jdf_generate_code_hook_gpu(const jdf_t *jdf,
     jdf_def_list_t *stage_in_property;
     jdf_def_list_t *stage_out_property;
     jdf_def_list_t *size_property;
+    jdf_def_list_t *alloc_size_property;
     jdf_def_list_t *desc_property;
     jdf_def_list_t *device_property;
     jdf_def_list_t *prop;
@@ -6877,14 +6878,17 @@ static void jdf_generate_code_hook_gpu(const jdf_t *jdf,
 
         sprintf(sa->ptr, "%s.size", fl->varname);
         jdf_find_property(body->properties, sa->ptr, &size_property);
+        sprintf(sa->ptr, "%s.alloc_size", fl->varname);
+        jdf_find_property(body->properties, sa->ptr, &alloc_size_property);
 
         if(fl->flow_flags & JDF_FLOW_TYPE_CTL) {
-            if(size_property != NULL) {
-                fprintf(stderr, "Error: specifying GPU buffer size for CTL flow %s at line %d\n",
+            if(size_property != NULL || alloc_size_property != NULL) {
+                fprintf(stderr, "Error: specifying GPU size/alloc_size for CTL flow %s at line %d\n",
                         fl->varname, JDF_OBJECT_LINENO(fl));
                 exit(-1);
             }
             coutput("  gpu_task->flow_info[%d].flow_span = 0;\n", di);
+            coutput("  gpu_task->flow_info[%d].flow_span_alloc = 0;\n", di);
         } else {
             coutput("  // A shortcut to check if the flow exists\n");
             coutput("  if (gpu_task->ec->data[%d].data_in != NULL) {\n", di);
@@ -6899,6 +6903,13 @@ static void jdf_generate_code_hook_gpu(const jdf_t *jdf,
                 }
 
             }
+            if(alloc_size_property == NULL){
+                coutput("  gpu_task->flow_info[%d].flow_span_alloc = (0 == gpu_task->ec->data[%d].data_in->original->span_alloc) ? gpu_task->flow_info[%d].flow_span : gpu_task->ec->data[%d].data_in->original->span_alloc;\n", di, di, di, di);
+            } else {
+                coutput("  gpu_task->flow_info[%d].flow_span_alloc = %s;\n",
+                        di, dump_expr((void**)alloc_size_property->expr, &info));
+            }
+            coutput("  assert(gpu_task->flow_info[%d].flow_span <= gpu_task->flow_info[%d].flow_span_alloc);\n", di, di);
             coutput("}\n");
         }
 

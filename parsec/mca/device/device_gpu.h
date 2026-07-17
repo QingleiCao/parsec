@@ -101,6 +101,10 @@ typedef struct parsec_gpu_flow_info_s {
                                              * size of the data, for all the other copies this should be the amount of memory
                                              * needed on the device.
                                              */
+    size_t                    flow_span_alloc; /* allocation span on the device for this flow.
+                                                * Defaults to original->span_alloc when not overridden;
+                                                * if that is 0 it falls back to flow_span.
+                                                */
     parsec_data_collection_t *flow_dc; /* the data collection from which the data originates. When the data copy is local, the data
                                         * collection can be accessed via the data_t, but for all copies coming from the network there
                                         * is no known data collection. Thus, for such cases the DSL need to provide a reference to the

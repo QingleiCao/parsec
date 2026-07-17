@@ -31,6 +31,10 @@ if(PARSEC_HAVE_CUDA)
   target_include_directories(testing_get_best_device PRIVATE $<$<NOT:${PARSEC_BUILD_INPLACE}>:${CMAKE_CURRENT_SOURCE_DIR}>)
   target_ptg_sources(testing_get_best_device PRIVATE "get_best_device_check.jdf")
 
+  parsec_addtest_executable(C alloc_size SOURCES alloc_size_main.c)
+  target_include_directories(alloc_size PRIVATE $<$<NOT:${PARSEC_BUILD_INPLACE}>:${CMAKE_CURRENT_SOURCE_DIR}>)
+  target_ptg_sources(alloc_size PRIVATE "alloc_size.jdf")
+
   if(CMAKE_CUDA_COMPILER)
     set_source_files_properties(ping_kernel.cu PROPERTIES LANGUAGE CUDA)
     list(APPEND PINGPONG_GPU_KERNEL_SOURCES ping_kernel.cu)
