@@ -105,9 +105,13 @@ struct parsec_gpu_task_s {
             const parsec_flow_t           *flow[MAX_PARAM_COUNT];  /* There is no consistent way to access the flows from the task_class,
                                                                     * so the DSL need to provide these flows here.
                                                                     */
-            size_t                         flow_nb_elts[MAX_PARAM_COUNT]; /* for each flow, size of the data to be allocated
-                                                                           * on the GPU.
+            size_t                         flow_nb_elts[MAX_PARAM_COUNT]; /* for each flow, logical size of data to be
+                                                                           * transferred / considered by the runtime.
                                                                            */
+            size_t                         flow_nb_elts_alloc[MAX_PARAM_COUNT]; /* for each flow, size of GPU buffer to allocate.
+                                                                                 * Defaults to original->nb_elts_alloc when not overridden;
+                                                                                 * if that is 0 it falls back to flow_nb_elts.
+                                                                                 */
             parsec_data_collection_t      *flow_dc[MAX_PARAM_COUNT];     /* for each flow, data collection from which the data
                                                                           * to be transferred logically belongs to.
                                                                           * This gives the user the chance to indicate on the JDF

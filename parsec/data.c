@@ -70,6 +70,7 @@ static void parsec_data_construct(parsec_data_t* obj )
     obj->preferred_device = -1;
     obj->key              = 0;
     obj->nb_elts          = 0;
+    obj->nb_elts_alloc    = 0;
     for( uint32_t i = 0; i < parsec_nb_devices;
          obj->device_copies[i] = NULL, i++ );
     obj->dc               = NULL;

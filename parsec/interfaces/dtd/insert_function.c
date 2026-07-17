@@ -2294,6 +2294,9 @@ static parsec_hook_return_t parsec_dtd_gpu_task_submit(parsec_execution_stream_t
             gpu_task->pushout |= 1<<i;
         gpu_task->flow[i] = dtd_tc->super.in[i];
         gpu_task->flow_nb_elts[i] = this_task->data[i].data_in->original->nb_elts;
+        gpu_task->flow_nb_elts_alloc[i] = (0 == this_task->data[i].data_in->original->nb_elts_alloc) ?
+                                          gpu_task->flow_nb_elts[i] :
+                                          this_task->data[i].data_in->original->nb_elts_alloc;
     }
 
     parsec_device_module_t *device = this_task->selected_device;

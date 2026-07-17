@@ -36,7 +36,10 @@ struct parsec_data_s {
                                                   * which device this data should be modified RW when there
                                                   * are multiple choices. -1 means no preference. */
     struct parsec_data_collection_s*     dc;
-    size_t                     nb_elts;          /* size in bytes of the memory layout */
+    size_t                     nb_elts;          /* logical size in bytes of the memory layout */
+    size_t                     nb_elts_alloc;    /* allocated capacity in bytes for device buffers.
+                                                  * 0 means "unset" and should fallback to nb_elts.
+                                                  */
     struct parsec_data_copy_s *device_copies[];  /* this array allocated according to the number of devices
                                                   * (parsec_nb_devices). It points to the most recent
                                                   * version of the data.

@@ -21,6 +21,10 @@ if(PARSEC_HAVE_CUDA)
 
   endif( NOT TARGET CUDA::cublas )
 
+  parsec_addtest_executable(C alloc_size SOURCES alloc_size_main.c)
+  target_include_directories(alloc_size PRIVATE $<$<NOT:${PARSEC_BUILD_INPLACE}>:${CMAKE_CURRENT_SOURCE_DIR}>)
+  target_ptg_sources(alloc_size PRIVATE "alloc_size.jdf")
+
   # Testing for geting best device
   parsec_addtest_executable(C testing_get_best_device SOURCES "testing_get_best_device.c")
   target_include_directories(testing_get_best_device PRIVATE $<$<NOT:${PARSEC_BUILD_INPLACE}>:${CMAKE_CURRENT_SOURCE_DIR}>)
