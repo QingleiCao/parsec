@@ -254,6 +254,36 @@ void parsec_abort( parsec_context_t* pcontext, int status);
 int parsec_fini( parsec_context_t** pcontext );
 
 /**
+ * @brief Start an explicitly scoped device-statistics interval.
+ *
+ * @details When device_show_statistics is enabled, the default reporting
+ * interval is the complete PaRSEC execution. Calling this function replaces
+ * that default with an interval beginning at this point. A second call
+ * restarts the interval from the new point. Resetting device statistics while
+ * an interval is active also restarts its baseline at the reset.
+ *
+ * Call this function after parsec_init(), preferably while the execution
+ * context is quiescent.
+ *
+ * @param[inout] context the PaRSEC context
+ */
+void parsec_device_show_capabilities_start(parsec_context_t *context);
+
+/**
+ * @brief End an explicitly scoped device-statistics interval.
+ *
+ * @details When device_show_statistics is enabled, this prints statistics
+ * accumulated since parsec_device_show_capabilities_start() and suppresses
+ * the automatic whole-execution report during parsec_fini().
+ *
+ * Call this function before parsec_fini(), preferably while the execution
+ * context is quiescent.
+ *
+ * @param[inout] context the PaRSEC context
+ */
+void parsec_device_show_capabilities_end(parsec_context_t *context);
+
+/**
  * Setup external finalize routine to be callback during parsec_fini
  */
 void parsec_context_at_fini(parsec_external_fini_cb_t cb, void *data);

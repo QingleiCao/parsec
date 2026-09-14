@@ -61,6 +61,9 @@ static float load_balance_skew;
  */
 static int parsec_device_load_balance_allow_cpu = 0;
 
+static uint64_t *parsec_device_statistics_start = NULL;
+static int parsec_device_statistics_window_used = 0;
+
 /**
  * Whether to skip input and output stream events that are not strictly
  * necessary (enabled by default).
@@ -592,6 +595,45 @@ void parsec_devices_print_statistics(parsec_context_t *parsec_context, uint64_t 
     parsec_devices_free_statistics(&end_stats);
 }
 
+static int parsec_device_show_statistics_enabled(void)
+{
+    int show_stats_index, show_stats = 0;
+
+    show_stats_index = parsec_mca_param_find("device", NULL, "show_statistics");
+    if( PARSEC_ERROR != show_stats_index ) {
+        parsec_mca_param_lookup_int(show_stats_index, &show_stats);
+    }
+    return show_stats;
+}
+
+void parsec_device_show_capabilities_start(parsec_context_t *parsec_context)
+{
+    (void)parsec_context;
+
+    if( 0 == parsec_nb_devices ) {
+        parsec_warning("%s must be called after device registration", __func__);
+        return;
+    }
+
+    parsec_devices_save_statistics(&parsec_device_statistics_start);
+    parsec_device_statistics_window_used = 1;
+}
+
+void parsec_device_show_capabilities_end(parsec_context_t *parsec_context)
+{
+    if( !parsec_device_statistics_window_used ||
+        (NULL == parsec_device_statistics_start) ) {
+        parsec_warning("%s called without a matching start", __func__);
+        return;
+    }
+
+    if( parsec_device_show_statistics_enabled() ) {
+        parsec_devices_print_statistics(parsec_context,
+                                        parsec_device_statistics_start);
+    }
+    parsec_devices_free_statistics(&parsec_device_statistics_start);
+}
+
 void parsec_mca_device_reset_statistics(parsec_context_t *parsec_context) {
     parsec_device_module_t *device;
 
@@ -605,6 +647,11 @@ void parsec_mca_device_reset_statistics(parsec_context_t *parsec_context) {
         device->required_data_in     = 0;
         device->required_data_out    = 0;
         device->nb_evictions         = 0;
+    }
+
+    /* A reset starts a new baseline for an active reporting interval. */
+    if( NULL != parsec_device_statistics_start ) {
+        parsec_devices_save_statistics(&parsec_device_statistics_start);
     }
 }
 
@@ -658,15 +705,18 @@ void parsec_mca_device_dump_and_reset_statistics(parsec_context_t* parsec_contex
 
 int parsec_mca_device_fini(void)
 {
-    int show_stats_index, show_stats = 0;
-
-    /* If no statistics are required */
-    show_stats_index = parsec_mca_param_find("device", NULL, "show_statistics");
-    if( 0 < show_stats_index )
-        parsec_mca_param_lookup_int(show_stats_index, &show_stats);
-    if( show_stats ) {
-        parsec_mca_device_dump_and_reset_statistics(NULL);
+    if( parsec_device_show_statistics_enabled() ) {
+        if( NULL != parsec_device_statistics_start ) {
+            parsec_devices_print_statistics(NULL,
+                                            parsec_device_statistics_start);
+        } else if( !parsec_device_statistics_window_used ) {
+            parsec_mca_device_dump_and_reset_statistics(NULL);
+        }
     }
+    if( NULL != parsec_device_statistics_start ) {
+        parsec_devices_free_statistics(&parsec_device_statistics_start);
+    }
+    parsec_device_statistics_window_used = 0;
 
     parsec_device_module_t *module;
     mca_base_component_t *component;
