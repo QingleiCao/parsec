@@ -30,3 +30,11 @@ if(PARSEC_HAVE_CUDA)
   target_include_directories(testing_get_best_device PRIVATE $<$<NOT:${PARSEC_BUILD_INPLACE}>:${CMAKE_CURRENT_SOURCE_DIR}>)
   target_ptg_sources(testing_get_best_device PRIVATE "get_best_device_check.jdf")
 endif(PARSEC_HAVE_CUDA)
+
+if(PARSEC_HAVE_CUDA OR PARSEC_HAVE_HIP)
+  # Testing an explicitly scoped device statistics report
+  include(ParsecCompilePTG)
+  parsec_addtest_executable(C device_show_capabilities)
+  target_include_directories(device_show_capabilities PRIVATE $<$<NOT:${PARSEC_BUILD_INPLACE}>:${CMAKE_CURRENT_SOURCE_DIR}>)
+  target_ptg_sources(device_show_capabilities PRIVATE "device_show_capabilities.jdf")
+endif()
