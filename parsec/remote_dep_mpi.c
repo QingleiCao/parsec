@@ -572,18 +572,18 @@ void parsec_remote_dep_memcpy(parsec_execution_stream_t* es,
 }
 
 static inline parsec_data_copy_t*
-remote_dep_copy_allocate(parsec_dep_type_description_t* data)
+remote_dep_copy_allocate(parsec_dep_type_description_t* data, uint64_t arena_count)
 {
     parsec_data_copy_t* dc;
     if( NULL == data->arena ) {
         assert(0 == data->dst_count);
         return NULL;
     }
-    dc = parsec_arena_get_copy(data->arena, data->dst_count, 0, data->dst_datatype);
+    dc = parsec_arena_get_copy(data->arena, arena_count, 0, data->dst_datatype);
 
     dc->coherency_state = PARSEC_DATA_COHERENCY_EXCLUSIVE;
-    PARSEC_DEBUG_VERBOSE(20, parsec_comm_output_stream, "MPI:\tMalloc new remote tile %p size %" PRIu64 " count = %" PRIu64 " displ = %" PRIi64 " %p",
-            dc, data->arena->elem_size, data->dst_count, data->dst_displ, data->arena);
+    PARSEC_DEBUG_VERBOSE(20, parsec_comm_output_stream, "MPI:\tMalloc new remote tile %p size %" PRIu64 " arena count = %" PRIu64 " receive count = %" PRIu64 " displ = %" PRIi64 " %p",
+            dc, data->arena->elem_size, arena_count, data->dst_count, data->dst_displ, data->arena);
     return dc;
 }
 
@@ -598,7 +598,7 @@ static inline parsec_data_copy_t*
 reshape_copy_allocate(parsec_dep_type_description_t* data)
 {
     parsec_data_copy_t* dc;
-    dc = remote_dep_copy_allocate(data);
+    dc = remote_dep_copy_allocate(data, data->dst_count);
 
     parsec_data_start_transfer_ownership_to_copy(dc->original,
                                                  0,
@@ -1854,7 +1854,10 @@ static void remote_dep_mpi_recv_activate(parsec_execution_stream_t* es,
             if((length - (*position)) >= (int)data_sizes[ds_idx]) {
                 assert(NULL == data_desc->data); /* we do not support in-place tiles now, make sure it doesn't happen yet */
                 if(NULL == data_desc->data) {
-                    data_desc->data = remote_dep_copy_allocate(type_desc);
+                    /* src_count still holds the count associated with the receiving
+                     * arena. dst_count may have been converted to a byte count when
+                     * the sender provided a smaller, variable-size payload. */
+                    data_desc->data = remote_dep_copy_allocate(type_desc, type_desc->src_count);
                 }
 #ifndef PARSEC_PROF_DRY_DEP
                 PARSEC_DEBUG_VERBOSE(10, parsec_comm_output_stream,
@@ -2080,7 +2083,10 @@ static void remote_dep_mpi_get_start(parsec_execution_stream_t* es,
         /* prepare the local receiving data */
         assert(NULL == deps->output[k].data.data); /* we do not support in-place tiles now, make sure it doesn't happen yet */
         if(NULL == deps->output[k].data.data) {
-            deps->output[k].data.data = remote_dep_copy_allocate(&deps->output[k].data.remote);
+            parsec_dep_type_description_t *type_desc = &deps->output[k].data.remote;
+            /* Allocate the capacity requested by the receiving arena, independently
+             * of a variable-size MPI datatype/count selected for this transfer. */
+            deps->output[k].data.data = remote_dep_copy_allocate(type_desc, type_desc->src_count);
         }
         dtt   = deps->output[k].data.remote.dst_datatype;
         nbdtt = deps->output[k].data.remote.dst_count;
@@ -2305,4 +2311,3 @@ int remote_dep_ce_fini(parsec_context_t* context)
 
     return 0;
 }
-
