@@ -2679,7 +2679,7 @@ static int parsec_check_overlapping_binding(parsec_context_t *context)
                     proc_mask[idx]++;
                 hwloc_bitmap_foreach_end();
 
-                MPI_Allreduce(MPI_IN_PLACE, proc_mask, length, MPI_BYTE, MPI_SUM, comml);
+                MPI_Allreduce(MPI_IN_PLACE, proc_mask, length, MPI_UNSIGNED_CHAR, MPI_SUM, comml);
                 for( int i = 0; i < length; i++ ) {
                     if( 1 < proc_mask[i] ) {
                         parsec_warning("/!\\ PERFORMANCE MIGHT BE REDUCED /!\\: "
