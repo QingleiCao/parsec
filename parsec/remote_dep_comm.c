@@ -743,15 +743,18 @@ remote_dep_arena_count(const parsec_dep_type_description_t* data)
  *            payload as fewer elements, or as bytes), or NULL. The buffer
  *            holds it too, and the copy takes its datatype.
  * @param[in] preferred_device where to allocate, if possible.
+ * @param[out] pinned 1 if the copy holds a reader the caller must hand back.
  */
 static inline parsec_data_copy_t*
 remote_dep_copy_allocate(parsec_dep_type_description_t* data,
                          const parsec_dep_type_description_t* wire,
-                         int preferred_device)
+                         int preferred_device,
+                         int *pinned)
 {
     parsec_data_copy_t* dc;
     parsec_datatype_t dtt = data->dst_datatype;
     uint64_t arena_count, wire_count;
+    *pinned = 0;
     if( NULL == data->arena ) {
         assert(0 == data->dst_count);
         return NULL;
@@ -780,6 +783,13 @@ remote_dep_copy_allocate(parsec_dep_type_description_t* data,
         PARSEC_OBJ_RELEASE(dc->original);
     }
     PARSEC_DATA_COPY_RETAIN(dc);
+    /* The network writes straight into this buffer, so it is being read from
+     * the device's point of view for as long as the message is outstanding. */
+    if( parsec_device_data_copy_pin_reader(dc) ) {
+        *pinned = 1;
+    } else {
+        parsec_warning("Freshly allocated receive buffer %p has no memory to receive into.", dc);
+    }
     /* don't use preferred_device, it might not be the location where the data copy resides */
     parsec_data_start_transfer_ownership_to_copy(dc->original, dc->device_index, PARSEC_FLOW_ACCESS_WRITE);
     if (dc->device_index != preferred_device) {
@@ -802,7 +812,14 @@ static inline parsec_data_copy_t*
 reshape_copy_allocate(parsec_dep_type_description_t* data)
 {
     parsec_data_copy_t* dc;
-    dc = remote_dep_copy_allocate(data, NULL, 0  /* default device */);
+    int pinned;
+
+    dc = remote_dep_copy_allocate(data, NULL, 0  /* default device */, &pinned);
+    /* No message reads this one: it is filled and only then published to the
+     * future, so nothing can observe it mid-fill. Whoever takes it over pins it
+     * again, and a pin nobody hands back would keep the copy from ever being
+     * reclaimed. */
+    if( pinned ) parsec_device_data_copy_unpin_reader(dc);
 
     parsec_data_start_transfer_ownership_to_copy(dc->original,
                                                  0,
@@ -1362,8 +1379,20 @@ remote_dep_release_incoming(parsec_execution_stream_t* es,
     for(i = 0; mask>>i; i++) {
         assert(i < MAX_PARAM_COUNT);
         if( !((1U<<i) & mask) ) continue;
-        if( NULL != origin->output[i].data.data )  /* except CONTROLs */
+        if( NULL != origin->output[i].data.data ) {  /* except CONTROLs */
+            /* An output the propagation above decided to forward is still being
+             * read by this message, from the very copy the receive handed over,
+             * so the reader taken for the receive stays and becomes the one the
+             * forwarding holds. remote_dep_complete_and_cleanup() gives it back
+             * once the sends are done. Giving it back here and taking it again
+             * would leave the copy reclaimable in between.
+             */
+            if( ((1U << i) & origin->pinned_mask) && !((1U << i) & origin->outgoing_mask) ) {
+                origin->pinned_mask ^= (1U << i);
+                parsec_device_data_copy_unpin_reader(origin->output[i].data.data);
+            }
             PARSEC_DATA_COPY_RELEASE(origin->output[i].data.data);
+        }
     }
 #if defined(PARSEC_DIST_COLLECTIVES)
     if(PARSEC_TASKPOOL_TYPE_PTG == origin->taskpool->taskpool_type) {
@@ -1715,9 +1744,17 @@ static int remote_dep_nothread_memcpy(parsec_execution_stream_t* es,
                          (char*)PARSEC_DATA_COPY_GET_PTR(cmd->memcpy.destination) + cmd->memcpy.layout.dst_displ, cmd->memcpy.layout.dst_datatype,
                          cmd->memcpy.layout.dst_count);
 
+    /* Both copies are read and written directly here, so hold them for the
+     * duration rather than for the lifetime of the command. */
+    int pinned_src = parsec_device_data_copy_pin_reader(cmd->memcpy.source);
+    int pinned_dst = parsec_device_data_copy_pin_reader(cmd->memcpy.destination);
+
     int rc = parsec_ce.reshape(&parsec_ce, es,
                                cmd->memcpy.destination, cmd->memcpy.layout.dst_displ, cmd->memcpy.layout.dst_datatype, cmd->memcpy.layout.dst_count,
                                cmd->memcpy.source, cmd->memcpy.layout.src_displ, cmd->memcpy.layout.src_datatype, cmd->memcpy.layout.src_count);
+
+    if( pinned_dst ) parsec_device_data_copy_unpin_reader(cmd->memcpy.destination);
+    if( pinned_src ) parsec_device_data_copy_unpin_reader(cmd->memcpy.source);
 
     PARSEC_DATA_COPY_RELEASE(cmd->memcpy.source);
     remote_dep_dec_flying_messages(item->cmd.memcpy.taskpool);
@@ -1963,6 +2000,16 @@ remote_dep_comm_put_start(parsec_execution_stream_t* es,
             deps->output[k].data.data = reshape_data;
 
             PARSEC_DATA_COPY_RETAIN(reshape_data);
+            /* The pin moves to the reshape result, each side only if granted. */
+            int old_pinned = (0 != (deps->pinned_mask & (1U << k)));
+            if( parsec_device_data_copy_pin_reader(reshape_data) ) {
+                deps->pinned_mask |= (1U << k);
+            } else {
+                deps->pinned_mask &= ~(1U << k);
+                parsec_warning("Reshape promise %p produced data copy %p whose memory the device owning "
+                               "it had already reclaimed.", deps->output[k].data_future, reshape_data);
+            }
+            if( old_pinned ) parsec_device_data_copy_unpin_reader(old_data);
             PARSEC_DATA_COPY_RELEASE(old_data);/*old data has been retained for remote communication*/
 
             PARSEC_OBJ_RELEASE(deps->output[k].data.data_future);
@@ -2181,7 +2228,9 @@ static void remote_dep_comm_recv_activate(parsec_execution_stream_t* es,
                 assert(NULL == data_desc->data); /* we do not support in-place tiles now, make sure it doesn't happen yet */
                 if(NULL == data_desc->data) {
                     /* if we have to unpack the data onto this new copy we might want to allocated it on the CPU */
-                    data_desc->data = remote_dep_copy_allocate(type_desc, &wire, 0);
+                    int pinned;
+                    data_desc->data = remote_dep_copy_allocate(type_desc, &wire, 0, &pinned);
+                    if( pinned ) deps->pinned_mask |= (1U << k);
                 }
 #ifndef PARSEC_PROF_DRY_DEP
                 PARSEC_DEBUG_VERBOSE(10, parsec_comm_output_stream,
@@ -2427,7 +2476,9 @@ static void remote_dep_comm_get_start(parsec_execution_stream_t* es,
                                !parsec_device_peer_mesh_incomplete &&
                                (0 < deps->output[k].data.preferred_device)) ?
                               deps->output[k].data.preferred_device : 0;
-            deps->output[k].data.data = remote_dep_copy_allocate(&deps->output[k].data.remote, NULL, best_device);
+            int pinned;
+            deps->output[k].data.data = remote_dep_copy_allocate(&deps->output[k].data.remote, NULL, best_device, &pinned);
+            if( pinned ) deps->pinned_mask |= (1U << k);
         }
         /* Mark the data under transfer */
         deps->output[k].data.data->data_transfer_status = PARSEC_DATA_STATUS_UNDER_TRANSFER;
