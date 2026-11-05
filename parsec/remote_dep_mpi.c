@@ -571,6 +571,51 @@ void parsec_remote_dep_memcpy(parsec_execution_stream_t* es,
     parsec_dequeue_push_back(&dep_cmd_queue, (parsec_list_item_t*) item);
 }
 
+/**
+ * Number of arena elements needed to hold a receive described by
+ * (dst_count, dst_datatype) at dst_displ. The receive may have been resized
+ * to a byte count (variable-size payload), so derive it from the receive
+ * size rather than from a count expressed in either type.
+ */
+static inline uint64_t
+remote_dep_arena_count(const parsec_dep_type_description_t* data)
+{
+    int dsize = 0;
+    uint64_t bytes, count;
+    if( NULL == data->arena || 0 == data->arena->elem_size ) {
+        return data->dst_count;
+    }
+    parsec_ce.pack_size(&parsec_ce, data->dst_count, data->dst_datatype, &dsize);
+    bytes = (uint64_t)dsize + (uint64_t)(data->dst_displ > 0 ? data->dst_displ : 0);
+    count = (bytes + data->arena->elem_size - 1) / data->arena->elem_size;
+    return count > 0 ? count : 1;
+}
+
+/**
+ * A rank that received data from a broadcast parent forwards it to its own
+ * children (chain or binomial trees) with the src description, which
+ * remote_dep_mpi_retrieve_datatype() takes from the local receiver's type.
+ * When the root sent less than that type (e.g. a tile sent as raw bytes in a
+ * lower precision into a full-size receive type), every forwarded hop would
+ * carry the full receive type. For a contiguous receive type the payload
+ * occupies the first received bytes, so forward exactly those.
+ */
+static inline void
+remote_dep_forward_received_size(parsec_dep_type_description_t* data, int received_bytes)
+{
+    int dsize = 0, tsize = 0;
+    ptrdiff_t lb = 0, extent = 0;
+    if( received_bytes <= 0 || 0 == data->dst_count ) return;  /* control flow */
+    if( PARSEC_DATATYPE_NULL == data->dst_datatype || PARSEC_DATATYPE_PACKED == data->dst_datatype ) return;
+    parsec_ce.pack_size(&parsec_ce, data->dst_count, data->dst_datatype, &dsize);
+    if( received_bytes >= dsize ) return;
+    parsec_type_size(data->dst_datatype, &tsize);
+    parsec_type_extent(data->dst_datatype, &lb, &extent);
+    if( 0 != lb || extent != (ptrdiff_t)tsize ) return;  /* non-contiguous layout */
+    data->src_datatype = parsec_datatype_int8_t;
+    data->src_count    = (uint64_t)received_bytes;
+}
+
 static inline parsec_data_copy_t*
 remote_dep_copy_allocate(parsec_dep_type_description_t* data, uint64_t arena_count)
 {
@@ -923,6 +968,7 @@ remote_dep_get_datatypes(parsec_execution_stream_t* es,
 
             origin->output[k].data.remote.src_datatype = origin->output[k].data.remote.dst_datatype = PARSEC_DATATYPE_NULL;
             assert(idx <= data_sizes[0]);
+            int received_bytes = (int)data_sizes[idx+1];
             origin->output[k].data.remote.src_count = data_sizes[idx+1];
             PARSEC_DEBUG_VERBOSE(20, parsec_comm_output_stream,
                                  "MPI:\tRetrieve datatype with mask 0x%x (remote_dep_get_datatypes) remote size %d",
@@ -931,6 +977,7 @@ remote_dep_get_datatypes(parsec_execution_stream_t* es,
                                                 local_mask,
                                                 remote_dep_mpi_retrieve_datatype,
                                                 origin);
+            remote_dep_forward_received_size(&origin->output[k].data.remote, received_bytes);
             idx++;
         }
     }
@@ -1854,10 +1901,10 @@ static void remote_dep_mpi_recv_activate(parsec_execution_stream_t* es,
             if((length - (*position)) >= (int)data_sizes[ds_idx]) {
                 assert(NULL == data_desc->data); /* we do not support in-place tiles now, make sure it doesn't happen yet */
                 if(NULL == data_desc->data) {
-                    /* src_count still holds the count associated with the receiving
-                     * arena. dst_count may have been converted to a byte count when
-                     * the sender provided a smaller, variable-size payload. */
-                    data_desc->data = remote_dep_copy_allocate(type_desc, type_desc->src_count);
+                    /* dst_count may have been converted to a byte count when the
+                     * sender provided a smaller, variable-size payload; size the
+                     * allocation from the receive itself. */
+                    data_desc->data = remote_dep_copy_allocate(type_desc, remote_dep_arena_count(type_desc));
                 }
 #ifndef PARSEC_PROF_DRY_DEP
                 PARSEC_DEBUG_VERBOSE(10, parsec_comm_output_stream,
@@ -2084,9 +2131,9 @@ static void remote_dep_mpi_get_start(parsec_execution_stream_t* es,
         assert(NULL == deps->output[k].data.data); /* we do not support in-place tiles now, make sure it doesn't happen yet */
         if(NULL == deps->output[k].data.data) {
             parsec_dep_type_description_t *type_desc = &deps->output[k].data.remote;
-            /* Allocate the capacity requested by the receiving arena, independently
-             * of a variable-size MPI datatype/count selected for this transfer. */
-            deps->output[k].data.data = remote_dep_copy_allocate(type_desc, type_desc->src_count);
+            /* Allocate the capacity needed by the receive, independently of a
+             * variable-size MPI datatype/count selected for this transfer. */
+            deps->output[k].data.data = remote_dep_copy_allocate(type_desc, remote_dep_arena_count(type_desc));
         }
         dtt   = deps->output[k].data.remote.dst_datatype;
         nbdtt = deps->output[k].data.remote.dst_count;
