@@ -125,8 +125,13 @@ static parsec_termdet_taskpool_state_t parsec_termdet_local_taskpool_state(parse
     if( tp->tdm.module == NULL )
         return PARSEC_TERM_TP_NOT_MONITORED;
     assert(tp->tdm.module == &parsec_termdet_local_module.module);
-    if( PARSEC_TERMDET_LOCAL_TERMINATED == monitor )
+    if( PARSEC_TERMDET_LOCAL_TERMINATED == monitor ) {
+        /* The caller goes on to on_leave_wait() and then to the user's code,
+         * which must see what the termination callback wrote. Pairs with the
+         * parsec_atomic_wmb() in parsec_termdet_local_termination_detected(). */
+        parsec_atomic_rmb();
         return PARSEC_TERM_TP_TERMINATED;
+    }
     if( (PARSEC_TERMDET_LOCAL_BUSY == monitor) || (PARSEC_TERMDET_LOCAL_TERMINATING == monitor) )
         return PARSEC_TERM_TP_BUSY;
     if( PARSEC_TERMDET_LOCAL_NOT_READY == monitor )
@@ -139,13 +144,13 @@ static parsec_termdet_taskpool_state_t parsec_termdet_local_taskpool_state(parse
  *           which lives in the taskpool) after this function is called */
 static void parsec_termdet_local_termination_detected(parsec_taskpool_t *tp)
 {
-    assert( tp->tdm.module != NULL);
-    assert( tp->tdm.module == &parsec_termdet_local_module.module );
-    assert( tp->tdm.monitor == PARSEC_TERMDET_LOCAL_TERMINATING );
     /* The caller won the BUSY -> TERMINATING CAS. Pairs with the
      * parsec_atomic_wmb() in parsec_termdet_local_taskpool_ready(), so the
      * reference taken there comes before the release below. */
     parsec_atomic_rmb();
+    assert( tp->tdm.module != NULL);
+    assert( tp->tdm.module == &parsec_termdet_local_module.module );
+    assert( tp->tdm.monitor == PARSEC_TERMDET_LOCAL_TERMINATING );
 
     PARSEC_DEBUG_VERBOSE(10, parsec_debug_output, "TERMDET-LOCAL\tTASKPOOL %p: termination detected", tp);
 
@@ -153,6 +158,9 @@ static void parsec_termdet_local_termination_detected(parsec_taskpool_t *tp)
         PARSEC_DEBUG_VERBOSE(10, parsec_debug_output, "TERMDET-LOCAL\tTASKPOOL %p: calling callback", tp);
         tp->tdm.callback(tp);
     }
+    /* Publish TERMINATED only after the callback's writes. Pairs with the
+     * parsec_atomic_rmb() in parsec_termdet_local_taskpool_state(). */
+    parsec_atomic_wmb();
     parsec_atomic_cas_ptr(&tp->tdm.monitor, PARSEC_TERMDET_LOCAL_TERMINATING, PARSEC_TERMDET_LOCAL_TERMINATED);
     PARSEC_OBJ_RELEASE(tp);
 }
@@ -163,15 +171,18 @@ static void parsec_termdet_local_termination_detected(parsec_taskpool_t *tp)
  * nb_pending_actions. Each side writes one variable and then reads the other,
  * so each needs a full fence in between: with the relaxed C11 atomics both
  * reads could otherwise return the old value, no thread would detect
- * termination, and the wait would never return. */
+ * termination, and the wait would never return. Release/acquire fences are
+ * not enough here: they only order anything once one thread reads the other's
+ * write, and the failure is precisely that neither does.
+ *
+ * On this side the read is the CAS itself, with no plain load in front of it.
+ * A CAS that fails is only a load, so it still needs the fence. */
 static void parsec_termdet_local_pending_actions_reached_zero(parsec_taskpool_t *tp)
 {
     parsec_mfence();
-    if( tp->tdm.monitor == PARSEC_TERMDET_LOCAL_BUSY ) {
+    if( parsec_atomic_cas_ptr(&tp->tdm.monitor, PARSEC_TERMDET_LOCAL_BUSY, PARSEC_TERMDET_LOCAL_TERMINATING) ) {
         PARSEC_DEBUG_VERBOSE(10, parsec_debug_output, "TERMDET-LOCAL:\tTASKPOOL %p nbpa == 0", tp);
-        if( parsec_atomic_cas_ptr(&tp->tdm.monitor, PARSEC_TERMDET_LOCAL_BUSY, PARSEC_TERMDET_LOCAL_TERMINATING) ) {
-            parsec_termdet_local_termination_detected(tp);
-        }
+        parsec_termdet_local_termination_detected(tp);
     }
 }
 
