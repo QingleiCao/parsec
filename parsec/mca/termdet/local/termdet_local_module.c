@@ -142,6 +142,10 @@ static void parsec_termdet_local_termination_detected(parsec_taskpool_t *tp)
     assert( tp->tdm.module != NULL);
     assert( tp->tdm.module == &parsec_termdet_local_module.module );
     assert( tp->tdm.monitor == PARSEC_TERMDET_LOCAL_TERMINATING );
+    /* The caller won the BUSY -> TERMINATING CAS. Pairs with the
+     * parsec_atomic_wmb() in parsec_termdet_local_taskpool_ready(), so the
+     * reference taken there comes before the release below. */
+    parsec_atomic_rmb();
 
     PARSEC_DEBUG_VERBOSE(10, parsec_debug_output, "TERMDET-LOCAL\tTASKPOOL %p: termination detected", tp);
 
@@ -153,6 +157,24 @@ static void parsec_termdet_local_termination_detected(parsec_taskpool_t *tp)
     PARSEC_OBJ_RELEASE(tp);
 }
 
+/* Called by a thread that brought nb_pending_actions to 0. Termination is
+ * detected either here, if the taskpool is already BUSY, or by
+ * parsec_termdet_local_taskpool_ready(), which publishes BUSY and then reads
+ * nb_pending_actions. Each side writes one variable and then reads the other,
+ * so each needs a full fence in between: with the relaxed C11 atomics both
+ * reads could otherwise return the old value, no thread would detect
+ * termination, and the wait would never return. */
+static void parsec_termdet_local_pending_actions_reached_zero(parsec_taskpool_t *tp)
+{
+    parsec_mfence();
+    if( tp->tdm.monitor == PARSEC_TERMDET_LOCAL_BUSY ) {
+        PARSEC_DEBUG_VERBOSE(10, parsec_debug_output, "TERMDET-LOCAL:\tTASKPOOL %p nbpa == 0", tp);
+        if( parsec_atomic_cas_ptr(&tp->tdm.monitor, PARSEC_TERMDET_LOCAL_BUSY, PARSEC_TERMDET_LOCAL_TERMINATING) ) {
+            parsec_termdet_local_termination_detected(tp);
+        }
+    }
+}
+
 static int parsec_termdet_local_taskpool_ready(parsec_taskpool_t *tp)
 {
     assert( tp->tdm.module != NULL );
@@ -160,10 +182,18 @@ static int parsec_termdet_local_taskpool_ready(parsec_taskpool_t *tp)
     assert( tp->tdm.monitor == PARSEC_TERMDET_LOCAL_NOT_READY );
     /* Retain before publishing BUSY: from then on any thread that completes
      * the last task can detect termination and release this reference, and
-     * a release that came first would free a taskpool still in use. */
+     * a release that came first would free a taskpool still in use. The C11
+     * atomics backend makes both the retain and the CAS relaxed, so order
+     * them explicitly; the matching parsec_atomic_rmb() is in
+     * parsec_termdet_local_termination_detected(). */
     PARSEC_OBJ_RETAIN(tp);
+    parsec_atomic_wmb();
     parsec_atomic_cas_ptr(&tp->tdm.monitor, PARSEC_TERMDET_LOCAL_NOT_READY, PARSEC_TERMDET_LOCAL_BUSY);
     PARSEC_DEBUG_VERBOSE(10, parsec_debug_output, "TERMDET-LOCAL:\tTASKPOOL %p READY", tp);
+    /* Pairs with the parsec_mfence() in
+     * parsec_termdet_local_pending_actions_reached_zero(): either the read
+     * below sees nb_pending_actions at 0, or that thread sees BUSY. */
+    parsec_mfence();
     if( tp->nb_pending_actions == 0) {
         /* It's possible another thread sees nb_pending_actions == 0 and BUSY before me, so call the callback
          * only if I'm the one setting to terminated */
@@ -192,11 +222,8 @@ static int32_t parsec_termdet_local_taskpool_set_nb_tasks(parsec_taskpool_t *tp,
             nbpa = parsec_atomic_fetch_dec_int32(&tp->nb_pending_actions) - 1;
             PARSEC_DEBUG_VERBOSE(10, parsec_debug_output, "TERMDET-LOCAL:\tTASKPOOL %p  NB_PA %d -> %d", tp, nbpa+1, nbpa);
         }
-        if( tp->tdm.monitor == PARSEC_TERMDET_LOCAL_BUSY && nbpa == 0 ) {
-            PARSEC_DEBUG_VERBOSE(10, parsec_debug_output, "TERMDET-LOCAL:\tTASKPOOL %p nbpa == 0", tp);
-            if( parsec_atomic_cas_ptr(&tp->tdm.monitor, PARSEC_TERMDET_LOCAL_BUSY, PARSEC_TERMDET_LOCAL_TERMINATING) ) {
-                parsec_termdet_local_termination_detected(tp);
-            }
+        if( nbpa == 0 ) {
+            parsec_termdet_local_pending_actions_reached_zero(tp);
         }
     }
     return ret;
@@ -210,10 +237,8 @@ static int32_t parsec_termdet_local_taskpool_set_runtime_actions(parsec_taskpool
     do {
         ov = tp->nb_pending_actions;
     } while(!parsec_atomic_cas_int32(&tp->nb_pending_actions, ov, v));
-    if( tp->tdm.monitor == PARSEC_TERMDET_LOCAL_BUSY && v == 0 ) {
-        if( parsec_atomic_cas_ptr(&tp->tdm.monitor, PARSEC_TERMDET_LOCAL_BUSY, PARSEC_TERMDET_LOCAL_TERMINATING) ) {
-            parsec_termdet_local_termination_detected(tp);
-        }
+    if( v == 0 ) {
+        parsec_termdet_local_pending_actions_reached_zero(tp);
     }
     return v;
 }
@@ -235,10 +260,8 @@ static int32_t parsec_termdet_local_taskpool_addto_nb_tasks(parsec_taskpool_t *t
         assert(nbpa >= 0);
         PARSEC_DEBUG_VERBOSE(10, parsec_debug_output, "TERMDET-LOCAL:\tTASKPOOL %p  NB_PA %d -> %d", tp, nbpa+1, nbpa);
     }
-    if( tp->tdm.monitor == PARSEC_TERMDET_LOCAL_BUSY && nbpa == 0 ) {
-        if( parsec_atomic_cas_ptr(&tp->tdm.monitor, PARSEC_TERMDET_LOCAL_BUSY, PARSEC_TERMDET_LOCAL_TERMINATING) ) {
-            parsec_termdet_local_termination_detected(tp);
-       }
+    if( nbpa == 0 ) {
+        parsec_termdet_local_pending_actions_reached_zero(tp);
     }
     return ov+v;
 }
@@ -252,10 +275,8 @@ static int32_t parsec_termdet_local_taskpool_addto_runtime_actions(parsec_taskpo
         return tp->nb_pending_actions;
     ov = parsec_atomic_fetch_add_int32(&tp->nb_pending_actions, v);
     assert(ov+v >= 0);
-    if( tp->tdm.monitor == PARSEC_TERMDET_LOCAL_BUSY && ov+v == 0 ) {
-        if( parsec_atomic_cas_ptr(&tp->tdm.monitor, PARSEC_TERMDET_LOCAL_BUSY, PARSEC_TERMDET_LOCAL_TERMINATING) ) {
-            parsec_termdet_local_termination_detected(tp);
-        }
+    if( ov+v == 0 ) {
+        parsec_termdet_local_pending_actions_reached_zero(tp);
     }
     return ov+v;
 }
