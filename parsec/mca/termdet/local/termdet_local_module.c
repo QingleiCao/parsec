@@ -120,8 +120,9 @@ static parsec_termdet_taskpool_state_t parsec_termdet_local_taskpool_state(parse
 {
     /* termination_detected() might run in parallel with taskpool_state(),
      * so use a local copy of the monitor. It's fine to return an old
-     * value for the state. */
-    void *monitor = tp->tdm.monitor;
+     * value for the state. The load is atomic so that the acquire fence
+     * below pairs with the release fence on the writer's side. */
+    void *monitor = parsec_atomic_load_ptr(&tp->tdm.monitor);
     if( tp->tdm.module == NULL )
         return PARSEC_TERM_TP_NOT_MONITORED;
     assert(tp->tdm.module == &parsec_termdet_local_module.module);
@@ -205,7 +206,7 @@ static int parsec_termdet_local_taskpool_ready(parsec_taskpool_t *tp)
      * parsec_termdet_local_pending_actions_reached_zero(): either the read
      * below sees nb_pending_actions at 0, or that thread sees BUSY. */
     parsec_mfence();
-    if( tp->nb_pending_actions == 0) {
+    if( parsec_atomic_load_int32(&tp->nb_pending_actions) == 0 ) {
         /* It's possible another thread sees nb_pending_actions == 0 and BUSY before me, so call the callback
          * only if I'm the one setting to terminated */
         if( parsec_atomic_cas_ptr(&tp->tdm.monitor, PARSEC_TERMDET_LOCAL_BUSY, PARSEC_TERMDET_LOCAL_TERMINATING) ) {

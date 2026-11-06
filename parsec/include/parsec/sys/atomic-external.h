@@ -42,6 +42,11 @@ parsec_atomic_cas_ptr(volatile void* location,
                       void* old_value,
                       void* new_value);
 
+/* Loads */
+
+PARSEC_DECLSPEC int32_t parsec_atomic_load_int32(volatile int32_t* location);
+PARSEC_DECLSPEC void* parsec_atomic_load_ptr(volatile void* location);
+
 /* Mask Operations */
 
 PARSEC_DECLSPEC int32_t parsec_atomic_fetch_or_int32(int32_t*, int32_t);

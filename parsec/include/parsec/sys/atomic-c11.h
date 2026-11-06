@@ -104,6 +104,24 @@ int parsec_atomic_cas_int128(volatile __int128_t* location,
 }
 #endif  /* defined(PARSEC_HAVE_INT128) */
 
+/* Loads */
+
+#define PARSEC_ATOMIC_HAS_ATOMIC_LOAD_INT32
+ATOMIC_STATIC_INLINE
+int32_t parsec_atomic_load_int32(volatile int32_t* location)
+{
+    return atomic_load_explicit((_Atomic int32_t*)location,
+                                PARSEC_ATOMIC_STDC_DEFAULT_MEMORDER);
+}
+
+#define PARSEC_ATOMIC_HAS_ATOMIC_LOAD_PTR
+ATOMIC_STATIC_INLINE
+void* parsec_atomic_load_ptr(volatile void* location)
+{
+    return (void*)atomic_load_explicit((_Atomic intptr_t*)location,
+                                       PARSEC_ATOMIC_STDC_DEFAULT_MEMORDER);
+}
+
 /* Mask Operations */
 
 #define PARSEC_ATOMIC_HAS_ATOMIC_FETCH_OR_INT32

@@ -98,6 +98,33 @@ int parsec_atomic_cas_ptr(volatile void* l, void* o, void* n)
 #    endif
 #  endif /* !defined(PARSEC_ATOMIC_HAS_ATOMIC_CAS_PTR) */
 
+/* Loads
+ *
+ * Relaxed loads: atomic, with no ordering of their own. Use them for a read
+ * that pairs with a fence, so that the fence rules of the C11 memory model
+ * apply to it. The C11 backend implements them with atomic_load_explicit().
+ * The other backends implement their read-modify-write operations with full
+ * barriers and, like the rest of PaRSEC, rely on aligned word-sized volatile
+ * reads being single-copy atomic. */
+
+#  if !defined(PARSEC_ATOMIC_HAS_ATOMIC_LOAD_INT32)
+#  define PARSEC_ATOMIC_HAS_ATOMIC_LOAD_INT32
+ATOMIC_STATIC_INLINE
+int32_t parsec_atomic_load_int32(volatile int32_t* location)
+{
+    return *location;
+}
+#  endif  /* !defined(PARSEC_ATOMIC_HAS_ATOMIC_LOAD_INT32) */
+
+#  if !defined(PARSEC_ATOMIC_HAS_ATOMIC_LOAD_PTR)
+#  define PARSEC_ATOMIC_HAS_ATOMIC_LOAD_PTR
+ATOMIC_STATIC_INLINE
+void* parsec_atomic_load_ptr(volatile void* location)
+{
+    return *(void* volatile*)location;
+}
+#  endif  /* !defined(PARSEC_ATOMIC_HAS_ATOMIC_LOAD_PTR) */
+
 /* Memory Barriers */
 
 #  if !defined(PARSEC_ATOMIC_HAS_WMB)
