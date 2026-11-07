@@ -6022,6 +6022,7 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
     if( NULL == gpu_task ) {
         if( 0 != completed_w2r ) {
             released_tasks = completed_w2r;
+            completed_w2r = 0;  /* counted out; see remove_gpu_task */
             goto release_device_slots;
         }
         gpu_task = progress_task;
@@ -6034,7 +6035,14 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
     /* Release the GPU task */
     released_tasks = parsec_gpu_task_ring_release(gpu_task);
     assert(released_tasks > 0);
+    /* Write-backs completed in the last completion round are counted out
+     * here, once. remove_gpu_task is also reached without passing through
+     * that round (a command retired, a task withdrawn with ASYNC or NEXT, an
+     * incarnation retired), so the count must not survive this use: added a
+     * second time it takes a slot nobody holds, and the manager later leaves
+     * at zero with a task still on the device that no thread will poll. */
     released_tasks += completed_w2r;
+    completed_w2r = 0;
 
   release_device_slots:
     rc = parsec_atomic_fetch_sub_int32(&(gpu_device->mutex), released_tasks);
