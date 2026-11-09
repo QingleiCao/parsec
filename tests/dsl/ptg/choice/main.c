@@ -21,7 +21,7 @@ int main(int argc, char *argv[])
 {
     parsec_context_t* parsec;
     int rank, world, cores = -1;
-    int size, nb, i, c, rc;
+    int size, nb, i, c, rc, ret = 0;
     parsec_data_collection_t *dcA;
     int *decision;
     parsec_taskpool_t *choice;
@@ -69,6 +69,15 @@ int main(int argc, char *argv[])
 
     parsec_taskpool_free((parsec_taskpool_t*)choice);
 
+    /* Each rank sees the decisions of the Choice tasks it ran, those of A(k)
+     * it owns (see rank_of in choice_data.c), and only those. */
+    for(i = rank; i <= nb; i += world) {
+        if( (1 != decision[i]) && (2 != decision[i]) ) {
+            fprintf(stderr, "On rank %d, Choice(%d) did not run (decision %d)\n", rank, i, decision[i]);
+            ret = 1;
+        }
+    }
+
     for(size = 0; size < world; size++) {
         if( rank == size ) {
             printf("On rank %d, the choices were: ", rank);
@@ -89,5 +98,5 @@ int main(int argc, char *argv[])
     rc = parsec_tests_context_fini(&parsec);
     PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
 
-    return 0;
+    return ret;
 }

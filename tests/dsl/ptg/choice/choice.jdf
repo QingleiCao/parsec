@@ -18,22 +18,26 @@ Choice(k)
 k = 0 .. NT
 : A(k)
 
-RW D  <- (k == 0) ? A(k)
-      <- %{ return (k > 0) && (decision[k-1] == 1); %} ? D TA(k-1)
-      <- %{ return (k > 0) && (decision[k-1] == 2); %} ? D TB(k-1)
-      -> %{ return (k <= NT) && (decision[k] == 1); %} ? D TA(k)
-      -> %{ return (k <= NT) && (decision[k] == 2); %} ? D TB(k)
+/*
+ * decision[] lives in each process and is written by the task bodies, so a
+ * rank only knows the decisions of the Choice tasks it ran. A rank that
+ * receives data for a task evaluates that task's input guards to find the
+ * receive type, so a guard reading decision[] is only valid on an edge whose
+ * two ends run on the same rank. Choice(k), TA(k), TB(k) and Join(k) all run
+ * on the owner of A(k): the decision only guards the edges between them, and
+ * the edge that crosses ranks, Join(k) -> Choice(k+1), does not depend on it.
+ */
+RW D  <- (k == 0) ? A(k) : D Join(k-1)
+      -> %{ return decision[k] == 1; %} ? D TA(k)
+      -> %{ return decision[k] == 2; %} ? D TB(k)
 
 CTL T -> (k == NT) ? T Terminate(0..P-1)
 
 BODY
 {
-        int d;
-        if(k <= NT ) {
-             d = rand() % 2 + 1;
-             decision[k] = d ;
-             printf("Execute Choice(%d), choosing decision %c\n", k, d == 0 ? '#' : (d == 1 ? 'A' : 'B'));
-        }
+        int d = rand() % 2 + 1;
+        decision[k] = d;
+        printf("Execute Choice(%d), choosing decision %c\n", k, d == 1 ? 'A' : 'B');
 }
 END
 
@@ -56,7 +60,7 @@ k = 0 .. NT
 : A(k)
 
 RW  D <- D Choice(k)
-      -> D Choice(k+1)
+      -> D Join(k)
 
 BODY
 {
@@ -75,7 +79,7 @@ k = 0 .. NT
 : A(k)
 
 RW  D <- D Choice(k)
-      -> D Choice(k+1)
+      -> D Join(k)
 
 BODY
 {
@@ -84,5 +88,24 @@ BODY
 
         /* Decrease counter for the task B not done */
         this_task->taskpool->tdm.module->taskpool_addto_nb_tasks(this_task->taskpool, -1);
+}
+END
+
+/*
+ * Join(k) runs where TA(k) or TB(k) ran, so its input guard reads the
+ * decision Choice(k) took on this rank.
+ */
+Join(k)
+
+k = 0 .. NT
+
+: A(k)
+
+RW  D <- %{ return decision[k] == 1; %} ? D TA(k) : D TB(k)
+      -> (k < NT) ? D Choice(k+1)
+
+BODY
+{
+        printf("Execute Join(%d) after T%c(%d)\n", k, decision[k] == 1 ? 'A' : 'B', k);
 }
 END
