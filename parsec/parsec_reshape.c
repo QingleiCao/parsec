@@ -533,10 +533,14 @@ parsec_set_up_reshape_promise(parsec_execution_stream_t *es,
     char type_name_src[MAX_TASK_STRLEN] = "NULL";
     char type_name_dst[MAX_TASK_STRLEN] = "NULL";
     char type_name_data[MAX_TASK_STRLEN] = "NULL";
+#if defined(PARSEC_HAVE_MPI)
     int len;
     if(data->local.src_datatype!=PARSEC_DATATYPE_NULL) MPI_Type_get_name(data->local.src_datatype, type_name_src, &len);
     if(data->local.dst_datatype!=PARSEC_DATATYPE_NULL) MPI_Type_get_name(data->local.dst_datatype, type_name_dst, &len);
     if(data->data->dtt!=PARSEC_DATATYPE_NULL) MPI_Type_get_name(data->data->dtt, type_name_data, &len);
+#else
+    (void)type_name_src; (void)type_name_dst; (void)type_name_data;
+#endif  /* defined(PARSEC_HAVE_MPI) */
 
     PARSEC_DEBUG_VERBOSE(12, parsec_debug_output,
                          "th%d RESHAPE_PROMISE CREATE %s %s %s [%p:%s:%p -> %s:%p] flow_idx %u fut %p on %s(%p) k%d dtt %s -> %s [data %s]",
@@ -614,10 +618,14 @@ parsec_get_copy_reshape_inline(parsec_execution_stream_t *es,
         char type_name_src[MAX_TASK_STRLEN] = "NULL";
         char type_name_dst[MAX_TASK_STRLEN] = "NULL";
         char type_name_data[MAX_TASK_STRLEN] = "NULL";
+#if defined(PARSEC_HAVE_MPI)
         int len;
         if(data->local.src_datatype!=PARSEC_DATATYPE_NULL) MPI_Type_get_name(data->local.src_datatype, type_name_src, &len);
         if(data->local.dst_datatype!=PARSEC_DATATYPE_NULL) MPI_Type_get_name(data->local.dst_datatype, type_name_dst, &len);
         if(data->data->dtt!=PARSEC_DATATYPE_NULL) MPI_Type_get_name(data->data->dtt, type_name_data, &len);
+#else
+        (void)type_name_src; (void)type_name_dst; (void)type_name_data;
+#endif  /* defined(PARSEC_HAVE_MPI) */
 
         PARSEC_DEBUG_VERBOSE(12, parsec_debug_output,
                              "th%d RESHAPE_PROMISE CREATE %s %s [%s:%p:%p -> %p] flow_idx %u fut %p on %s(%p) k%d dtt %s -> %s [data %s]",
