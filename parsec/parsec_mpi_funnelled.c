@@ -241,6 +241,9 @@ static int current_size_of_total_reqs = 0;
 static int mpi_funnelled_last_active_req = 0;
 static _Atomic int mpi_funnelled_num_recv_req_in_arr = 0;
 static _Atomic int mpi_funnelled_num_send_req_in_arr = 0;
+/** Active messages accepted by send_am whose MPI_Isend has not completed yet,
+ *  whether still queued or already in the array of requests. */
+static _Atomic int mpi_funnelled_num_sendam_pending = 0;
 
 #if defined(PARSEC_HAVE_MPI_OVERTAKE)
 static int parsec_param_enable_mpi_overtake = 1;
@@ -1330,6 +1333,8 @@ mpi_no_thread_send_active_message_impl(parsec_comm_engine_t *ce,
     cb->cb_type.sendam.remote = remote;
 
 
+    mpi_funnelled_num_sendam_pending++;
+
     /* need to take the lock here */
     pthread_mutex_lock(&array_of_requests_mtx);
     parsec_list_nolock_push_back(&mpi_funnelled_dynamic_sendamreq_fifo, (parsec_list_item_t *)item);
@@ -1542,6 +1547,10 @@ mpi_no_thread_progress(parsec_comm_engine_t *ce)
                 int cnt = --mpi_funnelled_num_send_req_in_arr;
                 DEBUG("COMPLETE MIMIC AM cnt %d\n", cnt);
                 assert(cnt >= 0);
+            } else if (cb->type == MPI_FUNNELLED_TYPE_SENDAM) {
+                int cnt = --mpi_funnelled_num_sendam_pending;
+                DEBUG("COMPLETE SEND AM cnt %d\n", cnt);
+                assert(cnt >= 0); (void)cnt;
             }
 
 
@@ -1707,10 +1716,21 @@ mpi_no_thread_enable(parsec_comm_engine_t *ce)
     return 1;
 }
 
+/**
+ * send_am only queues an active message; progress posts it once a slot in the
+ * array of requests is free. The upper layer considers the message sent as
+ * soon as send_am returns (remote_dep_nothread_send releases the task's
+ * dependencies right after it), so a process can finish its share of the
+ * work while some of its messages are still queued. Nothing progresses them
+ * while the engine is disabled, and the peer would wait for them forever:
+ * post and complete them all before going to sleep.
+ */
 int
 mpi_no_thread_disable(parsec_comm_engine_t *ce)
 {
-    (void) ce;
+    while( mpi_funnelled_num_sendam_pending > 0 ) {
+        mpi_no_thread_progress(ce);
+    }
     return 1;
 }
 

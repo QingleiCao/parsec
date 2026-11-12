@@ -472,6 +472,10 @@ void* remote_dep_dequeue_main(parsec_context_t* context)
         }
 
         whatsup = remote_dep_dequeue_nothread_progress(&parsec_comm_es, -1 /* loop till explicitly asked to return */);
+        /* Every message handed to the engine counts as sent: let the engine
+         * push out the ones it still holds, nothing will progress them while
+         * this thread sleeps. */
+        parsec_ce.disable(&parsec_ce);
         PARSEC_DEBUG_VERBOSE(20, parsec_comm_output_stream, "MPI: comm engine OFF on process %d/%d",
                              context->my_rank, context->nb_nodes);
         parsec_communication_engine_up = 1;  /* went to sleep */
