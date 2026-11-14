@@ -14,9 +14,11 @@ foreach(_sched ${MCA_sched})
     parsec_addtest_cmd(runtime/scheduling:${_sched} ${_schedmicro_launcher} runtime/scheduling/schedmicro -t 10 -l 8 -n 512 -- --mca mca_sched ${_sched})
 endforeach()
 
-# Order in which llp hands back tasks of known priorities and distances
+# Order in which llp hands back tasks of known priorities and distances, and
+# tasks another thread pushes into stream 0 while stream 0 merges
 if( "llp" IN_LIST MCA_sched )
   parsec_addtest_cmd(runtime/scheduling/llp_order ${SHM_TEST_CMD_LIST} runtime/scheduling/llp_order)
+  parsec_addtest_cmd(runtime/scheduling/llp_concurrent_push ${SHM_TEST_CMD_LIST} runtime/scheduling/llp_concurrent_push)
 endif()
 
 if( MPI_C_FOUND )

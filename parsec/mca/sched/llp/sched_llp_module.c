@@ -376,6 +376,26 @@ parsec_list_item_t* lifo_merge_ring(parsec_list_item_t *next_in_lifo,
     return list;
 }
 
+/**
+ * @brief Make a ring of the chain of elements other threads pushed into
+ *        the LIFO while lifo_chain_sorted() merged
+ *
+ * @details In paranoid builds, parsec_list_item_ring() detaches the
+ *          elements: lifo_chain_sorted() attaches them again before it
+ *          merges them back.
+ *
+ * @return the ring
+ */
+static
+parsec_list_item_t* lifo_chain_to_ring(parsec_list_item_t *first)
+{
+    parsec_list_item_t *last = first;
+    while (NULL != last->list_next) {
+        last = (parsec_list_item_t*)last->list_next;
+    }
+    return parsec_list_item_ring(first, last);
+}
+
 #if defined(PARSEC_ATOMIC_HAS_ATOMIC_CAS_INT128)
 
 void lifo_chain_sorted( parsec_lifo_t* lifo,
@@ -387,7 +407,6 @@ void lifo_chain_sorted( parsec_lifo_t* lifo,
 #if defined(PARSEC_DEBUG_PARANOID)
     assert( (uintptr_t)ring % PARSEC_LIFO_ALIGNMENT(lifo) == 0 );
 #endif
-    PARSEC_ITEMS_ATTACH(lifo, ring);
 
     /* first: mark the lifo as empty */
     parsec_list_item_t *next;
@@ -408,6 +427,9 @@ void lifo_chain_sorted( parsec_lifo_t* lifo,
 #endif // CHECK_RING_SORTED
 
 repeat:
+    /* attach the new elements, or on a repeat the elements pushed in
+     * between, which lifo_chain_to_ring() detached */
+    PARSEC_ITEMS_ATTACH(lifo, ring);
 
     /* first try to push the whole ring or detach existing elements */
     do {
@@ -463,13 +485,7 @@ repeat:
                     break;
                 }
                 /* form a ring of popped items */
-                parsec_list_item_t *last = next;
-				parsec_list_item_t *prev_last = last;
-                while (last != NULL) {
-					prev_last = last;
-                    last = PARSEC_LIST_ITEM_NEXT(last);
-                }
-                new_ring = parsec_list_item_ring(next, prev_last);
+                new_ring = lifo_chain_to_ring(next);
                 break;
             }
         } while (1);
@@ -503,7 +519,6 @@ void lifo_chain_sorted( parsec_lifo_t* lifo,
     int last_prio = COMPARISON_VAL(ring, offset);
     next = ring;
     do {
-        PARSEC_ITEM_ATTACH(lifo, next);
         next = PARSEC_LIST_ITEM_NEXT(next);
         if (last_prio < COMPARISON_VAL(next, offset)) {
             sorted = false;
@@ -513,6 +528,9 @@ void lifo_chain_sorted( parsec_lifo_t* lifo,
 #endif // CHECK_RING_SORTED
 
 repeat:
+    /* attach the new elements, or on a repeat the elements pushed in
+     * between, which lifo_chain_to_ring() detached */
+    PARSEC_ITEMS_ATTACH(lifo, ring);
 
     /* first try to detach existing elements */
 
@@ -564,11 +582,7 @@ repeat:
                 }
 
                 /* form a ring of popped items to repeat the process */
-                parsec_list_item_t *last = next;
-                while (last != NULL) {
-                    last = PARSEC_LIST_ITEM_NEXT(last);
-                }
-                new_ring = parsec_list_item_ring(next, last);
+                new_ring = lifo_chain_to_ring(next);
                 break;
             }
         } while (1);
@@ -607,7 +621,6 @@ void lifo_chain_sorted( parsec_lifo_t* lifo,
     int last_prio = COMPARISON_VAL(ring, offset);
     next = ring;
     do {
-        PARSEC_ITEM_ATTACH(lifo, next);
         next = PARSEC_LIST_ITEM_NEXT(next);
         if (last_prio < COMPARISON_VAL(next, offset)) {
             sorted = false;
@@ -620,6 +633,9 @@ void lifo_chain_sorted( parsec_lifo_t* lifo,
     parsec_atomic_lock(&lifo->lifo_head.data.guard.lock);
 
 repeat:
+    /* attach the new elements, or on a repeat the elements pushed in
+     * between, which lifo_chain_to_ring() detached */
+    PARSEC_ITEMS_ATTACH(lifo, ring);
 
     next = lifo->lifo_head.data.item;
     if (sorted && distance == 0 &&
@@ -658,11 +674,7 @@ repeat:
 
         /* check if there are new items */
         if (next != NULL) {
-            parsec_list_item_t *last = next;
-            while (last != NULL) {
-                last = PARSEC_LIST_ITEM_NEXT(last);
-            }
-            new_ring = parsec_list_item_ring(next, last);
+            new_ring = lifo_chain_to_ring(next);
         }
 
         if (NULL != new_ring) {
