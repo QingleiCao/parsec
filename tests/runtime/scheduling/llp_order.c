@@ -12,9 +12,11 @@
  * the ring. A task that returned PARSEC_HOOK_RETURN_AGAIN is rescheduled
  * with distance + 1, so it must not come back first.
  *
- * This test drives the llp module of the only execution stream directly:
- * it schedules rings of tasks of known priorities at known distances, then
- * selects every task back and checks the order.
+ * This test drives the llp module of an execution stream directly: it
+ * schedules rings of tasks of known priorities at known distances, then
+ * selects every task back and checks the order. It does so on two streams:
+ * other threads may schedule on stream 0, so llp puts a merged queue back
+ * with care there, while it just stores it on the other streams.
  */
 #include "parsec.h"
 #include "parsec/parsec_internal.h"
@@ -114,34 +116,43 @@ static int run_case(parsec_execution_stream_t *es, const sched_case_t *tc)
     }
 
     if( 0 != strcmp(got, tc->expected) ) {
-        fprintf(stderr, "FAIL %s: selected \"%s\", expected \"%s\"\n",
-                tc->what, got, tc->expected);
+        fprintf(stderr, "FAIL stream %d: %s: selected \"%s\", expected \"%s\"\n",
+                es->th_id, tc->what, got, tc->expected);
         return 1;
     }
-    printf("ok   %s: \"%s\"\n", tc->what, got);
+    printf("ok   stream %d: %s: \"%s\"\n", es->th_id, tc->what, got);
     return 0;
 }
 
 int main(int argc, char *argv[])
 {
     parsec_context_t *parsec = NULL;
+    parsec_vp_t *vp;
     const char *sched_name;
     int rc, failed = 0;
 
     /* this test is about llp, whatever the environment asks for */
     setenv("PARSEC_MCA_mca_sched", "llp", 1);
 
-    rc = parsec_tests_context_init(1, PARSEC_TEST_THREAD_SERIALIZED,
+    /* two streams: the context is never started, so the thread of the
+     * second one waits while this thread schedules and selects on both */
+    rc = parsec_tests_context_init(2, PARSEC_TEST_THREAD_SERIALIZED,
                                    &argc, &argv, &parsec, NULL, NULL);
     PARSEC_CHECK_ERROR(rc, "parsec_tests_context_init");
 
     sched_name = parsec_current_scheduler->component->base_version.mca_component_name;
+    vp = parsec_my_execution_stream()->virtual_process;
     if( 0 != strcmp(sched_name, "llp") ) {
         fprintf(stderr, "FAIL the selected scheduler is %s, not llp\n", sched_name);
         failed = 1;
+    } else if( vp->nb_cores < 2 ) {
+        fprintf(stderr, "FAIL the context has %d execution stream, not 2\n", vp->nb_cores);
+        failed = 1;
     } else {
-        for( size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++ ) {
-            failed += run_case(parsec_my_execution_stream(), &cases[c]);
+        for( int t = 0; t < 2; t++ ) {
+            for( size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++ ) {
+                failed += run_case(vp->execution_streams[t], &cases[c]);
+            }
         }
     }
 
