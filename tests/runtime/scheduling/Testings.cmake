@@ -14,6 +14,12 @@ foreach(_sched ${MCA_sched})
     parsec_addtest_cmd(runtime/scheduling:${_sched} ${_schedmicro_launcher} runtime/scheduling/schedmicro -t 10 -l 8 -n 512 -- --mca mca_sched ${_sched})
 endforeach()
 
+# By default a stream keeps one of the tasks it makes ready and runs it without
+# asking the scheduler. Here every task goes through the scheduler.
+foreach(_sched ${MCA_sched})
+    parsec_addtest_cmd(runtime/scheduling:nokeep:${_sched} ${_schedmicro_launcher} runtime/scheduling/schedmicro -t 10 -l 8 -n 512 -- --mca mca_sched ${_sched} --mca runtime_keep_highest_priority_task 0)
+endforeach()
+
 if( MPI_C_FOUND )
   foreach(_sched ${MCA_sched})
         parsec_addtest_cmd(runtime/scheduling:mp:${_sched} ${MPI_TEST_CMD_LIST} 2 runtime/scheduling/schedmicro -t 10 -l 8 -n 512 -- --mca mca_sched ${_sched})

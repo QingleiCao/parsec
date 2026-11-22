@@ -389,10 +389,13 @@ __parsec_schedule(parsec_execution_stream_t* es,
  * work, such as GPU management, it must flush this private slot to avoid
  * delaying ready work. A path that hands work to an existing manager and
  * returns to normal selection should retain the private task.
- * Everything else gets pushed into the execution stream 0 of the corresponding
- * virtual process.
- * If the provided execution stream is NULL, all tasks are delivered to their
- * respective vp.
+ * Everything else is handed to the scheduler: on the provided execution stream
+ * for the tasks of its own virtual process, if it is a computing stream, and
+ * on the execution stream 0 of every other virtual process. This also holds
+ * when no task is kept (runtime_keep_highest_priority_task is 0, or the
+ * distance is not 0).
+ * If the provided execution stream is NULL, all tasks are delivered to the
+ * execution stream 0 of their respective vp.
  *
  * Beware, as the manipulation of next_task is not protected, an execution
  * stream should never be used concurrently in two call to this function (or
@@ -414,6 +417,13 @@ int __parsec_schedule_vp(parsec_execution_stream_t* submission_es,
             if( NULL == ring ) continue;
 
             target_es = context->virtual_processes[vp]->execution_streams[0];
+            /* A computing stream schedules the tasks of its own VP on itself, as
+             * it does below when it keeps one of them. On the stream 0 instead,
+             * the tasks of every stream of the VP go through the queue of that
+             * one stream. */
+            if( NULL != submission_es && NULL != submission_es->scheduler_object &&
+                vp == submission_es->virtual_process->vp_id )
+                target_es = submission_es;
 
             ret = __parsec_schedule(target_es, ring, distance);
             if( 0 != ret )
