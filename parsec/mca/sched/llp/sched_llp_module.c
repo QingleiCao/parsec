@@ -367,14 +367,48 @@ parsec_list_item_t* lifo_merge_ring(parsec_list_item_t *next_in_lifo,
             } else {
                 list = item;
             }
-            /* the rest of the ring goes after this element */
-            prev = item;
+            if (!sorted && NULL != ring && A_HIGHER_PRIORITY_THAN_B(ring, item, offset)) {
+                /* unsorted ring: the next element goes before this one.
+                 * Look for its place from the head again, behind the same
+                 * elements of the chain. It then goes before the elements
+                 * of the ring that have its priority, like a new one. */
+                if (d < distance) {
+                    /* the chain is shorter than the distance */
+                    distance = d;
+                }
+                prev = NULL;
+                next = list;
+                d = 0;
+            } else {
+                /* the rest of the ring goes after this element */
+                prev = item;
+            }
         }
 
     } while (NULL != ring);
 
     return list;
 }
+
+#if CHECK_RING_SORTED
+/**
+ * @brief Tell if the elements of a ring are in descending priority order
+ */
+static
+bool lifo_ring_is_sorted(parsec_list_item_t *ring, size_t offset)
+{
+    parsec_list_item_t *item = ring, *next;
+
+    while (item != ring->list_prev) {
+        next = (parsec_list_item_t*)item->list_next;
+        if (A_HIGHER_PRIORITY_THAN_B(next, item, offset)) {
+            return false;
+        }
+        item = next;
+    }
+    return true;
+}
+#endif // CHECK_RING_SORTED
 
 /**
  * @brief Make a ring of the chain of elements other threads pushed into
@@ -415,15 +449,7 @@ void lifo_chain_sorted( parsec_lifo_t* lifo,
     bool sorted = true;
 
 #if CHECK_RING_SORTED
-    int last_prio = COMPARISON_VAL(ring, offset);
-    next = ring;
-    do {
-        next = PARSEC_LIST_ITEM_NEXT(next);
-        if (last_prio < COMPARISON_VAL(next, offset)) {
-            sorted = false;
-            break;
-        }
-    } while (next != ring->list_prev);
+    sorted = lifo_ring_is_sorted(ring, offset);
 #endif // CHECK_RING_SORTED
 
 repeat:
@@ -492,6 +518,8 @@ repeat:
 
         if (NULL != new_ring) {
             ring = new_ring;
+            /* the distance was for the ring of the caller, which is in place */
+            distance = 0;
             goto repeat;
         }
     }
@@ -516,15 +544,7 @@ void lifo_chain_sorted( parsec_lifo_t* lifo,
 
     bool sorted = true;
 #if CHECK_RING_SORTED
-    int last_prio = COMPARISON_VAL(ring, offset);
-    next = ring;
-    do {
-        next = PARSEC_LIST_ITEM_NEXT(next);
-        if (last_prio < COMPARISON_VAL(next, offset)) {
-            sorted = false;
-            break;
-        }
-    } while (next != ring->list_prev);
+    sorted = lifo_ring_is_sorted(ring, offset);
 #endif // CHECK_RING_SORTED
 
 repeat:
@@ -547,7 +567,7 @@ repeat:
             }
             /* restore the ring */
             ring->list_prev->list_next = ring;
-        } else if (parsec_atomic_sc_ptr((long*)&lifo->lifo_head.data.item, NULL)) {
+        } else if (parsec_atomic_sc_ptr((long*)&lifo->lifo_head.data.item, (intptr_t)NULL)) {
             /* detached all elements from the lifo */
             break;
         }
@@ -589,6 +609,8 @@ repeat:
 
         if (NULL != new_ring) {
             ring = new_ring;
+            /* the distance was for the ring of the caller, which is in place */
+            distance = 0;
             goto repeat;
         }
     }
@@ -618,15 +640,7 @@ void lifo_chain_sorted( parsec_lifo_t* lifo,
 
     bool sorted = true;
 #if CHECK_RING_SORTED
-    int last_prio = COMPARISON_VAL(ring, offset);
-    next = ring;
-    do {
-        next = PARSEC_LIST_ITEM_NEXT(next);
-        if (last_prio < COMPARISON_VAL(next, offset)) {
-            sorted = false;
-            break;
-        }
-    } while (next != ring->list_prev);
+    sorted = lifo_ring_is_sorted(ring, offset);
 #endif // CHECK_RING_SORTED
 
     /* first try to detach existing elements */
@@ -679,6 +693,8 @@ repeat:
 
         if (NULL != new_ring) {
             ring = new_ring;
+            /* the distance was for the ring of the caller, which is in place */
+            distance = 0;
             /* keep the lock */
             goto repeat;
         }
