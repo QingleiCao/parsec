@@ -567,7 +567,7 @@ repeat:
             }
             /* restore the ring */
             ring->list_prev->list_next = ring;
-        } else if (parsec_atomic_sc_ptr((long*)&lifo->lifo_head.data.item, NULL)) {
+        } else if (parsec_atomic_sc_ptr((long*)&lifo->lifo_head.data.item, (intptr_t)NULL)) {
             /* detached all elements from the lifo */
             break;
         }
