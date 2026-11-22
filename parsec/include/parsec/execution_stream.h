@@ -77,6 +77,16 @@ struct parsec_execution_stream_s {
                                                                     *   we use these mempools */
     parsec_thread_mempool_t *dependencies_mempool; /**< If using hashtables to store dependencies
                                                     *   those are allocated using this mempool */
+
+    /* The tasks this stream executes on a device that is not an accelerator
+     * are counted here, where only this stream writes, and not in the
+     * executed_tasks of the device, which all the streams would then write
+     * for every task. The statistics of the device add the two, see
+     * parsec_device_count_executed_task().
+     */
+    struct parsec_device_module_s *executed_tasks_device; /**< The device the count below is for */
+    uint64_t                       executed_tasks;        /**< Tasks executed on that device and not yet
+                                                           *   added to its executed_tasks */
 };
 
 /**

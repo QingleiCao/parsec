@@ -14,6 +14,9 @@ foreach(_sched ${MCA_sched})
     parsec_addtest_cmd(runtime/scheduling:${_sched} ${_schedmicro_launcher} runtime/scheduling/schedmicro -t 10 -l 8 -n 512 -- --mca mca_sched ${_sched})
 endforeach()
 
+# What the devices count as executed tasks, with the tasks executed by all the streams
+parsec_addtest_cmd(runtime/executed_tasks ${_schedmicro_launcher} runtime/scheduling/executed_tasks)
+
 if( MPI_C_FOUND )
   foreach(_sched ${MCA_sched})
         parsec_addtest_cmd(runtime/scheduling:mp:${_sched} ${MPI_TEST_CMD_LIST} 2 runtime/scheduling/schedmicro -t 10 -l 8 -n 512 -- --mca mca_sched ${_sched})

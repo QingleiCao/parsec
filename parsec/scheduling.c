@@ -232,7 +232,11 @@ int __parsec_execute( parsec_execution_stream_t* es,
         parsec_device_module_t *dev = task->selected_device;
         if(!PARSEC_DEV_IS_GPU(dev->type)) {
             /* accelerators count their own executed tasks */
-            parsec_atomic_fetch_inc_int64((int64_t*)&dev->executed_tasks);
+            if( es->executed_tasks_device == dev ) {
+                es->executed_tasks++;  /* in the stream: no other stream writes it */
+            } else {
+                parsec_device_count_executed_task(es, dev);
+            }
         }
     }
 
