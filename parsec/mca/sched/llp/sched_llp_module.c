@@ -492,6 +492,8 @@ repeat:
 
         if (NULL != new_ring) {
             ring = new_ring;
+            /* the distance was for the ring of the caller, which is in place */
+            distance = 0;
             goto repeat;
         }
     }
@@ -589,6 +591,8 @@ repeat:
 
         if (NULL != new_ring) {
             ring = new_ring;
+            /* the distance was for the ring of the caller, which is in place */
+            distance = 0;
             goto repeat;
         }
     }
@@ -679,6 +683,8 @@ repeat:
 
         if (NULL != new_ring) {
             ring = new_ring;
+            /* the distance was for the ring of the caller, which is in place */
+            distance = 0;
             /* keep the lock */
             goto repeat;
         }

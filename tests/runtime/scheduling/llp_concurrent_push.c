@@ -17,6 +17,10 @@
  * exactly once, in priority order. In paranoid builds the LIFO also checks
  * that every task it hands out had been attached to it.
  *
+ * Stream 0 schedules every other task at a distance longer than the queue.
+ * That distance is for its own task, which goes last anyway: the tasks
+ * pushed in the meantime must not be merged back behind it.
+ *
  * The race cannot be forced, only made likely: the test reports how many
  * pushes happened while stream 0 was scheduling, and passes without proving
  * anything if none did (e.g., on a single core).
@@ -112,8 +116,9 @@ static int run_round(parsec_execution_stream_t *es, int round, int *nb_overlaps)
     race.go = 1;
     /* each of these walks the whole LIFO, giving the other thread time to push */
     while( nb_merged < NB_MERGED && 0 == race.done ) {
+        distance = (nb_merged & 1) ? NB_TASKS : 0;
         parsec_atomic_fetch_inc_int32(&race.merging);
-        parsec_current_scheduler->module.schedule(es, tasks[NB_QUEUED + NB_PUSHED + nb_merged], 0);
+        parsec_current_scheduler->module.schedule(es, tasks[NB_QUEUED + NB_PUSHED + nb_merged], distance);
         parsec_atomic_fetch_inc_int32(&race.merging);
         nb_merged++;
     }
