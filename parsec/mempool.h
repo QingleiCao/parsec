@@ -58,12 +58,22 @@ struct parsec_mempool_s {
     parsec_thread_mempool_t *thread_mempools;   /**< Array of thread mempools (of size nb_thread_mempools) */
 };
 
+/** Size used to keep the thread mempools of different threads on different cache lines */
+#define PARSEC_MEMPOOL_CACHE_LINE 64
+
 struct parsec_thread_mempool_s {
     parsec_obj_allocator_t super; /**< allocator interface, must be first */
     parsec_mempool_t  *parent;   /**<  back pointer to the mempool */
     uint32_t nb_elt;             /**< this is the number of elements this thread
                                   *   has allocated since the creation of the pool */
     parsec_lifo_t mempool;       /**< Elements are stored in a LIFO */
+    char pad[PARSEC_MEMPOOL_CACHE_LINE]; /**< The thread mempools of a mempool are the elements of one
+                                          *   array, and each allocation and each release writes the
+                                          *   head of the LIFO and reads the fields before it: without
+                                          *   this, a thread would do so on a cache line that its
+                                          *   neighbour in the array writes. A full cache line keeps
+                                          *   them apart wherever the array starts, as it is not
+                                          *   guaranteed to be cache-line aligned. Must be last. */
 };
 
 /**
