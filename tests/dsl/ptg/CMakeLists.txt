@@ -28,6 +28,13 @@ if(PARSEC_HAVE_DEV_CAPABILITY_BATCH)
   target_ptg_sources(batch_cpu PRIVATE "batch_cpu.jdf")
 endif(PARSEC_HAVE_DEV_CAPABILITY_BATCH)
 
+# Two flows of one task broadcast to different sets of ranks: several ranks needed
+if( MPI_C_FOUND )
+  parsec_addtest_executable(C multiflow_bcast)
+  target_link_libraries(multiflow_bcast PRIVATE tests_runtime_common)
+  target_ptg_sources(multiflow_bcast PRIVATE "multiflow_bcast.jdf")
+endif( MPI_C_FOUND )
+
 add_subdirectory(branching)
 add_subdirectory(choice)
 add_subdirectory(controlgather)
