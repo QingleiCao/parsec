@@ -464,8 +464,9 @@ int parsec_remote_dep_activate(parsec_execution_stream_t* es,
                                uint32_t propagation_mask)
 {
     const parsec_task_class_t* tc = task->task_class;
-    int i, my_idx, idx, current_mask, keeper = 0;
+    int i, k, my_idx, idx, current_mask, more_trees, keeper = 0;
     unsigned int array_index, count, bit_index;
+    uint32_t rank_mask, tree_mask;
     struct remote_dep_output_param_s* output;
 
     assert(es->virtual_process->parsec_context->nb_nodes > 1);
@@ -499,8 +500,6 @@ int parsec_remote_dep_activate(parsec_execution_stream_t* es,
         output = &remote_deps->output[i];
         assert( 0 != output->count_bits );
 
-        my_idx = (remote_deps->root == es->virtual_process->parsec_context->my_rank) ? 0 : -1;
-        idx = 0;
         /**
          * Increase the refcount of each local output data once, to ensure the
          * data is protected during the entire execution of the communication,
@@ -550,6 +549,19 @@ int parsec_remote_dep_activate(parsec_execution_stream_t* es,
             }
         }
 
+        /**
+         * A rank is sent a single activation, by its parent in the tree, with
+         * all the outputs it consumes. A parent that is not the root holds the
+         * outputs it consumes itself, and no other. A tree therefore connects
+         * ranks that consume the same outputs: the ranks of this output that
+         * consume another set than the first one met are left for a next tree
+         * of this output, which starts again from the root.
+         */
+      next_tree:
+        my_idx = (remote_deps->root == es->virtual_process->parsec_context->my_rank) ? 0 : -1;
+        idx = 0;
+        tree_mask = 0;
+        more_trees = 0;
         for( array_index = count = 0; count < remote_deps->output[i].count_bits; array_index++ ) {
             current_mask = output->rank_bits[array_index];
             if( 0 == current_mask ) continue;  /* no bits here */
@@ -566,6 +578,20 @@ int parsec_remote_dep_activate(parsec_execution_stream_t* es,
                 if(remote_dep_is_forwarded(es, remote_deps, rank)) {  /* already in the counting */
                     PARSEC_DEBUG_VERBOSE(20, parsec_comm_output_stream, "[%d:%d] task %s my_idx %d idx %d rank %d -- skip (already done)",
                             remote_deps->root, i, tmp, my_idx, idx, rank);
+                    continue;
+                }
+                /* The outputs this rank consumes. None comes before this one,
+                 * or the rank would have been forwarded already. */
+                for( rank_mask = 0, k = i; propagation_mask >> k; k++ ) {
+                    if( ((1U << k) & propagation_mask) &&
+                        (remote_deps->output[k].rank_bits[array_index] & (1U << bit_index)) )
+                        rank_mask |= (1U << k);
+                }
+                if( 0 == tree_mask ) tree_mask = rank_mask;
+                if( rank_mask != tree_mask ) {
+                    PARSEC_DEBUG_VERBOSE(20, parsec_comm_output_stream, "[%d:%d] task %s my_idx %d idx %d rank %d -- skip (consumes %x, this tree %x)",
+                            remote_deps->root, i, tmp, my_idx, idx, rank, rank_mask, tree_mask);
+                    more_trees = 1;
                     continue;
                 }
                 idx++;
@@ -628,6 +654,7 @@ int parsec_remote_dep_activate(parsec_execution_stream_t* es,
                 remote_dep_mark_forwarded(es, remote_deps, rank);
             }
         }
+        if( more_trees ) goto next_tree;
     }
     remote_dep_complete_and_cleanup(&remote_deps, (keeper ? 1 : 0));
     return 0;
