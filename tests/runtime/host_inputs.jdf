@@ -1,0 +1,262 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+/**
+ * The inputs of a task that runs on the host.
+ *
+ * Before the body of a task that does not run on an accelerator, the runtime
+ * goes over the flows the task reads: an input that arrives as the copy of an
+ * accelerator is replaced by the copy of the host, and the task is counted as
+ * a reader of each of them until it completes (pinned_input_mask).
+ *
+ * The flows of a PTG task class are numbered with the flows the task writes
+ * first, so the position of an input among the inputs of its class is not
+ * always its flow index. USE is declared to make the two differ: its first
+ * flow, X, is written and never read, and its inputs H and G come after it. G
+ * is written by MAKE, whose CUDA body, when there is a device to run it,
+ * leaves the value on the accelerator.
+ *
+ * The body of USE checks that:
+ *   - the task is counted as the reader of H and G, and of no other flow;
+ *   - both inputs are copies of the host;
+ *   - both hold the value that was written to them.
+ * CHECK then reads what USE wrote to X.
+ *
+ * Options, before "--":
+ *   -n=NT     the number of USE tasks per process (default 16)
+ *   -b=BLOCK  the size of a flow, in bytes (default 1024)
+ *   -g        the run is meant for an accelerator: it is skipped when there
+ *             is no CUDA device, and fails when no MAKE ran on one
+ *   -v        verbose
+ */
+
+#include "parsec/data_dist/matrix/two_dim_rectangle_cyclic.h"
+#include "parsec/mca/device/device.h"
+#include "parsec/constants.h"
+#include "parsec/sys/atomic.h"
+#include "tests/tests_runtime.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Without an accelerator nothing writes back to a host copy, and a build may
+ * leave the readers of a host copy uncounted. */
+#if defined(PARSEC_HAVE_DEV_CUDA_SUPPORT) || defined(PARSEC_HAVE_DEV_HIP_SUPPORT) || \
+    defined(PARSEC_HAVE_DEV_LEVEL_ZERO_SUPPORT)
+#define HOST_READERS_ARE_COUNTED 1
+#else
+#define HOST_READERS_ARE_COUNTED 0
+#endif
+
+#define GMARK 0x5a   /* what MAKE writes to G */
+#define HMARK 0x21   /* what the collection holds */
+
+static int verbose = 0;
+static int32_t nb_errors = 0;
+static int32_t nb_on_accelerator = 0;
+
+%}
+
+descA      [ type = "parsec_data_collection_t*" ]
+P          [ type = int ]
+NT         [ type = int ]
+BLOCK      [ type = int ]
+
+MAKE(p, k)
+  p = 0 .. P-1
+  k = 0 .. NT-1
+
+: descA(p, k)
+
+  RW G <- descA(p, k)
+       -> G USE(p, k)
+
+BODY [type=CUDA]
+{
+    cudaMemset(G, GMARK, BLOCK);
+    (void)parsec_atomic_fetch_inc_int32(&nb_on_accelerator);
+    if( verbose ) printf("MAKE(%d, %d) on %s\n", p, k, gpu_device->super.name);
+}
+END
+
+BODY
+{
+    memset(G, GMARK, BLOCK);
+    if( verbose ) printf("MAKE(%d, %d) on the host\n", p, k);
+}
+END
+
+USE(p, k)
+  p = 0 .. P-1
+  k = 0 .. NT-1
+
+: descA(p, NT+k)
+
+  WRITE X -> X CHECK(p, k)
+  READ  H <- descA(p, NT+k)
+  READ  G <- G MAKE(p, k)
+
+BODY
+{
+    const uint32_t inputs = (1U << flow_of_host_inputs_USE_for_H.flow_index) |
+                            (1U << flow_of_host_inputs_USE_for_G.flow_index);
+    const uint32_t pinned = this_task->pinned_input_mask;
+    int errors = 0, readable = 1;
+
+    if( verbose ) printf("USE(%d, %d): reader of the flows 0x%x, H on device %d, G on device %d\n",
+                         p, k, pinned, (int)_f_H->device_index, (int)_f_G->device_index);
+    if( (pinned != inputs) && (HOST_READERS_ARE_COUNTED || (0 != pinned)) ) {
+        fprintf(stderr, "USE(%d, %d): counted as the reader of the flows 0x%x, its inputs are the flows 0x%x\n",
+                p, k, pinned, inputs);
+        errors++;
+    }
+    if( 0 != _f_H->device_index ) {
+        fprintf(stderr, "USE(%d, %d): the input H is the copy of device %d, not of the host\n",
+                p, k, (int)_f_H->device_index);
+        errors++; readable = 0;
+    }
+    if( 0 != _f_G->device_index ) {
+        fprintf(stderr, "USE(%d, %d): the input G is the copy of device %d, not of the host\n",
+                p, k, (int)_f_G->device_index);
+        errors++; readable = 0;
+    }
+    /* A copy of an accelerator points to memory the host cannot read */
+    for( int i = 0; readable && (i < BLOCK); i++ ) {
+        if( (HMARK != ((unsigned char*)H)[i]) || (GMARK != ((unsigned char*)G)[i]) ) {
+            fprintf(stderr, "USE(%d, %d): byte %d is 0x%02x in H and 0x%02x in G, expected 0x%02x and 0x%02x\n",
+                    p, k, i, ((unsigned char*)H)[i], ((unsigned char*)G)[i], HMARK, GMARK);
+            errors++;
+            break;
+        }
+    }
+    for( int i = 0; i < BLOCK; i++ ) {
+        ((unsigned char*)X)[i] = (unsigned char)((readable ? ((unsigned char*)G)[i] : 0) + k);
+    }
+    if( errors ) (void)parsec_atomic_fetch_add_int32(&nb_errors, errors);
+}
+END
+
+CHECK(p, k)
+  p = 0 .. P-1
+  k = 0 .. NT-1
+
+: descA(p, k)
+
+  READ X <- X USE(p, k)
+
+BODY
+{
+    for( int i = 0; i < BLOCK; i++ ) {
+        if( (unsigned char)(GMARK + k) != ((unsigned char*)X)[i] ) {
+            fprintf(stderr, "CHECK(%d, %d): byte %d is 0x%02x, expected 0x%02x\n",
+                    p, k, i, ((unsigned char*)X)[i], (unsigned char)(GMARK + k));
+            (void)parsec_atomic_fetch_inc_int32(&nb_errors);
+            break;
+        }
+    }
+}
+END
+
+extern "C" %{
+
+int main(int argc, char *argv[])
+{
+    parsec_host_inputs_taskpool_t *tp;
+    parsec_matrix_block_cyclic_t descA;
+    parsec_context_t *parsec;
+    int nt = 16, block = 1024, accelerator = 0;
+    int rank = 0, np = 1, rc, errors, on_accelerator;
+    int pargc = 0; char **pargv = NULL;
+    size_t size;
+
+    for( int i = 1; i < argc; i++ ) {
+        if( 0 == strncmp(argv[i], "--", 3) ) {
+            pargc = argc - i;
+            pargv = argv + i;
+            break;
+        }
+        if( 0 == strncmp(argv[i], "-n=", 3) ) {
+            nt = strtol(argv[i]+3, NULL, 10);
+            if( 0 >= nt ) nt = 16;
+            continue;
+        }
+        if( 0 == strncmp(argv[i], "-b=", 3) ) {
+            block = strtol(argv[i]+3, NULL, 10);
+            if( 0 >= block ) block = 1024;
+            continue;
+        }
+        if( 0 == strcmp(argv[i], "-g") ) { accelerator = 1; continue; }
+        if( 0 == strcmp(argv[i], "-v") ) { verbose = 1; continue; }
+    }
+
+    rc = parsec_tests_context_init(-1, PARSEC_TEST_THREAD_SERIALIZED,
+                                   &pargc, &pargv, &parsec, &rank, &np);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_init");
+
+    if( accelerator &&
+        (parsec_context_query(parsec, PARSEC_CONTEXT_QUERY_DEVICES, PARSEC_DEV_CUDA) <= 0) ) {
+        /* See SKIP_RETURN_CODE in tests/CMakeLists.txt */
+        parsec_warning("This run needs at least one CUDA device");
+        rc = parsec_tests_context_fini(&parsec);
+        PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
+        return -PARSEC_ERR_DEVICE;
+    }
+
+    /* One row of tiles per process: NT tiles for G, then NT tiles for H */
+    parsec_matrix_block_cyclic_init(&descA, PARSEC_MATRIX_BYTE, PARSEC_MATRIX_TILE,
+                                    rank,
+                                    1, block, np, 2*nt*block,
+                                    0, 0, np, 2*nt*block, np, 1, 1, 1, 0, 0);
+    size = (size_t)descA.super.nb_local_tiles * (size_t)descA.super.bsiz *
+           (size_t)parsec_datadist_getsizeoftype(PARSEC_MATRIX_BYTE);
+    descA.mat = parsec_data_allocate(size);
+    memset(descA.mat, HMARK, size);
+
+    tp = parsec_host_inputs_new((parsec_data_collection_t*)&descA, np, nt, block);
+    assert( NULL != tp );
+    /* No flow travels between processes, so the datatype does not matter */
+    parsec_arena_datatype_set_type(&tp->arenas_datatypes[PARSEC_host_inputs_DEFAULT_ADT_IDX],
+                                   block, PARSEC_ARENA_ALIGNMENT_SSE, PARSEC_DATATYPE_NULL);
+
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+    rc = parsec_context_add_taskpool(parsec, (parsec_taskpool_t*)tp);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+    rc = parsec_context_wait(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+
+    PARSEC_OBJ_DESTRUCT(&tp->arenas_datatypes[PARSEC_host_inputs_DEFAULT_ADT_IDX]);
+    parsec_taskpool_free((parsec_taskpool_t*)tp);
+    parsec_data_free(descA.mat);
+    parsec_tiled_matrix_destroy((parsec_tiled_matrix_t*)&descA);
+
+    errors = nb_errors;
+    on_accelerator = nb_on_accelerator;
+    if( accelerator && (0 == on_accelerator) ) {
+        fprintf(stderr, "rank %d: no MAKE task ran on an accelerator\n", rank);
+        errors++;
+    }
+    rc = parsec_tests_allreduce(parsec, NULL, &errors, 1,
+                                parsec_datatype_int_t, PARSEC_TESTS_REDUCE_SUM);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_allreduce");
+
+    rc = parsec_tests_context_fini(&parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
+
+    if( 0 == rank ) {
+        if( errors > 0 ) {
+            printf("TEST FAILED: %d errors\n", errors);
+        } else {
+            printf("TEST SUCCESS: %d of the %d MAKE tasks of rank 0 ran on an accelerator\n",
+                   on_accelerator, nt);
+        }
+    }
+    return (errors > 0) ? 1 : 0;
+}
+
+%}
