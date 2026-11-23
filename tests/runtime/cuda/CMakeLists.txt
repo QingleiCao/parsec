@@ -75,6 +75,10 @@ if(PINGPONG_GPU_KERNEL_SOURCES)
   parsec_addtest_executable(C ptg_pingpong SOURCES ${PINGPONG_GPU_KERNEL_SOURCES})
   target_include_directories(ptg_pingpong PRIVATE $<$<NOT:${PARSEC_BUILD_INPLACE}>:${CMAKE_CURRENT_SOURCE_DIR}>)
   target_ptg_sources(ptg_pingpong PRIVATE "ptg_pingpong.jdf")
+
+  parsec_addtest_executable(C forward_read SOURCES ${PINGPONG_GPU_KERNEL_SOURCES})
+  target_include_directories(forward_read PRIVATE $<$<NOT:${PARSEC_BUILD_INPLACE}>:${CMAKE_CURRENT_SOURCE_DIR}>)
+  target_ptg_sources(forward_read PRIVATE "forward_read.jdf")
 endif()
 
 parsec_addtest_executable(C zonemalloc SOURCES zonemalloc.c)
