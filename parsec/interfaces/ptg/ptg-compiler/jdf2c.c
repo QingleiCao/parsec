@@ -7674,6 +7674,31 @@ static void jdf_check_relatives( jdf_function_entry_t *f, jdf_dep_flags_t flow_t
         string_arena_init((SA_DATATYPE));                               \
     }
 
+/**
+ * The local definitions of a dependency that are not nested in a range of that
+ * dependency are declared in the block of the flow, which all the dependencies
+ * of the flow that go in the direction flow_type share. Tell if a dependency
+ * that comes before dep in the flow has declared name there, in which case dep
+ * reuses the variable: a second declaration in the same block does not compile.
+ */
+static int
+jdf_ldef_declared_by_previous_dep(const jdf_dataflow_t *fl, const jdf_dep_t *dep,
+                                  jdf_dep_flags_t flow_type, const char *name)
+{
+    const jdf_dep_t *prev;
+    jdf_expr_t *ld;
+
+    for(prev = fl->deps; prev != dep; prev = prev->next) {
+        if( !(prev->dep_flags & flow_type) ) continue;
+        if( JDF_IS_DEP_WRITE_ONLY_INPUT_TYPE(prev) ) continue;
+        for(ld = jdf_expr_lv_first(prev->local_defs); ld != NULL; ld = jdf_expr_lv_next(prev->local_defs, ld)) {
+            if( 0 == strcmp(ld->alias, name) ) return 1;
+            if( JDF_RANGE == ld->op ) break;  /* the following ones are declared inside the loop on this one */
+        }
+    }
+    return 0;
+}
+
 static void
 jdf_generate_code_iterate_successors_or_predecessors(const jdf_t *jdf,
                                                      const jdf_function_entry_t *f,
@@ -7891,7 +7916,10 @@ jdf_generate_code_iterate_successors_or_predecessors(const jdf_t *jdf,
                 for(ld = jdf_expr_lv_first(dl->local_defs); ld != NULL; ld = jdf_expr_lv_next(dl->local_defs, ld)) {
                     assert(NULL != ld->alias);
                     assert(-1 != ld->ldef_index);
-                    string_arena_add_string(sa_coutput, "%s  int %s;\n", indent(nb_open_ldef), ld->alias);
+                    if( (nb_open_ldef > 0) ||
+                        !jdf_ldef_declared_by_previous_dep(fl, dl, flow_type, ld->alias) ) {
+                        string_arena_add_string(sa_coutput, "%s  int %s;\n", indent(nb_open_ldef), ld->alias);
+                    }
                     if(JDF_RANGE == ld->op) {
                         string_arena_add_string(sa_coutput,
                                                 "%s  for( %s = %s;",

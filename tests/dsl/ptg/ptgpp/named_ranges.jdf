@@ -1,0 +1,195 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include "parsec/data_dist/matrix/two_dim_rectangle_cyclic.h"
+#include "parsec/sys/atomic.h"
+#include "tests/tests_runtime.h"
+
+/**
+ * Two dependencies of one flow that each cover a named range may give their
+ * index the same name. The code generated to iterate over the successors, or
+ * over the predecessors, of a task declares the index of such a range in the
+ * block of the flow, and used to declare it once per dependency: the
+ * generated file did not compile.
+ *
+ * SRC(0) sends its flow to LOW(k) for k in the first half of 0 .. 2*NB-1 and
+ * to HIGH(k) for k in the second half, both ranges written with k. SINK(0)
+ * waits for the tasks of both, again as two ranges written with k: these
+ * guards use the index, so the runtime counts the controls to wait for with
+ * the function that iterates over the predecessors. Every task of both
+ * ranges must run once, with the value SRC(0) wrote, before SINK(0) does.
+ * A task that is not reached never runs, and the test does not end.
+ *
+ * The two ranges have the same number of tasks on purpose: the runtime counts
+ * the controls of a flow with several such dependencies as that many times
+ * the first range (parsec_check_IN_dependencies_with_counter), whatever the
+ * names of the indices.
+ */
+
+#define VALUE 0x5eed
+
+static int32_t *reached;        /* reached[k]: how many times the task of index k ran in this process */
+static int32_t nb_errors = 0;
+static int32_t sink_ran = 0;
+
+static void reach(const char *what, int k, int32_t value)
+{
+    (void)parsec_atomic_fetch_inc_int32(&reached[k]);
+    if( VALUE != value ) {
+        fprintf(stderr, "%s(%d): read %d instead of %d\n", what, k, (int)value, VALUE);
+        (void)parsec_atomic_fetch_inc_int32(&nb_errors);
+    }
+}
+
+%}
+
+descA      [type = "parsec_matrix_block_cyclic_t*"]
+NB         [type = int]
+
+SRC(s)
+  s = 0 .. 0
+: descA(0, 0)
+
+  RW A <- descA(0, 0)
+       -> [ k = 0 .. NB-1 ]     1 ? A LOW(k)
+       -> [ k = NB .. 2*NB-1 ]  1 ? A HIGH(k)
+
+BODY
+  ((int32_t*)A)[0] = VALUE;
+END
+
+LOW(k)
+  k = 0 .. NB-1
+: descA(k, 0)
+
+  READ A <- A SRC(0)
+  CTL  X -> X SINK(0)
+
+BODY
+  reach("LOW", k, ((int32_t*)A)[0]);
+END
+
+HIGH(k)
+  k = NB .. 2*NB-1
+: descA(k, 0)
+
+  READ A <- A SRC(0)
+  CTL  X -> X SINK(0)
+
+BODY
+  reach("HIGH", k, ((int32_t*)A)[0]);
+END
+
+SINK(s)
+  s = 0 .. 0
+: descA(0, 0)
+
+  CTL X <- [ k = 0 .. NB-1 ]     k >= 0 ? X LOW(k)
+        <- [ k = NB .. 2*NB-1 ]  k >= 0 ? X HIGH(k)
+
+BODY
+  /* The tasks of this process that SINK(0) waits for have run */
+  for(int k = 0; k < 2*NB; k++) {
+    if( ((int)descA->super.super.rank_of(&descA->super.super, k, 0) == (int)descA->super.super.myrank)
+        && (1 != reached[k]) ) {
+      fprintf(stderr, "SINK(0) runs when %s(%d) has run %d time(s)\n",
+              (k < NB) ? "LOW" : "HIGH", k, (int)reached[k]);
+      (void)parsec_atomic_fetch_inc_int32(&nb_errors);
+    }
+  }
+  (void)parsec_atomic_fetch_inc_int32(&sink_ran);
+END
+
+extern "C" %{
+
+#define TASKS_PER_PROCESS 8
+
+int main(int argc, char *argv[])
+{
+    parsec_context_t *parsec;
+    parsec_named_ranges_taskpool_t *tp;
+    parsec_matrix_block_cyclic_t descA;
+    int32_t *total, local[2], global[2];
+    int rc, rank, world, NB, ret = 0;
+
+    rc = parsec_tests_context_init(-1, PARSEC_TEST_THREAD_SERIALIZED,
+                                   &argc, &argv, &parsec, &rank, &world);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_init");
+
+    /* Tile (k, 0) and the task of index k live on process k modulo the number
+     * of processes: each range reaches every process. */
+    NB = TASKS_PER_PROCESS * world;
+    parsec_matrix_block_cyclic_init(&descA, PARSEC_MATRIX_INTEGER, PARSEC_MATRIX_TILE,
+                                    rank,
+                                    1, 1,        /* Tile size */
+                                    2 * NB, 1,   /* Global matrix size */
+                                    0, 0,        /* Starting point in the global matrix */
+                                    2 * NB, 1,   /* Submatrix size */
+                                    world, 1,    /* process grid */
+                                    1, 1,        /* k-cyclicity */
+                                    0, 0);
+    descA.mat = parsec_data_allocate(descA.super.nb_local_tiles *
+                                     descA.super.bsiz *
+                                     parsec_datadist_getsizeoftype(PARSEC_MATRIX_INTEGER));
+    parsec_data_collection_set_key(&descA.super.super, "A");
+
+    reached = (int32_t*)calloc(2 * NB, sizeof(int32_t));
+    total   = (int32_t*)calloc(2 * NB, sizeof(int32_t));
+
+    tp = parsec_named_ranges_new(&descA, NB);
+    parsec_arena_datatype_set_type(&tp->arenas_datatypes[PARSEC_named_ranges_DEFAULT_ADT_IDX],
+                                   sizeof(int32_t), PARSEC_ARENA_ALIGNMENT_SSE,
+                                   parsec_datatype_int32_t);
+
+    rc = parsec_context_add_taskpool(parsec, (parsec_taskpool_t*)tp);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+    rc = parsec_context_wait(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+
+    rc = parsec_tests_allreduce(parsec, reached, total, 2 * NB,
+                                parsec_datatype_int32_t, PARSEC_TESTS_REDUCE_SUM);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_allreduce");
+    local[0] = nb_errors;
+    local[1] = sink_ran;
+    rc = parsec_tests_allreduce(parsec, local, global, 2,
+                                parsec_datatype_int32_t, PARSEC_TESTS_REDUCE_SUM);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_allreduce");
+
+    if( 0 == rank ) {
+        for(int k = 0; k < 2 * NB; k++) {
+            if( 1 != total[k] ) {
+                fprintf(stderr, "%s(%d) ran %d time(s) instead of once\n",
+                        (k < NB) ? "LOW" : "HIGH", k, (int)total[k]);
+                ret = 1;
+            }
+        }
+        if( (0 != global[0]) || (1 != global[1]) ) {
+            fprintf(stderr, "%d error(s) in the tasks, SINK(0) ran %d time(s) instead of once\n",
+                    (int)global[0], (int)global[1]);
+            ret = 1;
+        }
+        if( 0 == ret ) {
+            printf("The %d tasks of each of the two ranges ran once, before the task that waits for them\n", NB);
+        }
+    }
+
+    PARSEC_OBJ_DESTRUCT(&tp->arenas_datatypes[PARSEC_named_ranges_DEFAULT_ADT_IDX]);
+    parsec_taskpool_free((parsec_taskpool_t*)tp);
+    free(reached);
+    free(total);
+    parsec_data_free(descA.mat);
+    parsec_tiled_matrix_destroy((parsec_tiled_matrix_t*)&descA);
+
+    rc = parsec_tests_context_fini(&parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
+    return ret;
+}
+
+%}
