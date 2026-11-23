@@ -95,11 +95,14 @@ if( MPI_C_FOUND )
   parsec_addtest_cmd(collections/reshape/input_single_copy:mp ${MPI_TEST_CMD_LIST} 4 collections/reshape/input_dep_reshape_single_copy -N 12 -t 2 -c 2)
   parsec_addtest_cmd(collections/reshape/input_single_copy:mp:mt ${MPI_TEST_CMD_LIST} 4 collections/reshape/input_dep_reshape_single_copy -N 12 -t 2 -c 2 -m 1 )
 
-  #These tests will fail with runtime_comm_short_limit != 0. Explanation on testing_remote_multiple_outs_same_pred_flow.c
+  # One flow sent under two remote types to the same rank: with the data requested by the receiver
+  # (runtime_comm_short_limit 0), then with the data embedded in the activation message (:short)
   parsec_addtest_cmd(collections/reshape/remote_multiple_outs_same_pred_flow ${SHM_TEST_CMD_LIST} collections/reshape/remote_multiple_outs_same_pred_flow -N 320 -t 9 -c 10 -- --mca runtime_comm_short_limit 0)
   parsec_addtest_cmd(collections/reshape/remote_multiple_outs_same_pred_flow:mt ${SHM_TEST_CMD_LIST} collections/reshape/remote_multiple_outs_same_pred_flow -N 320 -t 9 -c 10 -m 1 -- --mca runtime_comm_short_limit 0)
   parsec_addtest_cmd(collections/reshape/remote_multiple_outs_same_pred_flow:mp ${MPI_TEST_CMD_LIST} 4 collections/reshape/remote_multiple_outs_same_pred_flow -N 320 -t 9 -c 10  -- --mca runtime_comm_short_limit 0)
   parsec_addtest_cmd(collections/reshape/remote_multiple_outs_same_pred_flow:mp:mt ${MPI_TEST_CMD_LIST} 4 collections/reshape/remote_multiple_outs_same_pred_flow -N 320 -t 9 -c 10 -m 1  -- --mca runtime_comm_short_limit 0)
+  parsec_addtest_cmd(collections/reshape/remote_multiple_outs_same_pred_flow:mp:short ${MPI_TEST_CMD_LIST} 4 collections/reshape/remote_multiple_outs_same_pred_flow -N 320 -t 9 -c 10)
+  parsec_addtest_cmd(collections/reshape/remote_multiple_outs_same_pred_flow:mp:mt:short ${MPI_TEST_CMD_LIST} 4 collections/reshape/remote_multiple_outs_same_pred_flow -N 320 -t 9 -c 10 -m 1)
 endif( MPI_C_FOUND)
 
 parsec_addtest_cmd(collections/reshape/avoidable ${SHM_TEST_CMD_LIST} collections/reshape/avoidable_reshape -N 100 -t 2 -c 10)

@@ -1183,7 +1183,8 @@ remote_dep_release_incoming(parsec_execution_stream_t* es,
     parsec_task_t task;
     const parsec_flow_t* target;
     int i, pidx;
-    uint32_t action_mask = 0;
+    uint32_t action_mask = 0, flows = 0;
+    remote_dep_datakey_t later_mask = 0;
 
     /* Update the mask of remaining dependencies to avoid releasing the same outputs twice */
     assert((origin->incoming_mask & complete_mask) == complete_mask);
@@ -1207,6 +1208,16 @@ remote_dep_release_incoming(parsec_execution_stream_t* es,
             target = task.task_class->out[++pidx];
             assert(NULL != target);
         }
+        /* A flow sent under several types has one output per type, and the
+         * task has a single slot per flow: the successors are given what that
+         * slot holds when they are released. Several outputs of a flow can
+         * complete together, when their data came with the activation; release
+         * the first one now and the others after it, each from its own copy. */
+        if( flows & (1U << target->flow_index) ) {
+            later_mask |= (1U<<i);
+            continue;
+        }
+        flows |= (1U << target->flow_index);
         PARSEC_DEBUG_VERBOSE(20, parsec_debug_output, "RDEP:\tDATA %p(%s) released from %p[%d] flow idx %d",
                 origin->output[i].data.data, target->name, origin, i, target->flow_index);
         task.data[target->flow_index].source_repo = NULL;
@@ -1220,6 +1231,9 @@ remote_dep_release_incoming(parsec_execution_stream_t* es,
             task.data[target->flow_index].data_in->data_transfer_status = PARSEC_DATA_STATUS_COMPLETE_TRANSFER;
         }
     }
+    /* The outputs left for later are still to be released */
+    complete_mask ^= later_mask;
+    origin->incoming_mask |= later_mask;
 
 #ifdef PARSEC_DIST_COLLECTIVES
     /* Corresponding comment below on the propagation part */
@@ -1249,6 +1263,9 @@ remote_dep_release_incoming(parsec_execution_stream_t* es,
                                         action_mask | PARSEC_ACTION_RELEASE_LOCAL_DEPS | PARSEC_ACTION_RESHAPE_REMOTE_ON_RELEASE,
                                         NULL);
     assert(0 == (origin->incoming_mask & complete_mask));
+
+    if(0 != later_mask)  /* the other outputs of the same flows */
+        return remote_dep_release_incoming(es, origin, later_mask);
 
     if(0 != origin->incoming_mask)  /* not done receiving */
         return origin;
