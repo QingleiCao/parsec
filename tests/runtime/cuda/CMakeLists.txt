@@ -77,4 +77,12 @@ if(PINGPONG_GPU_KERNEL_SOURCES)
   target_ptg_sources(ptg_pingpong PRIVATE "ptg_pingpong.jdf")
 endif()
 
+if(PARSEC_HAVE_CUDA OR PARSEC_HAVE_HIP)
+  include(ParsecCompilePTG)
+  # GPU bodies that decline the device: the tasks must fall back to the CPU.
+  parsec_addtest_executable(C decline_fallback)
+  target_include_directories(decline_fallback PRIVATE $<$<NOT:${PARSEC_BUILD_INPLACE}>:${CMAKE_CURRENT_SOURCE_DIR}>)
+  target_ptg_sources(decline_fallback PRIVATE "decline_fallback.jdf")
+endif()
+
 parsec_addtest_executable(C zonemalloc SOURCES zonemalloc.c)
