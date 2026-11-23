@@ -48,6 +48,7 @@ set_tests_properties(
 )
 
 parsec_addtest_cmd(dsl/ptg/ptgpp/write_check ${SHM_TEST_CMD_LIST} dsl/ptg/ptgpp/write_check)
+parsec_addtest_cmd(dsl/ptg/ptgpp/local_defs ${SHM_TEST_CMD_LIST} dsl/ptg/ptgpp/local_defs)
 
 if( MPI_C_FOUND )
   parsec_addtest_cmd(dsl/ptg/ptgpp/forward_RW_NULL:mp   ${MPI_TEST_CMD_LIST} 2 dsl/ptg/ptgpp/jdf_forward_RW_NULL)
@@ -59,6 +60,7 @@ if( MPI_C_FOUND )
     PASS_REGULAR_EXPRESSION "A NULL is forwarded"
   )
   parsec_addtest_cmd(dsl/ptg/ptgpp/write_check:mp ${MPI_TEST_CMD_LIST} 4 dsl/ptg/ptgpp/write_check)
+  parsec_addtest_cmd(dsl/ptg/ptgpp/local_defs:mp ${MPI_TEST_CMD_LIST} 4 dsl/ptg/ptgpp/local_defs)
 endif( MPI_C_FOUND )
 
 #
