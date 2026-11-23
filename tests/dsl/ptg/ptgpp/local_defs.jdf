@@ -1,0 +1,259 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include "parsec/data_dist/matrix/two_dim_rectangle_cyclic.h"
+#include "parsec/sys/atomic.h"
+#include "tests/tests_runtime.h"
+
+/**
+ * A dependency can define names for itself: the index of a range, as in
+ * "-> [ k = 0 .. N ] ...", or a value, as in "<- [ h = l / 2 ] ...", before
+ * the guard or before the call. The guard, the parameters of the call and the
+ * datatypes of the dependency read them. Several of the generated functions
+ * that evaluate these expressions did not declare the names, and the
+ * generated file did not compile:
+ *  - the datatype lookup, for a guard or a remote datatype that reads them;
+ *  - the data lookup, for anything of an input dependency that reads them,
+ *    and for the guard of an output dependency of a flow without input,
+ *    which chooses the datatype the data is allocated with;
+ *  - the function of the guard, for a named value, and for the "else" side of
+ *    a guard with two calls.
+ * A guard written as inline C compiled, but read the definition from a slot
+ * of the locals of the task that nothing had set, and chose the dependency
+ * from whatever was there.
+ * A value named for the first of the two calls of a guard had no place in
+ * the locals of the task either, when the task class defines nothing else.
+ *
+ * Every dependency of this test that is marked with a number reads a name it
+ * defines, in one of these ways. The tasks are spread over the processes:
+ * tile (t, 0) lives on process t modulo the number of processes.
+ *
+ *   SRC(0) --A--> EVEN(e), ODD(o) --V--> JOIN(j)            e, o, j in 0 .. H-1
+ *                                 --W--> LAST(l), TAIL(l)   l in 0 .. 2*H-1
+ *
+ * EVEN(e) writes the number of its tile, 2*e, and ODD(o) writes 2*o+1.
+ * JOIN(j) must read 2*j and 2*j+1; LAST(l) and TAIL(l) must read l on each
+ * of their flows. LAST(l) lives on another process than EVEN(l/2) or
+ * ODD(l/2) when there are 2 or 4 processes. Every task must run once. A task that is not reached never
+ * runs, and the test does not end.
+ */
+
+#define VALUE 0x5eed
+
+static int32_t *reached;        /* how many times each task ran in this process, see the SLOT_ macros */
+static int32_t nb_errors = 0;
+
+#define SLOT_EVEN(H, e) (e)
+#define SLOT_ODD(H, o)  ((H) + (o))
+#define SLOT_JOIN(H, j) (2*(H) + (j))
+#define SLOT_LAST(H, l) (3*(H) + (l))
+#define SLOT_TAIL(H, l) (5*(H) + (l))
+#define NB_SLOTS(H)     (7*(H))
+
+static void reach(const char *what, int idx, int slot, const char *flow, int32_t value, int32_t expected)
+{
+    if( NULL == flow ) {
+        (void)parsec_atomic_fetch_inc_int32(&reached[slot]);
+        return;
+    }
+    if( expected != value ) {
+        fprintf(stderr, "%s(%d): read %d instead of %d on flow %s\n",
+                what, idx, (int)value, (int)expected, flow);
+        (void)parsec_atomic_fetch_inc_int32(&nb_errors);
+    }
+}
+
+%}
+
+descA      [type = "parsec_matrix_block_cyclic_t*"]
+H          [type = int]
+
+SRC(s)
+  s = 0 .. 0
+: descA(0, 0)
+
+  /* (1) An output guard that reads the index of its range */
+  RW A <- descA(0, 0)
+       -> [ k = 0 .. 2*H-1 ] k % 2 == 0 ? A EVEN(k / 2)
+       -> [ m = 0 .. 2*H-1 ] m % 2 == 1 ? A ODD(m / 2)
+
+BODY
+  ((int32_t*)A)[0] = VALUE;
+END
+
+EVEN(e)
+  e = 0 .. H-1
+: descA(2*e, 0)
+
+  READ  A <- A SRC(0)
+  /* (2) The same on a flow without input: this guard also chooses the
+   *     datatype V is allocated with, and no other dependency can */
+  WRITE V -> [ p = 0 .. H-1 ] p == e ? E JOIN(p)
+  WRITE W -> X LAST(2*e)
+          -> Y LAST(2*e)
+          -> U LAST(2*e)
+          -> Z TAIL(2*e)
+
+BODY
+  reach("EVEN", e, SLOT_EVEN(H, e), "A", ((int32_t*)A)[0], VALUE);
+  ((int32_t*)V)[0] = 2*e;
+  ((int32_t*)W)[0] = 2*e;
+  reach("EVEN", e, SLOT_EVEN(H, e), NULL, 0, 0);
+END
+
+ODD(o)
+  o = 0 .. H-1
+: descA(2*o+1, 0)
+
+  READ  A <- A SRC(0)
+  WRITE V -> [ p = 0 .. H-1 ] p == o ? O JOIN(p)
+  WRITE W -> X LAST(2*o+1)
+          -> Y LAST(2*o+1)
+          -> U LAST(2*o+1)
+          -> Z TAIL(2*o+1)
+
+BODY
+  reach("ODD", o, SLOT_ODD(H, o), "A", ((int32_t*)A)[0], VALUE);
+  ((int32_t*)V)[0] = 2*o+1;
+  ((int32_t*)W)[0] = 2*o+1;
+  reach("ODD", o, SLOT_ODD(H, o), NULL, 0, 0);
+END
+
+JOIN(j)
+  j = 0 .. H-1
+: descA(j, 0)
+
+  /* (3) A value named in front of the call of an input */
+  READ E <- H > 0 ? [ e = j ] V EVEN(e)
+  /* (4) A value named in front of the guard of an input, read by the call */
+  READ O <- [ o = j ] H > 0 ? V ODD(o)
+
+BODY
+  reach("JOIN", j, SLOT_JOIN(H, j), "E", ((int32_t*)E)[0], 2*j);
+  reach("JOIN", j, SLOT_JOIN(H, j), "O", ((int32_t*)O)[0], 2*j+1);
+  reach("JOIN", j, SLOT_JOIN(H, j), NULL, 0, 0);
+END
+
+LAST(l)
+  l = 0 .. 2*H-1
+: descA(2*H-1-l, 0)
+
+  /* (5) A named value read by a guard with two calls */
+  READ X <- [ h = l / 2 ] 2*h == l ? W EVEN(h) : W ODD(h)
+  /* (6) A named value read by a guard with one call */
+  READ Y <- [ g = l / 2 ] 2*g != l ? W ODD(g)
+         <- W EVEN(l / 2)
+  /* (8) Named values read by guards written as inline C */
+  READ U <- [ c = l % 2 ] %{ return 0 == c; %} ? W EVEN(l / 2)
+         <- [ d = l % 2 ] %{ return 1 == d; %} ? W ODD(l / 2)
+
+BODY
+  reach("LAST", l, SLOT_LAST(H, l), "X", ((int32_t*)X)[0], l);
+  reach("LAST", l, SLOT_LAST(H, l), "Y", ((int32_t*)Y)[0], l);
+  reach("LAST", l, SLOT_LAST(H, l), "U", ((int32_t*)U)[0], l);
+  reach("LAST", l, SLOT_LAST(H, l), NULL, 0, 0);
+END
+
+TAIL(l)
+  l = 0 .. 2*H-1
+: descA(l, 0)
+
+  /* (7) A value named in front of the first of two calls, the only local
+   *     definition of this task class */
+  READ Z <- l % 2 == 0 ? [ f = l / 2 ] W EVEN(f) : W ODD(l / 2)
+
+BODY
+  reach("TAIL", l, SLOT_TAIL(H, l), "Z", ((int32_t*)Z)[0], l);
+  reach("TAIL", l, SLOT_TAIL(H, l), NULL, 0, 0);
+END
+
+extern "C" %{
+
+#define PAIRS_PER_PROCESS 8
+
+int main(int argc, char *argv[])
+{
+    parsec_context_t *parsec;
+    parsec_local_defs_taskpool_t *tp;
+    parsec_matrix_block_cyclic_t descA;
+    int32_t *total, errors = 0;
+    int rc, rank, world, H, ret = 0;
+
+    rc = parsec_tests_context_init(-1, PARSEC_TEST_THREAD_SERIALIZED,
+                                   &argc, &argv, &parsec, &rank, &world);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_init");
+
+    H = PAIRS_PER_PROCESS * world;
+    parsec_matrix_block_cyclic_init(&descA, PARSEC_MATRIX_INTEGER, PARSEC_MATRIX_TILE,
+                                    rank,
+                                    1, 1,        /* Tile size */
+                                    2 * H, 1,    /* Global matrix size */
+                                    0, 0,        /* Starting point in the global matrix */
+                                    2 * H, 1,    /* Submatrix size */
+                                    world, 1,    /* process grid */
+                                    1, 1,        /* k-cyclicity */
+                                    0, 0);
+    descA.mat = parsec_data_allocate(descA.super.nb_local_tiles *
+                                     descA.super.bsiz *
+                                     parsec_datadist_getsizeoftype(PARSEC_MATRIX_INTEGER));
+    parsec_data_collection_set_key(&descA.super.super, "A");
+
+    reached = (int32_t*)calloc(NB_SLOTS(H), sizeof(int32_t));
+    total   = (int32_t*)calloc(NB_SLOTS(H), sizeof(int32_t));
+
+    tp = parsec_local_defs_new(&descA, H);
+    parsec_arena_datatype_set_type(&tp->arenas_datatypes[PARSEC_local_defs_DEFAULT_ADT_IDX],
+                                   sizeof(int32_t), PARSEC_ARENA_ALIGNMENT_SSE,
+                                   parsec_datatype_int32_t);
+
+    rc = parsec_context_add_taskpool(parsec, (parsec_taskpool_t*)tp);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+    rc = parsec_context_wait(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+
+    rc = parsec_tests_allreduce(parsec, reached, total, NB_SLOTS(H),
+                                parsec_datatype_int32_t, PARSEC_TESTS_REDUCE_SUM);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_allreduce");
+    rc = parsec_tests_allreduce(parsec, &nb_errors, &errors, 1,
+                                parsec_datatype_int32_t, PARSEC_TESTS_REDUCE_SUM);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_allreduce");
+
+    if( 0 == rank ) {
+        for(int i = 0; i < NB_SLOTS(H); i++) {
+            if( 1 != total[i] ) {
+                fprintf(stderr, "%s(%d) ran %d time(s) instead of once\n",
+                        (i < H) ? "EVEN" : (i < 2*H) ? "ODD" : (i < 3*H) ? "JOIN" : (i < 5*H) ? "LAST" : "TAIL",
+                        (i < 3*H) ? (i % H) : (i < 5*H) ? (i - 3*H) : (i - 5*H), (int)total[i]);
+                ret = 1;
+            }
+        }
+        if( 0 != errors ) {
+            fprintf(stderr, "%d value(s) read by the tasks are wrong\n", (int)errors);
+            ret = 1;
+        }
+        if( 0 == ret ) {
+            printf("The %d tasks reached through local definitions ran once, with the right data\n",
+                   NB_SLOTS(H));
+        }
+    }
+
+    PARSEC_OBJ_DESTRUCT(&tp->arenas_datatypes[PARSEC_local_defs_DEFAULT_ADT_IDX]);
+    parsec_taskpool_free((parsec_taskpool_t*)tp);
+    free(reached);
+    free(total);
+    parsec_data_free(descA.mat);
+    parsec_tiled_matrix_destroy((parsec_tiled_matrix_t*)&descA);
+
+    rc = parsec_tests_context_fini(&parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
+    return ret;
+}
+
+%}

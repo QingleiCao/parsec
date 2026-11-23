@@ -1287,6 +1287,152 @@ static jdf_expr_t *jdf_expr_lv_next(jdf_expr_t *head, jdf_expr_t *cur)
     return head;
 }
 
+/**
+ * Tell if the expression e reads one of the local definitions of the stack
+ * defs, the named ranges and named values of a dependency or of a call. A
+ * variable reads the definition of its name. Inline C code reads all the
+ * definitions that were in scope where it was written: the function generated
+ * for it loads them from the ldef[] array of the locals it is given.
+ */
+static int jdf_expr_reads_local_defs(const jdf_expr_t *e, const jdf_expr_t *defs)
+{
+    const jdf_expr_t *ld;
+
+    if( (NULL == e) || (NULL == defs) )
+        return 0;
+    switch( e->op ) {
+    case JDF_CST:
+    case JDF_STRING:
+        return 0;
+    case JDF_VAR:
+        for(ld = defs; NULL != ld; ld = ld->next) {
+            if( 0 == strcmp(ld->alias, e->jdf_var) )
+                return 1;
+        }
+        return 0;
+    case JDF_C_CODE:
+        return NULL != e->local_variables;
+    case JDF_NOT:
+        return jdf_expr_reads_local_defs(e->jdf_ua, defs);
+    case JDF_TERNARY:
+    case JDF_RANGE:
+        return jdf_expr_reads_local_defs(e->u.ternary.arg1, defs) ||
+               jdf_expr_reads_local_defs(e->u.ternary.arg2, defs) ||
+               jdf_expr_reads_local_defs(e->u.ternary.arg3, defs);
+    default:
+        return jdf_expr_reads_local_defs(e->jdf_ba1, defs) ||
+               jdf_expr_reads_local_defs(e->jdf_ba2, defs);
+    }
+}
+
+static int jdf_datatype_reads_local_defs(const jdf_datatransfer_type_t *dt, const jdf_expr_t *defs)
+{
+    return jdf_expr_reads_local_defs(dt->type, defs) ||
+           jdf_expr_reads_local_defs(dt->layout, defs) ||
+           jdf_expr_reads_local_defs(dt->count, defs) ||
+           jdf_expr_reads_local_defs(dt->displ, defs);
+}
+
+static int jdf_call_reads_local_defs(const jdf_call_t *call, const jdf_expr_t *defs)
+{
+    const jdf_expr_t *el;
+
+    for(el = call->parameters; NULL != el; el = el->next) {
+        if( jdf_expr_reads_local_defs(el, defs) )
+            return 1;
+    }
+    return 0;
+}
+
+/**
+ * Tell if the code generated to find the data of a flow in data_lookup reads
+ * the local definitions of the dependency dl. An input dependency gives the
+ * guard, the source of the data and the datatypes to reshape it with. An
+ * output dependency, of a flow without input, gives the guard and the
+ * datatype to allocate the data with.
+ */
+static int jdf_dep_data_lookup_reads_local_defs(const jdf_dep_t *dl)
+{
+    const jdf_expr_t *defs = dl->local_defs;
+    const jdf_call_t *call;
+
+    if( NULL == defs )
+        return 0;
+    if( (JDF_GUARD_UNCONDITIONAL != dl->guard->guard_type) &&
+        jdf_expr_reads_local_defs(dl->guard->guard, defs) )
+        return 1;
+    if( jdf_datatype_reads_local_defs(&dl->datatype_local, defs) )
+        return 1;
+    if( dl->dep_flags & JDF_DEP_FLOW_OUT )
+        return 0;
+    if( jdf_datatype_reads_local_defs(&dl->datatype_data, defs) )
+        return 1;
+    for(call = dl->guard->calltrue; NULL != call;
+        call = (call == dl->guard->calltrue) ? dl->guard->callfalse : NULL) {
+        /* The definitions of a call may be computed from the ones of the dependency */
+        if( (NULL != call->local_defs) || jdf_call_reads_local_defs(call, defs) )
+            return 1;
+    }
+    return 0;
+}
+
+/**
+ * Bring the local definitions of the stack defs in scope, from the outermost
+ * to the innermost: add to sa a block that declares each of them and, for a
+ * range, a loop over its values. Each value is also stored in the ldef[]
+ * array of ldef_holder, where the inline C code reads it. The expressions
+ * are dumped with info. The definitions of the stack outer, the outermost
+ * ones of defs, are supposed to be in scope already and are left out.
+ *
+ * @return the number of blocks to close with jdf_local_defs_close().
+ */
+static int jdf_local_defs_open(string_arena_t *sa, const char *spaces,
+                               jdf_expr_t *defs, jdf_expr_t *outer,
+                               const char *ldef_holder, expr_info_t *info)
+{
+    jdf_expr_t *ld;
+    int nbopen = 0;
+
+    if( NULL == defs )
+        return 0;
+    for(ld = (NULL == outer) ? jdf_expr_lv_first(defs) : jdf_expr_lv_next(defs, outer);
+        NULL != ld; ld = jdf_expr_lv_next(defs, ld)) {
+        assert(NULL != ld->alias);
+        assert(-1 != ld->ldef_index);
+        if( JDF_RANGE == ld->op ) {
+            string_arena_add_string(sa,
+                                    "%s%s{  /* local definition '%s' */\n"
+                                    "%s%s  int %s;\n"
+                                    "%s%s  for( %s = %s;",
+                                    spaces, indent(nbopen), ld->alias,
+                                    spaces, indent(nbopen), ld->alias,
+                                    spaces, indent(nbopen), ld->alias, dump_expr((void**)ld->jdf_ta1, info));
+            string_arena_add_string(sa, " %s <= %s;",
+                                    ld->alias, dump_expr((void**)ld->jdf_ta2, info));
+            string_arena_add_string(sa, " %s += %s ) {\n"
+                                    "%s%s    %sldef[%d].value = %s;\n",
+                                    ld->alias, dump_expr((void**)ld->jdf_ta3, info),
+                                    spaces, indent(nbopen), ldef_holder, ld->ldef_index, ld->alias);
+            nbopen += 2;
+        } else {
+            string_arena_add_string(sa,
+                                    "%s%s{  /* local definition '%s' */\n"
+                                    "%s%s  int %s = %sldef[%d].value = %s; (void)%s;\n",
+                                    spaces, indent(nbopen), ld->alias,
+                                    spaces, indent(nbopen), ld->alias, ldef_holder, ld->ldef_index,
+                                    dump_expr((void**)ld, info), ld->alias);
+            nbopen += 1;
+        }
+    }
+    return nbopen;
+}
+
+static void jdf_local_defs_close(string_arena_t *sa, const char *spaces, int nbopen)
+{
+    while( nbopen-- > 0 )
+        string_arena_add_string(sa, "%s%s}\n", spaces, indent(nbopen));
+}
+
 static void jdf_coutput_prettycomment(char marker, const char *format, ...)
 {
     int ls, rs, i, length, vs;
@@ -1738,18 +1884,24 @@ jdf_generate_function_without_expression(const jdf_t *jdf,
     string_arena_t *sa2 = string_arena_new(64);
     expr_info_t info = EMPTY_EXPR_INFO;
     assignment_info_t ai;
+    int reads_ldefs, nb_open_ldef = 0;
 
     (void)jdf;
 
     assert( !jdf_expr_is_range(e) );
 
-    coutput("static inline %s %s%s(const __parsec_%s_internal_taskpool_t *__parsec_tp, const %s *locals)\n"
+    /* An expression that reads local definitions (not ranges, here) needs
+     * them in scope: they are computed from the locals, and stored in the
+     * ldef[] array of these locals for the inline C code. */
+    reads_ldefs = jdf_expr_reads_local_defs(e, e->local_variables);
+
+    coutput("static inline %s %s%s(const __parsec_%s_internal_taskpool_t *__parsec_tp, %s%s *locals)\n"
             "{\n",
-            rettype, name, suffix, jdf_basename, parsec_get_name(jdf, f, "parsec_assignment_t"));
-    if( !(JDF_OP_IS_C_CODE(e->op) || (JDF_OP_IS_CST(e->op))) ) {
+            rettype, name, suffix, jdf_basename, reads_ldefs ? "" : "const ", parsec_get_name(jdf, f, "parsec_assignment_t"));
+    if( reads_ldefs || !(JDF_OP_IS_C_CODE(e->op) || (JDF_OP_IS_CST(e->op))) ) {
         ai.sa = sa;
         ai.holder = "locals->";
-        ai.expr = e;
+        ai.expr = reads_ldefs ? NULL : e;
 
         coutput("%s\n",
                 UTIL_DUMP_LIST(sa2, f->locals, next, dump_local_assignments, &ai,
@@ -1765,10 +1917,20 @@ jdf_generate_function_without_expression(const jdf_t *jdf,
     info.suffix = "";
     info.assignments = "locals";
 
+    if( reads_ldefs ) {
+        string_arena_init(sa2);
+        nb_open_ldef = jdf_local_defs_open(sa2, "  ", e->local_variables, NULL, "locals->", &info);
+        coutput("%s", string_arena_get_string(sa2));
+    }
     coutput("  (void)__parsec_tp; (void)locals;\n"
-            "  return %s;\n"
-            "}\n",
+            "  return %s;\n",
             dump_expr((void**)e, &info));
+    if( reads_ldefs ) {
+        string_arena_init(sa2);
+        jdf_local_defs_close(sa2, "  ", nb_open_ldef);
+        coutput("%s", string_arena_get_string(sa2));
+    }
+    coutput("}\n");
     string_arena_free(sa);
     string_arena_free(sa2);
 }
@@ -2719,6 +2881,9 @@ static int jdf_generate_dataflow( const jdf_t *jdf, const jdf_function_entry_t* 
             sprintf(condname, "expr_of_cond_for_%s", depname);
             not.op = JDF_NOT;
             not.jdf_ua = dl->guard->guard;
+            /* The negation reads the local definitions that the guard reads */
+            if( jdf_expr_reads_local_defs(dl->guard->guard, dl->guard->guard->local_variables) )
+                not.local_variables = dl->guard->guard->local_variables;
             jdf_generate_expression(jdf, f, &not, condname);
             sprintf(condname, "&expr_of_cond_for_%s", depname);
             indepnorange = jdf_generate_dependency(jdf, flow, dl, dl->guard->callfalse, depname, condname, f) && indepnorange;
@@ -5041,9 +5206,15 @@ static char *jdf_create_code_assignments_calls(string_arena_t *sa, int spaces,
   return string_arena_get_string(sa);
 }
 
+/**
+ * Add to sa the arena datatype of a dependency. When it is given as inline C
+ * code, assignments is what the generated function is called with: the locals
+ * it reads, then the task.
+ */
 static void
-jdf_generate_arena_string_from_datatype(string_arena_t *sa,
-                                        jdf_datatransfer_type_t datatype)
+jdf_generate_arena_string_from_datatype_with(string_arena_t *sa,
+                                             jdf_datatransfer_type_t datatype,
+                                             char *assignments)
 {
     expr_info_t info = EMPTY_EXPR_INFO;
     string_arena_t *sa2 = string_arena_new(64);
@@ -5051,7 +5222,7 @@ jdf_generate_arena_string_from_datatype(string_arena_t *sa,
     info.sa = sa2;
     info.prefix = "";
     info.suffix = "";
-    info.assignments = "&this_task->locals, this_task ";
+    info.assignments = assignments;
     if( JDF_CST == datatype.type->op ) {
         string_arena_add_string(sa, "%d", datatype.type->jdf_cst);
     } else if( (JDF_VAR == datatype.type->op) || (JDF_STRING == datatype.type->op) ) {
@@ -5060,6 +5231,13 @@ jdf_generate_arena_string_from_datatype(string_arena_t *sa,
         string_arena_add_string(sa, "%s", dump_expr((void**)datatype.type, &info));
     }
     string_arena_free(sa2);
+}
+
+static void
+jdf_generate_arena_string_from_datatype(string_arena_t *sa,
+                                        jdf_datatransfer_type_t datatype)
+{
+    jdf_generate_arena_string_from_datatype_with(sa, datatype, "&this_task->locals, this_task ");
 }
 
 static void
@@ -5517,6 +5695,7 @@ jdf_generate_code_call_initialization(const jdf_t *jdf, const jdf_call_t *call,
     const jdf_dataflow_t* tflow = NULL;
     const jdf_function_entry_t* targetf = NULL;
     const char *fname = f->fname;
+    int nb_open_ldef = 0;
     sa = string_arena_new(64);
     sa2 = string_arena_new(64);
 
@@ -5524,6 +5703,15 @@ jdf_generate_code_call_initialization(const jdf_t *jdf, const jdf_call_t *call,
     info.prefix = "";
     info.suffix = "";
     info.assignments = "&this_task->locals";
+
+    /* The parameters of the call may read the local definitions of the call:
+     * bring them in scope. The ones of the dependency already are. */
+    if( jdf_call_reads_local_defs(call, call->local_defs) ) {
+        nb_open_ldef = jdf_local_defs_open(sa, spaces, call->local_defs, dl->local_defs,
+                                           "this_task->locals.", &info);
+        coutput("%s", string_arena_get_string(sa));
+        string_arena_init(sa);
+    }
 
     if( call->var != NULL ) {
         targetf = find_target_function(jdf, call->func_or_mem);
@@ -5685,6 +5873,11 @@ jdf_generate_code_call_initialization(const jdf_t *jdf, const jdf_call_t *call,
                 spaces, JDF_OBJECT_ONAME( flow ),
                 spaces);
     }
+    if( nb_open_ldef > 0 ) {
+        string_arena_init(sa);
+        jdf_local_defs_close(sa, spaces, nb_open_ldef);
+        coutput("%s", string_arena_get_string(sa));
+    }
     string_arena_free(sa);
     string_arena_free(sa2);
 }
@@ -5789,6 +5982,7 @@ static void jdf_generate_code_flow_initialization(const jdf_t *jdf,
     expr_info_t info = EMPTY_EXPR_INFO;
     string_arena_t *sa, *sa2 = NULL;
     int cond_index = 0, has_output_deps = 0;
+    int scoped = 0, nb_open_ldef = 0;
     char* condition[] = {"    if( %s ) {\n", "    else if( %s ) {\n"};
 
     if( JDF_FLOW_TYPE_CTL & flow->flow_flags ) {
@@ -5832,25 +6026,68 @@ static void jdf_generate_code_flow_initialization(const jdf_t *jdf,
     info.suffix = "";
     info.assignments = "    &this_task->locals";
 
+    /* The dependencies of the flow are tried in turn, as the branches of one
+     * "if ... else if ... else" statement. When what is generated for one of
+     * them reads its local definitions, these must be in scope around its
+     * guard, and around its guard only: each dependency then is a statement
+     * of its own, inside the blocks and loops of its definitions, that jumps
+     * to the end of the flow once it applies. In the loop of a range the
+     * first index for which the guard holds is the one that applies. */
+    for(dl = flow->deps; dl != NULL; dl = dl->next) {
+        if( (flow->flow_flags & JDF_FLOW_TYPE_READ) && (dl->dep_flags & JDF_DEP_FLOW_OUT) ) continue;
+        scoped |= jdf_dep_data_lookup_reads_local_defs(dl);
+    }
+#define JDF_CODE_LOCAL_DEFS_OPEN(DEP)                                   \
+    do {                                                                \
+        if( scoped && jdf_dep_data_lookup_reads_local_defs((DEP)) ) {   \
+            sa2 = string_arena_new(64);                                 \
+            nb_open_ldef = jdf_local_defs_open(sa2, "    ", (DEP)->local_defs, NULL, \
+                                               "this_task->locals.", &info); \
+            coutput("%s", string_arena_get_string(sa2));                \
+            string_arena_free(sa2);                                     \
+            sa2 = NULL;                                                 \
+        }                                                               \
+    } while(0)
+#define JDF_CODE_LOCAL_DEFS_DONE(DEP)                                   \
+    do {                                                                \
+        if( scoped )                                                    \
+            coutput("    goto "JDF2C_NAMESPACE"flow_%s_ready;\n", flow->varname); \
+    } while(0)
+#define JDF_CODE_LOCAL_DEFS_CLOSE(DEP)                                  \
+    do {                                                                \
+        if( nb_open_ldef > 0 ) {                                        \
+            sa2 = string_arena_new(64);                                 \
+            jdf_local_defs_close(sa2, "    ", nb_open_ldef);            \
+            coutput("%s", string_arena_get_string(sa2));                \
+            string_arena_free(sa2);                                     \
+            sa2 = NULL;                                                 \
+            nb_open_ldef = 0;                                           \
+        }                                                               \
+    } while(0)
+
     if ( flow->flow_flags & JDF_FLOW_TYPE_READ ) {
         int check = 1;
         for(dl = flow->deps; dl != NULL; dl = dl->next) {
             if( dl->dep_flags & JDF_DEP_FLOW_OUT ) continue;
 
             check = 0;
+            JDF_CODE_LOCAL_DEFS_OPEN(dl);
             switch( dl->guard->guard_type ) {
             case JDF_GUARD_UNCONDITIONAL:
                 if( 0 != cond_index ) coutput("    else {\n");
                 jdf_generate_code_call_initialization( jdf, dl->guard->calltrue, f, flow, dl,
                                                        (0 != cond_index ? "  " : "") );
                 if( 0 != cond_index ) coutput("    }\n");
+                JDF_CODE_LOCAL_DEFS_DONE(dl);
+                JDF_CODE_LOCAL_DEFS_CLOSE(dl);
                 goto done_with_input;
             case JDF_GUARD_BINARY:
                 coutput( (0 == cond_index ? condition[0] : condition[1]),
                          dump_expr((void**)dl->guard->guard, &info));
                 jdf_generate_code_call_initialization( jdf, dl->guard->calltrue, f, flow, dl, "  " );
+                JDF_CODE_LOCAL_DEFS_DONE(dl);
                 coutput("    }\n");
-                cond_index++;
+                if( !scoped ) cond_index++;
                 break;
             case JDF_GUARD_TERNARY:
                 coutput( (0 == cond_index ? condition[0] : condition[1]),
@@ -5859,8 +6096,11 @@ static void jdf_generate_code_flow_initialization(const jdf_t *jdf,
                 coutput("    } else {\n");
                 jdf_generate_code_call_initialization( jdf, dl->guard->callfalse, f, flow, dl, "  " );
                 coutput("    }\n");
+                JDF_CODE_LOCAL_DEFS_DONE(dl);
+                JDF_CODE_LOCAL_DEFS_CLOSE(dl);
                 goto done_with_input;
             }
+            JDF_CODE_LOCAL_DEFS_CLOSE(dl);
         }
         if ( check ) {
             jdf_fatal(JDF_OBJECT_LINENO(flow),
@@ -5884,18 +6124,22 @@ static void jdf_generate_code_flow_initialization(const jdf_t *jdf,
 
             /* This is the case of a pure output data.
              */
+            JDF_CODE_LOCAL_DEFS_OPEN(dl);
             switch( dl->guard->guard_type ) {
             case JDF_GUARD_UNCONDITIONAL:
                 if( 0 != cond_index ) coutput("    else {\n");
                 jdf_generate_code_call_init_output(jdf, dl->guard->calltrue, flow, f->fname, dl, "  ");
                 if( 0 != cond_index ) coutput("    }\n");
+                JDF_CODE_LOCAL_DEFS_DONE(dl);
+                JDF_CODE_LOCAL_DEFS_CLOSE(dl);
                 goto done_with_input;
             case JDF_GUARD_BINARY:
                 coutput( (0 == cond_index ? condition[0] : condition[1]),
                          dump_expr((void**)dl->guard->guard, &info));
                 jdf_generate_code_call_init_output(jdf, dl->guard->calltrue, flow, f->fname, dl, "  ");
+                JDF_CODE_LOCAL_DEFS_DONE(dl);
                 coutput("    }\n");
-                cond_index++;
+                if( !scoped ) cond_index++;
                 break;
             case JDF_GUARD_TERNARY:
                 coutput( (0 == cond_index ? condition[0] : condition[1]),
@@ -5904,11 +6148,19 @@ static void jdf_generate_code_flow_initialization(const jdf_t *jdf,
                 coutput("    } else {\n");
                 jdf_generate_code_call_init_output(jdf, dl->guard->callfalse, flow, f->fname, dl, "  ");
                 coutput("    }\n");
+                JDF_CODE_LOCAL_DEFS_DONE(dl);
+                JDF_CODE_LOCAL_DEFS_CLOSE(dl);
                 goto done_with_input;
             }
+            JDF_CODE_LOCAL_DEFS_CLOSE(dl);
         }
     }
  done_with_input:
+#undef JDF_CODE_LOCAL_DEFS_OPEN
+#undef JDF_CODE_LOCAL_DEFS_DONE
+#undef JDF_CODE_LOCAL_DEFS_CLOSE
+     if( scoped )
+         coutput(" "JDF2C_NAMESPACE"flow_%s_ready:\n", flow->varname);
      coutput("    this_task->data._f_%s.data_in     = chunk;\n"
              "    this_task->data._f_%s.source_repo       = consumed_repo;\n"
              "    this_task->data._f_%s.source_repo_entry = consumed_entry;\n",
@@ -6297,8 +6549,9 @@ jdf_generate_code_datatype_lookup(const jdf_t *jdf,
     string_arena_t *sa_temp       = string_arena_new(256);
 
     int last_datatype_idx, continue_dependencies, type, skip_condition, generate_exit_label = 0;
+    int own_scope, nb_open_ldef = 0;
     uint32_t current_mask = 0;
-    expr_info_t info = EMPTY_EXPR_INFO;
+    expr_info_t info = EMPTY_EXPR_INFO, info_ldef = EMPTY_EXPR_INFO, *dinfo;
 
     sa  = string_arena_new(64);
     sa2 = string_arena_new(64);
@@ -6307,6 +6560,12 @@ jdf_generate_code_datatype_lookup(const jdf_t *jdf,
     info.prefix = "";
     info.suffix = "";
     info.assignments = "&this_task->locals";
+
+    /* For the dependencies looked up with their local definitions in scope */
+    info_ldef.sa = sa2;
+    info_ldef.prefix = "";
+    info_ldef.suffix = "";
+    info_ldef.assignments = "&"JDF2C_NAMESPACE"_tmp_locals";
 
     ai.sa = sa2;
     ai.holder = "this_task->locals.";
@@ -6359,27 +6618,52 @@ jdf_generate_code_datatype_lookup(const jdf_t *jdf,
         for(dl = fl->deps; NULL != dl; dl = dl->next) {
             if( !(dl->dep_flags & type) ) continue;
 
+            /* A dependency whose guard, or whose remote datatype, reads the
+             * local definitions of the dependency is looked up alone, with
+             * these definitions in scope. In the loop of a range the first
+             * index for which the guard holds returns: such a dependency
+             * applies if its guard holds for some index, and has the datatype
+             * of the first one. One datatype is returned for the dependency,
+             * whatever the number of tasks its range covers. */
+            own_scope = ((JDF_GUARD_BINARY == dl->guard->guard_type) &&
+                         jdf_expr_reads_local_defs(dl->guard->guard, dl->local_defs)) ||
+                        jdf_datatype_reads_local_defs(&dl->datatype_remote, dl->local_defs);
+            dinfo = own_scope ? &info_ldef : &info;
+
             /* Prepare the memory layout of the output dependency. */
-            if( last_datatype_idx != dl->dep_datatype_index ) {
+            if( own_scope || (last_datatype_idx != dl->dep_datatype_index) ) {
                 JDF_CODE_DATATYPE_DUMP(sa_coutput, current_mask, sa_cond, sa_datatype, skip_condition);
+                if( own_scope ) {
+                    string_arena_add_string(sa_coutput,
+                                            "    if( (*flow_mask) & 0x%xU ) {  /* dependency of line %d, with its local definitions */\n"
+                                            "      %s "JDF2C_NAMESPACE"_tmp_locals = this_task->locals; (void)"JDF2C_NAMESPACE"_tmp_locals;\n",
+                                            (type == JDF_DEP_FLOW_OUT ? (1U << dl->dep_index) : (1U << fl->flow_index)),
+                                            JDF_OBJECT_LINENO(dl), parsec_get_name(jdf, f, "parsec_assignment_t"));
+                    nb_open_ldef = jdf_local_defs_open(sa_coutput, "      ", dl->local_defs, NULL,
+                                                       JDF2C_NAMESPACE"_tmp_locals.", &info_ldef);
+                }
                 /************************************/
                 /* REMOTE DATATYPE USED FOR RECV    */
                 /************************************/
                 string_arena_init(sa_tmp_arena);
                 string_arena_init(sa_tmp_type);
                 string_arena_init(sa_temp);
-                jdf_generate_arena_string_from_datatype(sa_temp, dl->datatype_remote);
+                if( own_scope )
+                    jdf_generate_arena_string_from_datatype_with(sa_temp, dl->datatype_remote,
+                                                                 "&"JDF2C_NAMESPACE"_tmp_locals, this_task ");
+                else
+                    jdf_generate_arena_string_from_datatype(sa_temp, dl->datatype_remote);
                 string_arena_add_string(sa_tmp_arena, " %s->arena ", string_arena_get_string(sa_temp));
 
                 if( NULL == dl->datatype_remote.layout ) { /* no specific layout */
                     string_arena_add_string(sa_tmp_type, "%s->opaque_dtt", string_arena_get_string(sa_temp));
                 } else {
-                    string_arena_add_string(sa_tmp_type, "%s", dump_expr((void**)dl->datatype_remote.layout, &info));
+                    string_arena_add_string(sa_tmp_type, "%s", dump_expr((void**)dl->datatype_remote.layout, dinfo));
                 }
                 string_arena_init(sa_tmp_count);
-                string_arena_add_string(sa_tmp_count, "%s", dump_expr((void**)dl->datatype_remote.count, &info));
+                string_arena_add_string(sa_tmp_count, "%s", dump_expr((void**)dl->datatype_remote.count, dinfo));
                 string_arena_init(sa_tmp_displ);
-                string_arena_add_string(sa_tmp_displ, "%s", dump_expr((void**)dl->datatype_remote.displ, &info));
+                string_arena_add_string(sa_tmp_displ, "%s", dump_expr((void**)dl->datatype_remote.displ, dinfo));
 
                 jdf_generate_code_fillup_datatypes(sa_tmp_arena,    sa_arena,
                                                    sa_tmp_type,     sa_type,
@@ -6411,12 +6695,20 @@ jdf_generate_code_datatype_lookup(const jdf_t *jdf,
                     string_arena_add_string(sa_cond, " || ");
                 string_arena_add_string(sa_cond,
                                         "%s",
-                                        dump_expr((void**)dl->guard->guard, &info));
+                                        dump_expr((void**)dl->guard->guard, dinfo));
                 break;
             }
 
             /* update the mask before the next dump */
             current_mask |= (type == JDF_DEP_FLOW_OUT ? (1U << dl->dep_index) : (1U << fl->flow_index));
+
+            if( own_scope ) {
+                /* Dump this dependency now, in the scope of its definitions */
+                JDF_CODE_DATATYPE_DUMP(sa_coutput, current_mask, sa_cond, sa_datatype, skip_condition);
+                jdf_local_defs_close(sa_coutput, "      ", nb_open_ldef);
+                string_arena_add_string(sa_coutput, "    }\n");
+                last_datatype_idx = -1;  /* the next dependency does not share this lookup */
+            }
 
             if( !continue_dependencies ) break;
         }

@@ -1772,6 +1772,9 @@ int jdf_assign_ldef_index(jdf_function_entry_t *f)
                         DO_DEBUG_VERBOSE(2, ({ fprintf(stderr, "  Flow for %s, dep %d, calltrue: ldef %s is at %d\n", fl->varname, depi, ld->alias, ld->ldef_index); }) );
                     }
                 }
+                /* The two calls share their indices: remember how many the first one uses */
+                if( nb_ldef_for_calls > f->nb_max_local_def )
+                    f->nb_max_local_def = nb_ldef_for_calls;
                 nb_ldef_for_calls = nb_ldef_for_deps;
                 for(ld = dep->guard->callfalse->local_defs; NULL != ld; ld = ld->next) {
                     assert(NULL != ld->alias);
