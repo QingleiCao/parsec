@@ -467,17 +467,19 @@ int parsec_mca_device_init(void)
                     device_components[i] = NULL;
                     continue;
                 }
-                if( i != j ) {  /* compress the list of components */
+                /* Compress the list of components: every component that gave
+                 * modules takes the next place, also when it is already in it. */
+                if( i != j ) {
                     device_components[j] = device_components[i];
                     device_components[i] = NULL;
-                    j++;
                 }
                 modules_activated[num_modules_activated++] = modules[0];
 
 #if defined(PARSEC_PROF_TRACE)
-                strncat(modules_activated_str, device_components[i]->mca_component_name, 1023);
+                strncat(modules_activated_str, device_components[j]->mca_component_name, 1023);
                 strncat(modules_activated_str, ",", 1023);
 #endif
+                j++;
             }
         }
     }
