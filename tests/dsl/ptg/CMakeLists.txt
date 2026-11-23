@@ -22,6 +22,10 @@ parsec_addtest_executable(C complex_deps)
 target_link_libraries(complex_deps PRIVATE tests_runtime_common)
 target_ptg_sources(complex_deps PRIVATE "complex_deps.jdf")
 
+parsec_addtest_executable(C ctl_into_write_only)
+target_link_libraries(ctl_into_write_only PRIVATE tests_runtime_common)
+target_ptg_sources(ctl_into_write_only PRIVATE "ctl_into_write_only.jdf")
+
 if(PARSEC_HAVE_DEV_CAPABILITY_BATCH)
   parsec_addtest_executable(C batch_cpu)
   target_link_libraries(batch_cpu PRIVATE tests_runtime_common)
