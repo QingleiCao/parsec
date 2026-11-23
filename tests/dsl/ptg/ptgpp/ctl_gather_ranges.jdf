@@ -25,19 +25,26 @@ extern "C" %{
  *    predecessors of the task, which selects the input dependencies by their
  *    index. The runtime used to pass the index of the flow: with the flow at
  *    index 0, each such dependency counted the tasks of the first one.
+ * A ternary, "[ k = 0 .. N-1 ] guard ? X A(k) : X B(k)", is one dependency
+ * with two branches, which share its index. Its guard holds the range, so the
+ * iterator counts the predecessors of both branches. The runtime used to count
+ * the false branch again, with its own count function.
  * A task with a count that is too small starts before the tasks it waits for
  * are done, and again each time the count is reached. With a count that is
  * too large it never starts, and the test does not end.
  *
  * LOW(0 .. NL-1) and HIGH(0 .. NH-1) are two sets of tasks of different sizes,
- * spread over the processes. Three tasks wait for them, each on another
+ * spread over the processes. Five tasks wait for them, each on another
  * process when there are enough: WAIT_CST(0) with constant guards, WAIT_IDX(0)
- * with guards that select every other task of each set, and WAIT_MIX(0) with
- * one guard of each kind. Each must run once, after the tasks it waits for.
+ * with guards that select every other task of each set, WAIT_MIX(0) with one
+ * guard of each kind, and WAIT_TERN(0) and WAIT_TERN(1) with a ternary that
+ * takes the first NL tasks of LOW for one and of HIGH for the other. Each must
+ * run once, after the tasks it waits for.
  */
 
-enum { W_CST = 0, W_IDX, W_MIX, W_NB };
-static const char *wait_name[W_NB] = { "WAIT_CST", "WAIT_IDX", "WAIT_MIX" };
+enum { W_CST = 0, W_IDX, W_MIX, W_TERN, W_NB = W_TERN + 2 };
+static const char *wait_name[W_NB] = { "WAIT_CST(0)", "WAIT_IDX(0)", "WAIT_MIX(0)",
+                                       "WAIT_TERN(0)", "WAIT_TERN(1)" };
 
 static int32_t *ran_low, *ran_high;  /* How many times LOW(k) and HIGH(j) ran in this process */
 static int32_t  ran_wait[W_NB];      /* How many times each waiting task ran in this process */
@@ -51,7 +58,7 @@ static void waited_for(int w, const char *set, const int32_t *ran,
 {
     for(int i = first; i < nb; i += step) {
         if( ((int)dc->rank_of(dc, i, 0) == (int)dc->myrank) && (1 != ran[i]) ) {
-            fprintf(stderr, "%s(0) starts when %s(%d) has run %d time(s)\n",
+            fprintf(stderr, "%s starts when %s(%d) has run %d time(s)\n",
                     wait_name[w], set, i, (int)ran[i]);
             (void)parsec_atomic_fetch_inc_int32(&nb_errors);
         }
@@ -71,6 +78,7 @@ LOW(k)
   CTL X -> X WAIT_CST(0)
         -> ((k % 2) == 0) ? X WAIT_IDX(0)
         -> X WAIT_MIX(0)
+        -> X WAIT_TERN(0)
 
 BODY
   usleep(1000);  /* Leave a task that starts too early the time to do so */
@@ -84,6 +92,7 @@ HIGH(j)
   CTL X -> X WAIT_CST(0)
         -> ((j % 2) == 1) ? X WAIT_IDX(0)
         -> ((j % 2) == 1) ? X WAIT_MIX(0)
+        -> (j < NL) ? X WAIT_TERN(1)
 
 BODY
   usleep(1000);
@@ -129,6 +138,20 @@ BODY
   (void)parsec_atomic_fetch_inc_int32(&ran_wait[W_MIX]);
 END
 
+WAIT_TERN(w)
+  w = 0 .. 1
+: descA(3 + w, 0)
+
+  CTL X <- [ k = 0 .. NL-1 ] (w == 0) ? X LOW(k) : X HIGH(k)
+
+BODY
+  if( 0 == w )
+    waited_for(W_TERN, "LOW", ran_low, 0, NL, 1, &descA->super.super);
+  else
+    waited_for(W_TERN + 1, "HIGH", ran_high, 0, NL, 1, &descA->super.super);
+  (void)parsec_atomic_fetch_inc_int32(&ran_wait[W_TERN + w]);
+END
+
 extern "C" %{
 
 #define LOW_PER_PROCESS 8
@@ -147,8 +170,9 @@ int main(int argc, char *argv[])
 
     /* Tile (i, 0), LOW(i) and HIGH(i) live on process i modulo the number of
      * processes: both sets reach every process. The second set is the larger,
-     * so that both wrong counts are too small: the test fails instead of
-     * hanging. */
+     * so that the wrong counts of two ranged dependencies are too small and
+     * the test fails. The one of a ternary is too large: the waiting task
+     * never runs, and the time limit of the test ends it. */
     NL = LOW_PER_PROCESS * world;
     NH = 3 * NL;
     parsec_matrix_block_cyclic_init(&descA, PARSEC_MATRIX_INTEGER, PARSEC_MATRIX_TILE,
@@ -196,7 +220,7 @@ int main(int argc, char *argv[])
         }
         for(int w = 0; w < W_NB; w++) {
             if( 1 != global[1 + w] ) {
-                fprintf(stderr, "%s(0) ran %d time(s) instead of once\n",
+                fprintf(stderr, "%s ran %d time(s) instead of once\n",
                         wait_name[w], (int)global[1 + w]);
                 ret = 1;
             }
