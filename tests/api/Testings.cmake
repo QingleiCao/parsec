@@ -9,6 +9,7 @@ if(MPI_Fortran_FOUND AND CMAKE_Fortran_COMPILER_WORKS AND CMAKE_Fortran_COMPILER
 endif()
 
 parsec_addtest_cmd(api/compose ${SHM_TEST_CMD_LIST} api/compose)
+parsec_addtest_cmd(api/arena_allocator ${SHM_TEST_CMD_LIST} api/arena_allocator)
 
 if( MPI_C_FOUND )
   parsec_addtest_cmd(api/init_fini:mp ${MPI_TEST_CMD_LIST} 4 api/init_fini)
