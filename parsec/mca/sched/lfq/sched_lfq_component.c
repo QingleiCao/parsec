@@ -78,13 +78,14 @@ static int sched_lfq_component_query(mca_base_module_t **module, int *priority)
 
 int parsec_sched_lfq_overflow_batch = 32;
 int parsec_sched_lfq_overflow_spins = 256;
+int parsec_sched_lfq_overflow_refill = PARSEC_SCHED_LFQ_REFILL_BEFORE_STEAL;
 
 static int sched_lfq_component_register(void)
 {
     parsec_mca_param_reg_int_name("sched_lfq", "overflow_batch",
                                   "Largest number of tasks a thread takes from the overflow queue in one visit: "
-                                  "the first is executed, the others go to the local queue of the thread "
-                                  "(at most half of its size). 1 takes one task per visit.",
+                                  "the first is executed, the others wait where sched_lfq_overflow_refill says. "
+                                  "1 takes one task per visit.",
                                   false, false, parsec_sched_lfq_overflow_batch, &parsec_sched_lfq_overflow_batch);
     if( parsec_sched_lfq_overflow_batch < 1 )
         parsec_sched_lfq_overflow_batch = 1;
@@ -94,6 +95,16 @@ static int sched_lfq_component_register(void)
                                   false, false, parsec_sched_lfq_overflow_spins, &parsec_sched_lfq_overflow_spins);
     if( parsec_sched_lfq_overflow_spins < 0 )
         parsec_sched_lfq_overflow_spins = 0;
+    parsec_mca_param_reg_int_name("sched_lfq", "overflow_refill",
+                                  "Where the tasks a thread took from the overflow queue wait, beyond the one it executes. "
+                                  "0: in the local queue of the thread (at most half of its size), where the other threads "
+                                  "steal them like any other task. 1: in a list of the thread, that it empties before it "
+                                  "steals, and that the other threads take from only once the overflow queue is empty. "
+                                  "2: in the same list, that the thread comes to after it found nothing to steal.",
+                                  false, false, parsec_sched_lfq_overflow_refill, &parsec_sched_lfq_overflow_refill);
+    if( (parsec_sched_lfq_overflow_refill < PARSEC_SCHED_LFQ_REFILL_NONE) ||
+        (parsec_sched_lfq_overflow_refill > PARSEC_SCHED_LFQ_REFILL_AFTER_STEAL) )
+        parsec_sched_lfq_overflow_refill = PARSEC_SCHED_LFQ_REFILL_BEFORE_STEAL;
     PARSEC_PAPI_SDE_DESCRIBE_COUNTER("SCHEDULER::PENDING_TASKS::SCHED=LFQ",
                               "the number of pending tasks for the LFQ scheduler");
     PARSEC_PAPI_SDE_DESCRIBE_COUNTER("SCHEDULER::PENDING_TASKS::QUEUE=<VPID>/<QID>::SCHED=LFQ",

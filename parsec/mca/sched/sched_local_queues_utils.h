@@ -74,11 +74,10 @@ static inline parsec_task_t *parsec_mca_sched_pop_from_system_queue_wrapper(pars
  * Take up to max tasks from the head of the system queue in one visit.
  *
  * @details
- *   The first task is returned. The others go to the bounded buffer of the
- *   calling thread: the thread finds them there without coming back to the
- *   system queue, and the other threads can still steal them. max should not
- *   exceed what the bounded buffer can take, or the surplus is pushed back to
- *   the system queue.
+ *   The tasks come back as a ring, in the order they had in the queue. The
+ *   caller executes the first one and decides where the others wait: every
+ *   thread that is out of tasks comes to this queue, so the fewer the visits
+ *   the better.
  *
  *   A thread that finds the queue locked while it holds tasks does not report
  *   "no task" at once: the runtime counts that as a miss and sends the thread
@@ -89,18 +88,20 @@ static inline parsec_task_t *parsec_mca_sched_pop_from_system_queue_wrapper(pars
  *   parsec_mca_sched_pop_from_system_queue_wrapper().
  *
  * @param[inout] sched_obj the scheduler object of the calling thread
- * @param[in] max the largest number of tasks to take (the returned one included)
+ * @param[in] max the largest number of tasks to take
  * @param[in] max_spins how many times to try again a lock that is busy
- * @return a task, or NULL if the queue is empty or stayed locked
+ * @param[out] nb the number of tasks in the ring
+ * @return a ring of tasks, or NULL if the queue is empty or stayed locked
  */
-static inline parsec_task_t *
+static inline parsec_list_item_t *
 parsec_mca_sched_pop_chain_from_system_queue_wrapper(parsec_mca_sched_local_queues_scheduler_object_t *sched_obj,
-                                                     int max, int max_spins)
+                                                     int max, int max_spins, int *nb)
 {
     parsec_list_t *queue = (parsec_list_t*)sched_obj->system_queue;
-    parsec_list_item_t *first, *others;
-    int spins = 0, nb = 0;
+    parsec_list_item_t *ring;
+    int spins = 0;
 
+    *nb = 0;
     if( parsec_list_nolock_is_empty(queue) )
         return NULL;
     while( !parsec_atomic_trylock(&queue->atomic_lock) ) {
@@ -109,18 +110,12 @@ parsec_mca_sched_pop_chain_from_system_queue_wrapper(parsec_mca_sched_local_queu
         spins++;
         parsec_cpu_relax();
     }
-    first = parsec_list_nolock_unchain_front(queue, max, &nb);
+    ring = parsec_list_nolock_unchain_front(queue, max, nb);
     parsec_atomic_unlock(&queue->atomic_lock);
-    if( NULL == first )
-        return NULL;
 #if defined(PARSEC_PAPI_SDE)
-    sched_obj->local_system_queue_balance -= nb;
+    sched_obj->local_system_queue_balance -= *nb;
 #endif
-    others = parsec_list_item_ring_chop(first);
-    PARSEC_LIST_ITEM_SINGLETON(first);
-    if( NULL != others )
-        parsec_hbbuffer_push_all(sched_obj->task_queue, others, 0);
-    return (parsec_task_t*)first;
+    return ring;
 }
 
 static inline void parsec_mca_sched_push_in_system_queue_wrapper(void *sobj, parsec_list_item_t *elt, int32_t distance)

@@ -49,6 +49,36 @@ const parsec_sched_module_t parsec_sched_lfq_module = {
     }
 };
 
+/**
+ * What lfq adds to the scheduler object of the local queues: the tasks that a
+ * thread brought back from the system queue in one visit and has not executed
+ * yet. They are kept apart from the bounded buffer so that a thread that runs
+ * out of tasks goes to the system queue for a batch of its own, rather than
+ * take, one at a time, what is left of the batches of the others.
+ */
+typedef struct {
+    parsec_mca_sched_local_queues_scheduler_object_t super;
+    parsec_list_t  *refill;            /* The tasks of the last batch of this thread that wait */
+    parsec_list_t **hierarch_refills;  /* The refill lists of all threads, in the order of super.hierarch_queues */
+} sched_lfq_object_t;
+
+#define SCHED_LFQ_OBJECT(es) ((sched_lfq_object_t*)(es)->scheduler_object)
+#define SCHED_LFQ_CACHE_LINE 64
+
+/* The owner of a refill list writes to it for every task it takes out. The list
+ * gets cache lines of its own: what the allocator would put next to it, the
+ * bounded buffer of the same thread, is read by every thread that looks for
+ * work. */
+static parsec_list_t* sched_lfq_refill_new(void)
+{
+    size_t size = (sizeof(parsec_list_t) + SCHED_LFQ_CACHE_LINE - 1) & ~((size_t)SCHED_LFQ_CACHE_LINE - 1);
+    void *list = NULL;
+    int rc = posix_memalign(&list, SCHED_LFQ_CACHE_LINE, size);
+    assert( (0 == rc) && (NULL != list) ); (void)rc;
+    PARSEC_OBJ_CONSTRUCT(list, parsec_list_t);
+    return (parsec_list_t*)list;
+}
+
 static int sched_lfq_install( parsec_context_t *master )
 {
     (void)master;
@@ -58,6 +88,7 @@ static int sched_lfq_install( parsec_context_t *master )
 static int flow_lfq_init(parsec_execution_stream_t* es, struct parsec_barrier_t* barrier)
 {
     parsec_mca_sched_local_queues_scheduler_object_t *sched_obj = NULL;
+    sched_lfq_object_t *lfq = NULL;
     int nq, hwloc_levels;
     uint32_t queue_size;
     parsec_vp_t* vp;
@@ -65,8 +96,9 @@ static int flow_lfq_init(parsec_execution_stream_t* es, struct parsec_barrier_t*
     vp = es->virtual_process;
 
     /* Every flow creates its own local object */
-    sched_obj = (parsec_mca_sched_local_queues_scheduler_object_t*)calloc(1, sizeof(parsec_mca_sched_local_queues_scheduler_object_t));
-    es->scheduler_object = sched_obj;
+    lfq = (sched_lfq_object_t*)calloc(1, sizeof(sched_lfq_object_t));
+    sched_obj = &lfq->super;
+    es->scheduler_object = lfq;
     if( 0 == es->th_id ) {  /* And flow 0 creates the system_queue */
         sched_obj->system_queue = PARSEC_OBJ_NEW(parsec_dequeue_t);
     }
@@ -74,6 +106,8 @@ static int flow_lfq_init(parsec_execution_stream_t* es, struct parsec_barrier_t*
     sched_obj->nb_hierarch_queues = vp->nb_cores;
     sched_obj->hierarch_queues = (parsec_hbbuffer_t **)malloc(sched_obj->nb_hierarch_queues * sizeof(parsec_hbbuffer_t*) );
     queue_size = vp->nb_cores * 4;
+    lfq->refill = sched_lfq_refill_new();
+    lfq->hierarch_refills = (parsec_list_t **)malloc(sched_obj->nb_hierarch_queues * sizeof(parsec_list_t*) );
 
     /* All local allocations are now completed. Synchronize with the other
      threads before setting up the entire queues hierarchy. */
@@ -86,6 +120,7 @@ static int flow_lfq_init(parsec_execution_stream_t* es, struct parsec_barrier_t*
     sched_obj->task_queue = parsec_hbbuffer_new( queue_size, 1, parsec_mca_sched_push_in_system_queue_wrapper,
                                                 (void*)sched_obj );
     sched_obj->hierarch_queues[0] = sched_obj->task_queue;
+    lfq->hierarch_refills[0] = lfq->refill;
 
     /* All local allocations are now completed. Synchronize with the other
      threads before setting up the entire queues hierarchy. */
@@ -105,6 +140,7 @@ static int flow_lfq_init(parsec_execution_stream_t* es, struct parsec_barrier_t*
         for( ; nq < sched_obj->nb_hierarch_queues; nq++ ) {
             sched_obj->hierarch_queues[nq] =
                 PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(vp->execution_streams[(es->th_id + nq) % vp->nb_cores])->task_queue;
+            lfq->hierarch_refills[nq] = SCHED_LFQ_OBJECT(vp->execution_streams[(es->th_id + nq) % vp->nb_cores])->refill;
         }
 #if defined(PARSEC_HAVE_HWLOC)
     } else {
@@ -117,6 +153,7 @@ static int flow_lfq_init(parsec_execution_stream_t* es, struct parsec_barrier_t*
                 d = parsec_hwloc_distance(es->th_id, id);
                 if( d == 2*level || d == 2*level + 1 ) {
                     sched_obj->hierarch_queues[nq] = PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(vp->execution_streams[id])->task_queue;
+                    lfq->hierarch_refills[nq] = SCHED_LFQ_OBJECT(vp->execution_streams[id])->refill;
                     PARSEC_DEBUG_VERBOSE(20, parsec_debug_output, "%d of %d: my %d preferred queue is the task queue of %d (%p)",
                            es->th_id, es->virtual_process->vp_id, nq, id, sched_obj->hierarch_queues[nq]);
                     nq++;
@@ -162,47 +199,117 @@ static int flow_lfq_init(parsec_execution_stream_t* es, struct parsec_barrier_t*
     return PARSEC_SUCCESS;
 }
 
+/* A task of the refill list of a thread, the calling one or another. These
+ * tasks are still counted with the system queue they came from. */
+static inline parsec_task_t*
+sched_lfq_pop_refill(parsec_mca_sched_local_queues_scheduler_object_t *sched_obj,
+                     parsec_list_t *refill, int own)
+{
+    parsec_task_t *task = (parsec_task_t*)(own ? parsec_list_pop_front(refill)
+                                               : parsec_list_try_pop_front(refill));
+#if defined(PARSEC_PAPI_SDE)
+    if( NULL != task )
+        sched_obj->local_system_queue_balance--;
+#endif
+    (void)sched_obj;
+    return task;
+}
+
 static parsec_task_t*
 sched_lfq_select(parsec_execution_stream_t *es,
                  int32_t* distance)
 {
+    sched_lfq_object_t *lfq = SCHED_LFQ_OBJECT(es);
+    parsec_mca_sched_local_queues_scheduler_object_t *sched_obj = &lfq->super;
+    const int refill = parsec_sched_lfq_overflow_refill;
+    parsec_list_item_t *ring, *others;
     parsec_task_t *task = NULL;
-    task = (parsec_task_t*)parsec_hbbuffer_pop_best(PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es)->task_queue,
-                                                                       parsec_execution_context_priority_comparator);
+    int max, nb;
+
+    task = (parsec_task_t*)parsec_hbbuffer_pop_best(sched_obj->task_queue,
+                                                    parsec_execution_context_priority_comparator);
     if( NULL != task ) {
         *distance = 0;
         return task;
     }
-    for(int i = 0; i <  PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es)->nb_hierarch_queues; i++ ) {
-        task = (parsec_task_t*)parsec_hbbuffer_pop_best(PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es)->hierarch_queues[i],
-                                                                           parsec_execution_context_priority_comparator);
+    if( PARSEC_SCHED_LFQ_REFILL_BEFORE_STEAL == refill ) {
+        task = sched_lfq_pop_refill(sched_obj, lfq->refill, 1);
+        if( NULL != task ) {
+            *distance = 1 + sched_obj->nb_hierarch_queues;
+            return task;
+        }
+    }
+    for(int i = 0; i < sched_obj->nb_hierarch_queues; i++ ) {
+        task = (parsec_task_t*)parsec_hbbuffer_pop_best(sched_obj->hierarch_queues[i],
+                                                        parsec_execution_context_priority_comparator);
         if( NULL != task ) {
             PARSEC_DEBUG_VERBOSE(20, parsec_debug_output, "LQ\t: %d:%d found task %p in its %d-preferred hierarchical queue %p",
-                    es->virtual_process->vp_id, es->th_id, task, i, PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es)->hierarch_queues[i]);
+                    es->virtual_process->vp_id, es->th_id, task, i, sched_obj->hierarch_queues[i]);
             *distance = i + 1;
+            return task;
+        }
+    }
+    if( PARSEC_SCHED_LFQ_REFILL_AFTER_STEAL == refill ) {
+        task = sched_lfq_pop_refill(sched_obj, lfq->refill, 1);
+        if( NULL != task ) {
+            *distance = 1 + sched_obj->nb_hierarch_queues;
             return task;
         }
     }
 
     /* Nothing in the bounded buffers: go to the system queue, and bring back
      * several tasks at once. Every thread that is out of tasks comes to this
-     * queue, so the fewer the visits the better. The tasks beyond the first go
-     * to the local buffer, which is empty or close to it at this point; keep
-     * half of it for the tasks that the first one will make ready. */
-    {
-        parsec_mca_sched_local_queues_scheduler_object_t *sched_obj = PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es);
-        int max = 1 + (int)(sched_obj->task_queue->size / 2);
-        if( max > parsec_sched_lfq_overflow_batch )
-            max = parsec_sched_lfq_overflow_batch;
-        task = parsec_mca_sched_pop_chain_from_system_queue_wrapper(sched_obj, max,
-                                                                    parsec_sched_lfq_overflow_spins);
+     * queue, so the fewer the visits the better. */
+    max = parsec_sched_lfq_overflow_batch;
+    if( PARSEC_SCHED_LFQ_REFILL_NONE == refill ) {
+        /* The tasks beyond the first go to the local buffer, which is empty or
+         * close to it at this point; keep half of it for the tasks that the
+         * first one will make ready. */
+        int room = 1 + (int)(sched_obj->task_queue->size / 2);
+        if( max > room )
+            max = room;
     }
-    if( NULL != task ) {
-        PARSEC_DEBUG_VERBOSE(20, parsec_debug_output, "LQ\t: %d:%d found task %p in its system queue %p",
-                es->virtual_process->vp_id, es->th_id, task, PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es)->system_queue);
-        *distance = 1 + PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es)->nb_hierarch_queues;
+    ring = parsec_mca_sched_pop_chain_from_system_queue_wrapper(sched_obj, max,
+                                                                parsec_sched_lfq_overflow_spins, &nb);
+    if( NULL != ring ) {
+        others = parsec_list_item_ring_chop(ring);
+        PARSEC_LIST_ITEM_SINGLETON(ring);
+        task = (parsec_task_t*)ring;
+        if( NULL != others ) {
+            if( PARSEC_SCHED_LFQ_REFILL_NONE == refill ) {
+                parsec_hbbuffer_push_all(sched_obj->task_queue, others, 0);
+            } else {
+                /* Only this thread adds to its refill list, and it comes here
+                 * once the list is empty: the list never holds more than a batch. */
+                parsec_list_chain_back(lfq->refill, others);
+#if defined(PARSEC_PAPI_SDE)
+                sched_obj->local_system_queue_balance += nb - 1;
+#endif
+            }
+        }
+        PARSEC_DEBUG_VERBOSE(20, parsec_debug_output, "LQ\t: %d:%d found task %p and %d others in its system queue %p",
+                es->virtual_process->vp_id, es->th_id, task, nb - 1, sched_obj->system_queue);
+        *distance = 1 + sched_obj->nb_hierarch_queues;
+        return task;
     }
-    return task;
+
+    /* The system queue is empty: what is left waits in the refill lists, and a
+     * thread that executes a long task must not keep its own for itself. While
+     * the system queue holds tasks the lists of the others are left alone, even
+     * if the lock of the queue stayed busy: the thread comes back to the queue. */
+    if( (PARSEC_SCHED_LFQ_REFILL_NONE != refill) &&
+        parsec_list_nolock_is_empty((parsec_list_t*)sched_obj->system_queue) ) {
+        for(int i = 1; i < sched_obj->nb_hierarch_queues; i++ ) {
+            task = sched_lfq_pop_refill(sched_obj, lfq->hierarch_refills[i], 0);
+            if( NULL != task ) {
+                PARSEC_DEBUG_VERBOSE(20, parsec_debug_output, "LQ\t: %d:%d found task %p in the %d-preferred refill list %p",
+                        es->virtual_process->vp_id, es->th_id, task, i, lfq->hierarch_refills[i]);
+                *distance = 1 + sched_obj->nb_hierarch_queues + i;
+                return task;
+            }
+        }
+    }
+    return NULL;
 }
 
 static int sched_lfq_schedule(parsec_execution_stream_t* es,
@@ -240,6 +347,10 @@ static void sched_lfq_remove( parsec_context_t *master )
 
                 free(sched_obj->hierarch_queues);
                 sched_obj->hierarch_queues = NULL;
+
+                PARSEC_OBJ_DESTRUCT( SCHED_LFQ_OBJECT(es)->refill );
+                free( SCHED_LFQ_OBJECT(es)->refill );
+                free( SCHED_LFQ_OBJECT(es)->hierarch_refills );
 
                 free(es->scheduler_object);
                 es->scheduler_object = NULL;
