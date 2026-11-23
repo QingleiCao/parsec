@@ -354,6 +354,7 @@ install(FILES
         ${CMAKE_CURRENT_SOURCE_DIR}/include/parsec/execution_stream.h
         ${CMAKE_CURRENT_SOURCE_DIR}/parsec_internal.h
         ${CMAKE_CURRENT_SOURCE_DIR}/vpmap.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/parsec_hwloc.h
         DESTINATION ${PARSEC_INSTALL_INCLUDEDIR}/parsec)
 if(PARSEC_PROF_GRAPHER)
   install(FILES
