@@ -691,6 +691,25 @@ parsec_list_nolock_chain_back( parsec_list_t* list,
 static inline parsec_list_item_t*
 parsec_list_nolock_unchain( parsec_list_t* list );
 
+/**
+ * @brief Remove the first elements of a dequeue, without locking it
+ *
+ * @details consider the list as a dequeue, and remove up to max elements
+ *          from its head. They are returned as a ring that starts with
+ *          the element that was the head and keeps the order of the dequeue.
+ *
+ * @param[inout] list the dequeue from which to extract the elements
+ * @param[in] max the largest number of elements to extract
+ * @param[out] nb the number of elements extracted
+ * @return the ring of elements (NULL if the dequeue was empty or max is
+ *         not positive)
+ *
+ * @remark this function is not thread safe
+ * @remark the cost is linear in the number of elements extracted
+ */
+static inline parsec_list_item_t*
+parsec_list_nolock_unchain_front( parsec_list_t* list, int max, int* nb );
+
 
 /**
  * @cond FALSE
@@ -1196,6 +1215,30 @@ parsec_list_unchain( parsec_list_t* list )
     head = parsec_list_nolock_unchain(list);
     parsec_list_unlock(list);
     return head;
+}
+
+static inline parsec_list_item_t*
+parsec_list_nolock_unchain_front( parsec_list_t* list, int max, int* nb )
+{
+    parsec_list_item_t* first;
+    parsec_list_item_t* last;
+    int count = 1;
+
+    if( (max <= 0) || parsec_list_nolock_is_empty(list) ) {
+        *nb = 0;
+        return NULL;
+    }
+    first = last = (parsec_list_item_t*)_HEAD(list);
+    while( (count < max) && (_GHOST(list) != last->list_next) ) {
+        last = (parsec_list_item_t*)last->list_next;
+        count++;
+    }
+    /* What follows last becomes the head; if nothing does, the list is empty */
+    _HEAD(list) = last->list_next;
+    _HEAD(list)->list_prev = _GHOST(list);
+    parsec_list_item_ring(first, last);
+    *nb = count;
+    return first;
 }
 
 

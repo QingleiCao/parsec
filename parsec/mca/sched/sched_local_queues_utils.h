@@ -20,6 +20,7 @@
 
 #include "parsec/parsec_config.h"
 #include "parsec/hbbuffer.h"
+#include "parsec/sys/cpu_relax.h"
 
 typedef struct {
     parsec_dequeue_t   *system_queue;               /* The overflow queue itself. */
@@ -67,6 +68,59 @@ static inline parsec_task_t *parsec_mca_sched_pop_from_system_queue_wrapper(pars
         sched_obj->local_system_queue_balance--;
 #endif
     return task;
+}
+
+/**
+ * Take up to max tasks from the head of the system queue in one visit.
+ *
+ * @details
+ *   The first task is returned. The others go to the bounded buffer of the
+ *   calling thread: the thread finds them there without coming back to the
+ *   system queue, and the other threads can still steal them. max should not
+ *   exceed what the bounded buffer can take, or the surplus is pushed back to
+ *   the system queue.
+ *
+ *   A thread that finds the queue locked while it holds tasks does not report
+ *   "no task" at once: the runtime counts that as a miss and sends the thread
+ *   to sleep after two of them. It tries the lock again, up to max_spins
+ *   times, as long as the queue is not empty.
+ *
+ *   With max == 1 and max_spins == 0 this is
+ *   parsec_mca_sched_pop_from_system_queue_wrapper().
+ *
+ * @param[inout] sched_obj the scheduler object of the calling thread
+ * @param[in] max the largest number of tasks to take (the returned one included)
+ * @param[in] max_spins how many times to try again a lock that is busy
+ * @return a task, or NULL if the queue is empty or stayed locked
+ */
+static inline parsec_task_t *
+parsec_mca_sched_pop_chain_from_system_queue_wrapper(parsec_mca_sched_local_queues_scheduler_object_t *sched_obj,
+                                                     int max, int max_spins)
+{
+    parsec_list_t *queue = (parsec_list_t*)sched_obj->system_queue;
+    parsec_list_item_t *first, *others;
+    int spins = 0, nb = 0;
+
+    if( parsec_list_nolock_is_empty(queue) )
+        return NULL;
+    while( !parsec_atomic_trylock(&queue->atomic_lock) ) {
+        if( (spins >= max_spins) || parsec_list_nolock_is_empty(queue) )
+            return NULL;
+        spins++;
+        parsec_cpu_relax();
+    }
+    first = parsec_list_nolock_unchain_front(queue, max, &nb);
+    parsec_atomic_unlock(&queue->atomic_lock);
+    if( NULL == first )
+        return NULL;
+#if defined(PARSEC_PAPI_SDE)
+    sched_obj->local_system_queue_balance -= nb;
+#endif
+    others = parsec_list_item_ring_chop(first);
+    PARSEC_LIST_ITEM_SINGLETON(first);
+    if( NULL != others )
+        parsec_hbbuffer_push_all(sched_obj->task_queue, others, 0);
+    return (parsec_task_t*)first;
 }
 
 static inline void parsec_mca_sched_push_in_system_queue_wrapper(void *sobj, parsec_list_item_t *elt, int32_t distance)

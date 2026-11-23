@@ -184,7 +184,19 @@ sched_lfq_select(parsec_execution_stream_t *es,
         }
     }
 
-    task = parsec_mca_sched_pop_from_system_queue_wrapper(PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es));
+    /* Nothing in the bounded buffers: go to the system queue, and bring back
+     * several tasks at once. Every thread that is out of tasks comes to this
+     * queue, so the fewer the visits the better. The tasks beyond the first go
+     * to the local buffer, which is empty or close to it at this point; keep
+     * half of it for the tasks that the first one will make ready. */
+    {
+        parsec_mca_sched_local_queues_scheduler_object_t *sched_obj = PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es);
+        int max = 1 + (int)(sched_obj->task_queue->size / 2);
+        if( max > parsec_sched_lfq_overflow_batch )
+            max = parsec_sched_lfq_overflow_batch;
+        task = parsec_mca_sched_pop_chain_from_system_queue_wrapper(sched_obj, max,
+                                                                    parsec_sched_lfq_overflow_spins);
+    }
     if( NULL != task ) {
         PARSEC_DEBUG_VERBOSE(20, parsec_debug_output, "LQ\t: %d:%d found task %p in its system queue %p",
                 es->virtual_process->vp_id, es->th_id, task, PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es)->system_queue);
