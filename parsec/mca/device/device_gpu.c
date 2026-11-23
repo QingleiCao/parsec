@@ -214,6 +214,7 @@ typedef struct parsec_gpu_pushout_plan_s {
     parsec_gpu_task_t *gpu_task;
     uint32_t remaining_flows;
     int      send_from_gpu_denied;  /**< the engine cannot send from accelerator memory */
+    int      forwards_need_host_copy;  /**< same, and there are other ranks to forward to */
     int      peers_incomplete;      /**< some accelerator cannot read another one */
 } parsec_gpu_pushout_plan_t;
 
@@ -281,6 +282,17 @@ parsec_gpu_pushout_successor(parsec_execution_stream_t *es,
          * medium that reaches it.
          */
         needs_host_copy = plan->peers_incomplete;
+        /* A successor that only reads the flow may pass it on to tasks of
+         * other ranks, and on an accelerator what it passes on is the copy it
+         * read there. When the engine cannot send that one it sends the host
+         * copy, which nobody writes after this task: it must hold the value
+         * from now on.
+         */
+        if( plan->forwards_need_host_copy && (NULL != dep->flow) &&
+            !(dep->flow->flow_flags & PARSEC_FLOW_ACCESS_WRITE) &&
+            (NULL != dep->flow->dep_out[0]) ) {
+            needs_host_copy = 1;
+        }
     }
     if( needs_host_copy ) {
         plan->gpu_task->pushout |= flow_bit;
@@ -318,8 +330,10 @@ parsec_gpu_task_update_pushout(parsec_execution_stream_t *es,
 
 #if defined(DISTRIBUTED)
     plan.send_from_gpu_denied = !(parsec_mpi_allow_gpu_memory_communications & PARSEC_RUNTIME_SEND_GPU_MEMORY);
+    plan.forwards_need_host_copy = plan.send_from_gpu_denied && (es->virtual_process->parsec_context->nb_nodes > 1);
 #else
     plan.send_from_gpu_denied = 0;  /* there are no remote successors to begin with */
+    plan.forwards_need_host_copy = 0;
 #endif  /* defined(DISTRIBUTED) */
     plan.peers_incomplete = parsec_device_peer_mesh_incomplete;
 
@@ -2338,13 +2352,10 @@ parsec_data_copy_t *parsec_device_data_copy_pin_value(parsec_data_copy_t *copy)
     uint32_t wanted = copy->version;
     int device_memory_readable;
 
-    if( parsec_device_data_copy_pin_reader(copy) ) return copy;
-    if( NULL == original ) return NULL;
-
     /* Whoever asks here reads through the communication engine, which reaches
-     * accelerator memory only when it has been told it may. The host mirror is
-     * always a candidate, and is the copy a device writes back to, so it comes
-     * first for being both the likeliest and the cheapest to read.
+     * accelerator memory only when it has been told it may. That holds for the
+     * copy asked for as well: an accelerator task forwards the copy it read on
+     * a read-only flow, and that one is in the accelerator's memory.
      */
 #if defined(DISTRIBUTED)
     device_memory_readable =
@@ -2352,6 +2363,14 @@ parsec_data_copy_t *parsec_device_data_copy_pin_value(parsec_data_copy_t *copy)
 #else
     device_memory_readable = 1;
 #endif  /* defined(DISTRIBUTED) */
+    if( (device_memory_readable || (0 == copy->device_index)) &&
+        parsec_device_data_copy_pin_reader(copy) ) return copy;
+    if( NULL == original ) return NULL;
+
+    /* The host mirror is always a candidate, and is the copy a device writes
+     * back to, so it comes first for being both the likeliest and the cheapest
+     * to read.
+     */
     for( uint32_t i = 0; i < parsec_nb_devices; i++ ) {
         parsec_data_copy_t *candidate = original->device_copies[i];
 
