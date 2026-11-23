@@ -47,6 +47,9 @@ set_tests_properties(
   PASS_REGULAR_EXPRESSION "A NULL is forwarded"
 )
 
+parsec_addtest_cmd(dsl/ptg/ptgpp/ctl_gather_ranges ${SHM_TEST_CMD_LIST} dsl/ptg/ptgpp/ctl_gather_ranges)
+# A wrong count of controls can leave a task waiting forever
+set_tests_properties(dsl/ptg/ptgpp/ctl_gather_ranges PROPERTIES TIMEOUT 60)
 parsec_addtest_cmd(dsl/ptg/ptgpp/write_check ${SHM_TEST_CMD_LIST} dsl/ptg/ptgpp/write_check)
 
 if( MPI_C_FOUND )
@@ -58,6 +61,9 @@ if( MPI_C_FOUND )
     PROPERTIES
     PASS_REGULAR_EXPRESSION "A NULL is forwarded"
   )
+  parsec_addtest_cmd(dsl/ptg/ptgpp/ctl_gather_ranges:mp ${MPI_TEST_CMD_LIST} 4 dsl/ptg/ptgpp/ctl_gather_ranges)
+  # A wrong count of controls can leave a task waiting forever
+  set_tests_properties(dsl/ptg/ptgpp/ctl_gather_ranges:mp PROPERTIES TIMEOUT 60)
   parsec_addtest_cmd(dsl/ptg/ptgpp/write_check:mp ${MPI_TEST_CMD_LIST} 4 dsl/ptg/ptgpp/write_check)
 endif( MPI_C_FOUND )
 

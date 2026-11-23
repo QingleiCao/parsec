@@ -1507,6 +1507,7 @@ parsec_check_IN_dependencies_with_counter( const parsec_taskpool_t *tp,
 {
     const parsec_task_class_t* tc = task->task_class;
     int i, j, active;
+    uint32_t iterated;
     const parsec_flow_t* flow;
     const parsec_dep_t* dep;
     parsec_dependency_t ret = 0;
@@ -1535,8 +1536,11 @@ parsec_check_IN_dependencies_with_counter( const parsec_taskpool_t *tp,
         active = 0;
         if( PARSEC_FLOW_ACCESS_NONE == (flow->flow_flags & PARSEC_FLOW_ACCESS_MASK) ) {
             /* Control case: just count how many must be resolved */
+            iterated = 0;  /* the dependencies counted with iterate_predecessors */
             for( j = 0; (j < MAX_DEP_IN_COUNT) && (NULL != flow->dep_in[j]); j++ ) {
                 dep = flow->dep_in[j];
+                if( iterated & (1U << dep->dep_index) )
+                    continue;  /* the other branch of a ternary, already counted */
                 if( NULL != dep->cond ) {
                     /* Check if the condition apply on the current setting */
                     if( dep->cond->op == PARSEC_EXPR_OP_INLINE ) {
@@ -1549,8 +1553,15 @@ parsec_check_IN_dependencies_with_counter( const parsec_taskpool_t *tp,
                             }
                         }
                     } else {
-                        /* Complicated case: fall back to iterate_predecessors with a counter */
-                        task->task_class->iterate_predecessors(NULL, task, 1 << flow->flow_index,  count_deps_fct, &active);
+                        /* Complicated case: fall back to iterate_predecessors with a counter.
+                         * The iterator selects the input dependencies by their index: count
+                         * the predecessors of this one only, the others are counted in turn.
+                         * For each value of the range it evaluates the condition and takes
+                         * one branch of a ternary: it counts the predecessors of both
+                         * branches, which share the index. The true branch comes first,
+                         * and the false one has such a condition only if the true one does. */
+                        task->task_class->iterate_predecessors(NULL, task, 1U << dep->dep_index, count_deps_fct, &active);
+                        iterated |= 1U << dep->dep_index;
                     }
                 } else {
                     if( NULL == dep->ctl_gather_nb)
