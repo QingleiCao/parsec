@@ -1100,8 +1100,6 @@ endif( BUILD_TESTING )
 
 add_subdirectory(docs)
 
-string(TIMESTAMP PARSEC_COMPILE_DATE)
-
 # Fetch GIT info for this build, if not preset for a release
 # First, check if `git archive` has substituted the special values
 set(GIT_COMMIT_HASH "$Format:%h$")
@@ -1196,6 +1194,23 @@ endforeach()
 set(PARSEC_C_INCLUDES "${CMAKE_INSTALL_PREFIX}/${PARSEC_INSTALL_INCLUDEDIR};${EXTRA_INCLUDES}"
     CACHE STRING "List of directories used to compile the parsec_ptgpp generated code")
 mark_as_advanced(PARSEC_C_INCLUDES)
+
+# parsec_options.h records the date of the build, and nearly every source
+# includes it. With a new date at each run of cmake, each run would rewrite
+# the header and everything would be rebuilt, even when nothing has changed.
+# Keep the date of the last run that changed the header: take a new one only
+# when the previous one does not give the header that is already there.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/parsec/include/parsec/parsec_options.h.in" parsec_options_in)
+string(CONFIGURE "${parsec_options_in}" parsec_options_new)
+set(parsec_options_old "")
+if(EXISTS "${PROJECT_INCLUDE_DIR}/parsec/parsec_options.h")
+  file(READ "${PROJECT_INCLUDE_DIR}/parsec/parsec_options.h" parsec_options_old)
+endif()
+if(NOT "${parsec_options_new}" STREQUAL "${parsec_options_old}")
+  string(TIMESTAMP parsec_compile_date)
+  set(PARSEC_COMPILE_DATE "${parsec_compile_date}" CACHE INTERNAL
+      "Date of the last run of cmake that changed parsec_options.h")
+endif()
 
 # Configuration header
 configure_file (
