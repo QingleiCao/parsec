@@ -13,3 +13,7 @@ endif( MPI_C_FOUND )
 parsec_addtest_executable(C dtt_bug_replicator SOURCES dtt_bug_replicator_ex.c)
 target_link_libraries(dtt_bug_replicator PRIVATE tests_runtime_common)
 target_ptg_sources(dtt_bug_replicator PRIVATE "dtt_bug_replicator.jdf")
+
+parsec_addtest_executable(C host_inputs)
+target_link_libraries(host_inputs PRIVATE tests_runtime_common)
+target_ptg_sources(host_inputs PRIVATE "host_inputs.jdf")

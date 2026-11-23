@@ -160,11 +160,15 @@ int __parsec_execute( parsec_execution_stream_t* es,
         for( int i = 0; i < task->task_class->nb_flows; i++ ) {
             /* Ignore output-only flows */
             if( NULL == task->task_class->in[i] ) continue;
+            /* in[] lists the flows that have an input one after the other,
+             * while the data of a task are indexed by flow: a task class with
+             * an output-only flow has them at different positions. */
+            const int f = task->task_class->in[i]->flow_index;
             /* Make sure data_in is not NULL */
-            if( NULL == task->data[i].data_in ) continue;
+            if( NULL == task->data[f].data_in ) continue;
             if( PARSEC_FLOW_ACCESS_NONE == (PARSEC_FLOW_ACCESS_MASK & task->task_class->in[i]->flow_flags) )  continue;  /* control flow */
 
-            parsec_data_copy_t* copy = task->data[i].data_in;
+            parsec_data_copy_t* copy = task->data[f].data_in;
             if(parsec_mca_device_is_gpu(copy->device_index)) {
                 /* A copy whose device reclaimed its memory has nothing to read
                  * from, and the mirror it was emptied into is the only place its
@@ -174,8 +178,8 @@ int __parsec_execute( parsec_execution_stream_t* es,
                     || copy->coherency_state == PARSEC_DATA_COHERENCY_SHARED);
                 assert(NULL != copy->original && NULL != copy->original->device_copies[0]);
                 assert(copy->version == copy->original->device_copies[0]->version);
-                task->data[i].data_in = copy->original->device_copies[0];
-                PARSEC_DATA_COPY_RETAIN(task->data[i].data_in);
+                task->data[f].data_in = copy->original->device_copies[0];
+                PARSEC_DATA_COPY_RETAIN(task->data[f].data_in);
                 PARSEC_DATA_COPY_RELEASE(copy);
             }
             /* The body is about to read these bytes, and a write-back coming
@@ -184,9 +188,9 @@ int __parsec_execute( parsec_execution_stream_t* es,
              * Remember the flows rather than look for them again afterwards, so
              * what is handed back cannot drift from what was taken.
              */
-            assert(i < MAX_PARAM_COUNT);
-            if( parsec_device_data_copy_pin_reader(task->data[i].data_in) ) {
-                task->pinned_input_mask |= (1U << i);
+            assert(f < MAX_PARAM_COUNT);
+            if( parsec_device_data_copy_pin_reader(task->data[f].data_in) ) {
+                task->pinned_input_mask |= (1U << f);
             }
         }
     }
@@ -198,11 +202,12 @@ int __parsec_execute( parsec_execution_stream_t* es,
                     tmp, task->selected_chore,
                     task->selected_device->device_index, task->selected_device->name);
     for( int i = 0; parsec_debug_verbose > 5 && i < task->task_class->nb_flows; i++ ) {
-        parsec_data_copy_t* copy = task->data[i].data_in;
-        if( NULL == copy ) continue; /* Make sure data_in is not NULL */
         if( NULL == task->task_class->in[i] ) continue; /* Ignore output-only flows */
         if( PARSEC_FLOW_ACCESS_NONE == (PARSEC_FLOW_ACCESS_MASK & task->task_class->in[i]->flow_flags) )  continue;  /* control flow */
-        len += snprintf(&tmp2[len], 4096-len, "\n\t  Data[%d] key %llx\ton dev:%d version:%d readers:%d ptr:%p", i, copy->original->key, copy->device_index, copy->version, copy->readers, copy->device_private);
+        const int f = task->task_class->in[i]->flow_index;  /* same as above */
+        parsec_data_copy_t* copy = task->data[f].data_in;
+        if( NULL == copy ) continue; /* Make sure data_in is not NULL */
+        len += snprintf(&tmp2[len], 4096-len, "\n\t  Data[%d] key %llx\ton dev:%d version:%d readers:%d ptr:%p", f, copy->original->key, copy->device_index, copy->version, copy->readers, copy->device_private);
     }
     PARSEC_DEBUG_VERBOSE(5, parsec_debug_output, "%s", tmp2);
 #endif
