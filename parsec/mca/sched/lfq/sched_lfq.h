@@ -57,10 +57,18 @@ extern int parsec_sched_lfq_overflow_spins;
                                                  *   like any task of that buffer */
 #define PARSEC_SCHED_LFQ_REFILL_BEFORE_STEAL 1  /**< in a list of the thread, that the thread empties before it
                                                  *   looks into the buffers of the others; the other threads
-                                                 *   take from it only once the overflow queue is empty */
+                                                 *   take from it only once the overflow queue is empty, or
+                                                 *   when its owner stopped using it */
 #define PARSEC_SCHED_LFQ_REFILL_AFTER_STEAL  2  /**< in the same list, that the thread comes to after it found
                                                  *   nothing in the buffers of the others */
 extern int parsec_sched_lfq_overflow_refill;
+/**
+ * Whether a thread takes the whole list of another thread that stopped using
+ * it (MCA parameter sched_lfq_overflow_takeover). Without it, the tasks in the
+ * list of a thread that executes a long task wait for that thread, or for the
+ * overflow queue to be empty.
+ */
+extern int parsec_sched_lfq_overflow_takeover;
 
 
 END_C_DECLS

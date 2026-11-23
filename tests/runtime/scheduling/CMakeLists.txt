@@ -7,3 +7,7 @@ include(ParsecCompilePTG)
 parsec_addtest_executable(C schedmicro SOURCES main.c ep_wrapper.c schedmicro_data.c)
 target_ptg_sources(schedmicro PRIVATE "ep.jdf")
 target_link_libraries(schedmicro PRIVATE m tests_runtime_common)
+
+parsec_addtest_executable(C stalled SOURCES stalled_main.c schedmicro_data.c)
+target_ptg_sources(stalled PRIVATE "stalled.jdf")
+target_link_libraries(stalled PRIVATE tests_runtime_common)

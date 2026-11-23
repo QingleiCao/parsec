@@ -60,6 +60,8 @@ typedef struct {
     parsec_mca_sched_local_queues_scheduler_object_t super;
     parsec_list_t  *refill;            /* The tasks of the last batch of this thread that wait */
     parsec_list_t **hierarch_refills;  /* The refill lists of all threads, in the order of super.hierarch_queues */
+    parsec_list_item_t **refill_seen;  /* For each of these lists, its first task when this thread last looked at it */
+    int             refill_next;       /* The list this thread looks at on its next way to the system queue */
 } sched_lfq_object_t;
 
 #define SCHED_LFQ_OBJECT(es) ((sched_lfq_object_t*)(es)->scheduler_object)
@@ -108,6 +110,8 @@ static int flow_lfq_init(parsec_execution_stream_t* es, struct parsec_barrier_t*
     queue_size = vp->nb_cores * 4;
     lfq->refill = sched_lfq_refill_new();
     lfq->hierarch_refills = (parsec_list_t **)malloc(sched_obj->nb_hierarch_queues * sizeof(parsec_list_t*) );
+    lfq->refill_seen = (parsec_list_item_t **)calloc(sched_obj->nb_hierarch_queues, sizeof(parsec_list_item_t*) );
+    lfq->refill_next = 1;
 
     /* All local allocations are now completed. Synchronize with the other
      threads before setting up the entire queues hierarchy. */
@@ -215,6 +219,56 @@ sched_lfq_pop_refill(parsec_mca_sched_local_queues_scheduler_object_t *sched_obj
     return task;
 }
 
+/* The first task of a ring is for the calling thread to execute, the others
+ * wait in its refill list. Only this thread adds to its list, and it does so
+ * once the list is empty: the list never holds more than a batch. */
+static inline parsec_task_t*
+sched_lfq_keep_ring(sched_lfq_object_t *lfq, parsec_list_item_t *ring)
+{
+    parsec_list_item_t *others = parsec_list_item_ring_chop(ring);
+    PARSEC_LIST_ITEM_SINGLETON(ring);
+    if( NULL != others )
+        parsec_list_chain_back(lfq->refill, others);
+    return (parsec_task_t*)ring;
+}
+
+/* A thread that stopped selecting tasks (it executes a long one, or it manages
+ * a device) leaves its refill list as it is, and the other threads keep away
+ * from that list as long as the system queue holds tasks. So, on its way to the
+ * system queue, a thread looks at the list of one other thread, a different one
+ * each time. A list that is in use changes its first task with every task its
+ * owner takes: if the first task is the one that was there on the previous
+ * look, the list is taken whole. Taking the list of a thread that was merely
+ * slow costs nothing but the move, that thread goes to the system queue next. */
+static inline parsec_list_item_t*
+sched_lfq_take_stalled_refill(sched_lfq_object_t *lfq)
+{
+    parsec_list_item_t *head, *ring = NULL;
+    parsec_list_t *list;
+    int v = lfq->refill_next;
+
+    if( lfq->super.nb_hierarch_queues < 2 )
+        return NULL;
+    lfq->refill_next = (v + 1 < lfq->super.nb_hierarch_queues) ? v + 1 : 1;
+    list = lfq->hierarch_refills[v];
+    head = (parsec_list_item_t*)PARSEC_LIST_ITERATOR_FIRST(list);
+    if( PARSEC_LIST_ITERATOR_END(list) == head ) {
+        lfq->refill_seen[v] = NULL;
+        return NULL;
+    }
+    if( head != lfq->refill_seen[v] ) {
+        lfq->refill_seen[v] = head;
+        return NULL;
+    }
+    lfq->refill_seen[v] = NULL;
+    if( !parsec_atomic_trylock(&list->atomic_lock) )
+        return NULL;
+    if( head == (parsec_list_item_t*)PARSEC_LIST_ITERATOR_FIRST(list) )
+        ring = parsec_list_nolock_unchain(list);
+    parsec_atomic_unlock(&list->atomic_lock);
+    return ring;
+}
+
 static parsec_task_t*
 sched_lfq_select(parsec_execution_stream_t *es,
                  int32_t* distance)
@@ -222,7 +276,7 @@ sched_lfq_select(parsec_execution_stream_t *es,
     sched_lfq_object_t *lfq = SCHED_LFQ_OBJECT(es);
     parsec_mca_sched_local_queues_scheduler_object_t *sched_obj = &lfq->super;
     const int refill = parsec_sched_lfq_overflow_refill;
-    parsec_list_item_t *ring, *others;
+    parsec_list_item_t *ring;
     parsec_task_t *task = NULL;
     int max, nb;
 
@@ -257,6 +311,22 @@ sched_lfq_select(parsec_execution_stream_t *es,
         }
     }
 
+    /* The tasks that a stalled thread holds in its list left the system queue
+     * before the ones that are in it now */
+    if( (PARSEC_SCHED_LFQ_REFILL_NONE != refill) && parsec_sched_lfq_overflow_takeover ) {
+        ring = sched_lfq_take_stalled_refill(lfq);
+        if( NULL != ring ) {
+            task = sched_lfq_keep_ring(lfq, ring);
+#if defined(PARSEC_PAPI_SDE)
+            sched_obj->local_system_queue_balance--;
+#endif
+            PARSEC_DEBUG_VERBOSE(20, parsec_debug_output, "LQ\t: %d:%d found task %p in a refill list that stalled",
+                    es->virtual_process->vp_id, es->th_id, task);
+            *distance = 2 + sched_obj->nb_hierarch_queues;
+            return task;
+        }
+    }
+
     /* Nothing in the bounded buffers: go to the system queue, and bring back
      * several tasks at once. Every thread that is out of tasks comes to this
      * queue, so the fewer the visits the better. */
@@ -272,20 +342,17 @@ sched_lfq_select(parsec_execution_stream_t *es,
     ring = parsec_mca_sched_pop_chain_from_system_queue_wrapper(sched_obj, max,
                                                                 parsec_sched_lfq_overflow_spins, &nb);
     if( NULL != ring ) {
-        others = parsec_list_item_ring_chop(ring);
-        PARSEC_LIST_ITEM_SINGLETON(ring);
-        task = (parsec_task_t*)ring;
-        if( NULL != others ) {
-            if( PARSEC_SCHED_LFQ_REFILL_NONE == refill ) {
+        if( PARSEC_SCHED_LFQ_REFILL_NONE == refill ) {
+            parsec_list_item_t *others = parsec_list_item_ring_chop(ring);
+            PARSEC_LIST_ITEM_SINGLETON(ring);
+            task = (parsec_task_t*)ring;
+            if( NULL != others )
                 parsec_hbbuffer_push_all(sched_obj->task_queue, others, 0);
-            } else {
-                /* Only this thread adds to its refill list, and it comes here
-                 * once the list is empty: the list never holds more than a batch. */
-                parsec_list_chain_back(lfq->refill, others);
+        } else {
+            task = sched_lfq_keep_ring(lfq, ring);
 #if defined(PARSEC_PAPI_SDE)
-                sched_obj->local_system_queue_balance += nb - 1;
+            sched_obj->local_system_queue_balance += nb - 1;
 #endif
-            }
         }
         PARSEC_DEBUG_VERBOSE(20, parsec_debug_output, "LQ\t: %d:%d found task %p and %d others in its system queue %p",
                 es->virtual_process->vp_id, es->th_id, task, nb - 1, sched_obj->system_queue);
@@ -293,9 +360,9 @@ sched_lfq_select(parsec_execution_stream_t *es,
         return task;
     }
 
-    /* The system queue is empty: what is left waits in the refill lists, and a
-     * thread that executes a long task must not keep its own for itself. While
-     * the system queue holds tasks the lists of the others are left alone, even
+    /* The system queue is empty: what is left waits in the refill lists, take
+     * it from there one task at a time. While the system queue holds tasks the
+     * lists of the others are left alone (unless they stalled, see above), even
      * if the lock of the queue stayed busy: the thread comes back to the queue. */
     if( (PARSEC_SCHED_LFQ_REFILL_NONE != refill) &&
         parsec_list_nolock_is_empty((parsec_list_t*)sched_obj->system_queue) ) {
@@ -351,6 +418,7 @@ static void sched_lfq_remove( parsec_context_t *master )
                 PARSEC_OBJ_DESTRUCT( SCHED_LFQ_OBJECT(es)->refill );
                 free( SCHED_LFQ_OBJECT(es)->refill );
                 free( SCHED_LFQ_OBJECT(es)->hierarch_refills );
+                free( SCHED_LFQ_OBJECT(es)->refill_seen );
 
                 free(es->scheduler_object);
                 es->scheduler_object = NULL;
