@@ -7,6 +7,10 @@ parsec_addtest_executable(C write_check SOURCES vector.c)
 target_link_libraries(write_check PRIVATE tests_runtime_common)
 target_ptg_sources(write_check PRIVATE "write_check.jdf")
 
+parsec_addtest_executable(C named_ranges)
+target_link_libraries(named_ranges PRIVATE tests_runtime_common)
+target_ptg_sources(named_ranges PRIVATE "named_ranges.jdf")
+
 parsec_addtest_executable(C jdf_forward_RW_NULL)
 target_link_libraries(jdf_forward_RW_NULL PRIVATE tests_runtime_common)
 target_ptg_sources(jdf_forward_RW_NULL PRIVATE "forward_RW_NULL.jdf")
