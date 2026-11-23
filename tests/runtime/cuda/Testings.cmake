@@ -45,6 +45,13 @@ if(PARSEC_HAVE_CUDA)
     parsec_addtest_cmd(runtime/cuda/ptg_pingpong:mp:gpu:capped ${MPI_TEST_CMD_LIST} 2 ${CTEST_CUDA_LAUNCHER_OPTIONS} runtime/cuda/ptg_pingpong --mca device_cuda_enabled 1 --mca device_cuda_memory_number_of_blocks 32 --mca device_show_statistics 1)
     set_tests_properties(runtime/cuda/ptg_pingpong:mp:gpu:capped PROPERTIES FIXTURES_REQUIRED parsec_cuda_kernels_run)
   endif()
+  if(MPI_C_FOUND AND TARGET forward_read)
+    # A GPU task passes a flow it only read on to another rank while the
+    # engine may not send from GPU memory: the host copy has to be sent, and
+    # has to hold what the GPU wrote.
+    parsec_addtest_cmd(runtime/cuda/forward_read:mp:gpu ${MPI_TEST_CMD_LIST} 2 ${CTEST_CUDA_LAUNCHER_OPTIONS} runtime/cuda/forward_read --mca device_cuda_enabled 1 --mca mpi_gpu_aware 0 --mca device_cuda_memory_number_of_blocks 64 --mca device_show_statistics 1)
+    set_tests_properties(runtime/cuda/forward_read:mp:gpu PROPERTIES FIXTURES_REQUIRED parsec_cuda_kernels_run)
+  endif()
 endif()
 
 if(PARSEC_HAVE_HIP)
@@ -53,5 +60,8 @@ if(PARSEC_HAVE_HIP)
   endif()
   if(TARGET dtd_pingpong)
     parsec_addtest_cmd(runtime/cuda/dtd_pingpong:hip ${SHM_TEST_CMD_LIST} ${CTEST_HIP_LAUNCHER_OPTIONS} runtime/cuda/dtd_pingpong --mca device_hip_enabled 2 --mca device_show_statistics 1)
+  endif()
+  if(MPI_C_FOUND AND TARGET forward_read)
+    parsec_addtest_cmd(runtime/cuda/forward_read:mp:hip ${MPI_TEST_CMD_LIST} 2 ${CTEST_HIP_LAUNCHER_OPTIONS} runtime/cuda/forward_read --mca device_hip_enabled 1 --mca mpi_gpu_aware 0 --mca device_hip_memory_number_of_blocks 64 --mca device_show_statistics 1)
   endif()
 endif()

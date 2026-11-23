@@ -1,0 +1,340 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+/*
+ * A GPU task that only reads a flow passes on the copy it read, which is in
+ * the accelerator's memory. When the communication engine may not send from
+ * accelerator memory (mpi_gpu_aware without 2), a successor on another rank
+ * must still receive the value, sent from host memory.
+ *
+ * PRODUCE updates each tile on a GPU, FORWARD reads it there and passes it to
+ * CHECK on the next rank, which verifies it. MPI_Isend, MPI_Send and MPI_Pack
+ * are intercepted to check that the engine never hands MPI a buffer in
+ * accelerator memory while it is not allowed to: with a GPU-aware MPI such a
+ * send succeeds, so the values alone would not show it.
+ */
+
+#include "parsec/parsec_config.h"
+#include "parsec/parsec_internal.h"
+#include "parsec/sys/atomic.h"
+#include "parsec/data_dist/matrix/two_dim_rectangle_cyclic.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#if defined(PARSEC_HAVE_MPI)
+#include <mpi.h>
+#endif
+#if defined(PARSEC_HAVE_DEV_CUDA_SUPPORT)
+#include <cuda_runtime_api.h>
+#endif
+#if defined(PARSEC_HAVE_DEV_HIP_SUPPORT)
+#include <hip/hip_runtime_api.h>
+#endif
+
+#include "forward_read.h"
+
+#if defined(PARSEC_HAVE_DEV_CUDA_SUPPORT)
+extern void cuda_pong_kernel(int *dev_data, int idx, void *stream);
+#endif
+#if defined(PARSEC_HAVE_DEV_HIP_SUPPORT)
+extern void hip_pong_kernel(int *dev_data, int idx, void *stream);
+#endif
+
+/* The GPU adds i to element i for these few indices (never 0, where adding i
+ * changes nothing). */
+#define NB_TOUCHED 4
+static inline int touched_index(int nb, int j) { return 1 + j * (nb / NB_TOUCHED); }
+
+static inline int initial_value(int r, int k, int nt, int i) { return 1000000 * (r * nt + k) + i; }
+
+%}
+
+dist   [type = "parsec_tiled_matrix_t*"]
+NT     [type = "int"]
+NB     [type = "int"]
+WORLD  [type = "int"]
+NB_ERR [type = "int32_t*"]
+
+/* Fills the tile on the host. */
+INIT(r, k)
+  r = 0 .. WORLD-1
+  k = 0 .. NT-1
+
+: dist(r, k)
+
+WRITE T <- NEW
+        -> T PRODUCE(r, k)
+
+BODY
+{
+    int *tile = (int*)T;
+    for( int i = 0; i < NB; i++ ) tile[i] = initial_value(r, k, NT, i);
+}
+END
+
+/* Updates the tile on an accelerator, which leaves the host copy behind. */
+PRODUCE(r, k)
+  r = 0 .. WORLD-1
+  k = 0 .. NT-1
+
+: dist(r, k)
+
+RW T <- T INIT(r, k)
+     -> T FORWARD(r, k)
+
+BODY [type=CUDA]
+{
+    for( int j = 0; j < NB_TOUCHED; j++ )
+        cuda_pong_kernel((int*)T, touched_index(NB, j), (void*)parsec_body.stream);
+}
+END
+
+BODY [type=HIP]
+{
+    for( int j = 0; j < NB_TOUCHED; j++ )
+        hip_pong_kernel((int*)T, touched_index(NB, j), (void*)parsec_body.stream);
+}
+END
+
+/* Reads the tile on the accelerator and passes it on to the next rank: what it
+ * passes on is the accelerator copy it read. */
+FORWARD(r, k)
+  r = 0 .. WORLD-1
+  k = 0 .. NT-1
+
+: dist(r, k)
+
+READ T <- T PRODUCE(r, k)
+       -> T CHECK((r + 1) % WORLD, k)
+
+BODY [type=CUDA]
+{
+    /* nothing to compute: what matters is where the output is read from */
+}
+END
+
+BODY [type=HIP]
+{
+    /* nothing to compute: what matters is where the output is read from */
+}
+END
+
+CHECK(r, k)
+  r = 0 .. WORLD-1
+  k = 0 .. NT-1
+  s = (r + WORLD - 1) % WORLD
+
+: dist(r, k)
+
+READ T <- T FORWARD(s, k)
+
+BODY
+{
+    const int *tile = (const int*)T;
+    int errors = 0, j = 0;
+    for( int i = 0; i < NB; i++ ) {
+        int expected = initial_value(s, k, NT, i);
+        if( (j < NB_TOUCHED) && (i == touched_index(NB, j)) ) {
+            expected += i;
+            j++;
+        }
+        if( tile[i] != expected ) {
+            if( errors < 4 )
+                fprintf(stderr, "CHECK(%d, %d): element %d of the tile from rank %d is %d, expected %d\n",
+                        r, k, i, s, tile[i], expected);
+            errors++;
+        }
+    }
+    if( errors ) parsec_atomic_fetch_add_int32(NB_ERR, errors);
+}
+END
+
+extern "C" %{
+
+#define NB_TILES 4          /* tiles per rank */
+#define NB_ELEMS (64*1024)  /* ints per tile: far above the short message limit */
+
+#if defined(PARSEC_HAVE_MPI)
+/* What the engine hands MPI to read from must not be in accelerator memory
+ * while the engine is not allowed to send from there. */
+static int32_t nb_device_buffers = 0;
+static int32_t nb_tile_sends = 0;
+static size_t  tile_bytes = SIZE_MAX;
+
+static int is_device_memory(const void *buf)
+{
+#if defined(PARSEC_HAVE_DEV_CUDA_SUPPORT)
+    {
+        struct cudaPointerAttributes attr;
+        if( cudaSuccess == cudaPointerGetAttributes(&attr, buf) ) {
+            if( cudaMemoryTypeDevice == attr.type ) return 1;
+        } else {
+            (void)cudaGetLastError();  /* not memory CUDA knows about */
+        }
+    }
+#endif
+#if defined(PARSEC_HAVE_DEV_HIP_SUPPORT)
+    {
+        hipPointerAttribute_t attr;
+        if( hipSuccess == hipPointerGetAttributes(&attr, buf) ) {
+#if HIP_VERSION_MAJOR >= 6
+            if( hipMemoryTypeDevice == attr.type ) return 1;
+#else
+            if( hipMemoryTypeDevice == attr.memoryType ) return 1;
+#endif
+        } else {
+            (void)hipGetLastError();  /* not memory HIP knows about */
+        }
+    }
+#endif
+    (void)buf;
+    return 0;
+}
+
+static void check_read_buffer(const char *call, const void *buf, int count, MPI_Datatype type)
+{
+    int size = 0;
+    if( (NULL == buf) || (count <= 0) || (MPI_SUCCESS != PMPI_Type_size(type, &size)) ) return;
+    if( (size_t)size * (size_t)count >= tile_bytes )
+        parsec_atomic_fetch_inc_int32(&nb_tile_sends);
+    if( (0 == (parsec_mpi_allow_gpu_memory_communications & PARSEC_RUNTIME_SEND_GPU_MEMORY)) &&
+        is_device_memory(buf) ) {
+        fprintf(stderr, "%s reads %zu bytes at %p in accelerator memory, but the engine may not send from there\n",
+                call, (size_t)size * (size_t)count, buf);
+        parsec_atomic_fetch_inc_int32(&nb_device_buffers);
+    }
+}
+
+int MPI_Isend(const void *buf, int count, MPI_Datatype type, int dest, int tag, MPI_Comm comm, MPI_Request *req)
+{
+    check_read_buffer("MPI_Isend", buf, count, type);
+    return PMPI_Isend(buf, count, type, dest, tag, comm, req);
+}
+
+int MPI_Send(const void *buf, int count, MPI_Datatype type, int dest, int tag, MPI_Comm comm)
+{
+    check_read_buffer("MPI_Send", buf, count, type);
+    return PMPI_Send(buf, count, type, dest, tag, comm);
+}
+
+int MPI_Pack(const void *inbuf, int incount, MPI_Datatype type, void *outbuf, int outsize, int *position, MPI_Comm comm)
+{
+    check_read_buffer("MPI_Pack", inbuf, incount, type);
+    return PMPI_Pack(inbuf, incount, type, outbuf, outsize, position, comm);
+}
+#endif  /* defined(PARSEC_HAVE_MPI) */
+
+int main(int argc, char *argv[])
+{
+    parsec_context_t *parsec;
+    parsec_forward_read_taskpool_t *tp;
+    parsec_matrix_block_cyclic_t dist;
+    parsec_arena_datatype_t adt;
+    parsec_datatype_t dt;
+    int32_t nb_err = 0;
+    int rank = 0, world = 1, nb_gpus = 0, rc;
+
+#if defined(PARSEC_HAVE_MPI)
+    {
+        int provided;
+        MPI_Init_thread(NULL, NULL, MPI_THREAD_SERIALIZED, &provided);
+        MPI_Comm_size(MPI_COMM_WORLD, &world);
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    }
+#endif
+
+    parsec = parsec_init(-1, &argc, &argv);
+    if( NULL == parsec ) {
+        exit(-1);
+    }
+
+    for( unsigned int i = 0; i < parsec_nb_devices; i++ ) {
+        parsec_device_module_t *dev = parsec_mca_device_get(i);
+        if( PARSEC_DEV_IS_GPU(dev->type) ) nb_gpus++;
+    }
+#if defined(PARSEC_HAVE_MPI)
+    MPI_Allreduce(MPI_IN_PLACE, &nb_gpus, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+#endif
+    if( 0 == nb_gpus ) {
+        if( 0 == rank ) {
+            fprintf(stderr, "Warning: test disabled because a rank has no GPU in this run\n");
+        }
+        parsec_fini(&parsec);
+#if defined(PARSEC_HAVE_MPI)
+        MPI_Finalize();
+#endif
+        /* Report a skip rather than a pass (see SKIP_RETURN_CODE in tests/CMakeLists.txt). */
+        return -PARSEC_ERR_DEVICE;
+    }
+
+    /* The collection only places the tasks: tile (r, k) is on rank r. */
+    parsec_matrix_block_cyclic_init(&dist, PARSEC_MATRIX_INTEGER, PARSEC_MATRIX_TILE,
+                                    rank,
+                                    1, 1,
+                                    world, NB_TILES,
+                                    0, 0,
+                                    world, NB_TILES,
+                                    world, 1,
+                                    1, 1,
+                                    0, 0);
+    dist.mat = parsec_data_allocate((size_t)dist.super.nb_local_tiles *
+                                    (size_t)dist.super.bsiz *
+                                    (size_t)parsec_datadist_getsizeoftype(dist.super.mtype));
+
+    parsec_translate_matrix_type(PARSEC_MATRIX_INTEGER, &dt);
+    PARSEC_OBJ_CONSTRUCT(&adt, parsec_arena_datatype_t);
+    parsec_matrix_adt_define_rect(&adt, dt, NB_ELEMS, 1, NB_ELEMS);
+#if defined(PARSEC_HAVE_MPI)
+    tile_bytes = (size_t)NB_ELEMS * sizeof(int);
+#endif
+
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+
+    tp = parsec_forward_read_new((parsec_tiled_matrix_t*)&dist, NB_TILES, NB_ELEMS, world, &nb_err);
+    assert(NULL != tp);
+    tp->arenas_datatypes[PARSEC_forward_read_DEFAULT_ADT_IDX] = adt;
+    PARSEC_OBJ_RETAIN(adt.arena);
+
+    rc = parsec_context_add_taskpool(parsec, (parsec_taskpool_t*)tp);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+    rc = parsec_context_wait(parsec);
+    parsec_taskpool_free(&tp->super);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+
+#if defined(PARSEC_HAVE_MPI)
+    if( world > 1 ) {
+        if( nb_device_buffers ) {
+            fprintf(stderr, "Rank %d: %d buffer(s) in accelerator memory handed to MPI with mpi_gpu_aware = %d\n",
+                    rank, nb_device_buffers, parsec_mpi_allow_gpu_memory_communications);
+            nb_err += nb_device_buffers;
+        }
+        if( 0 == nb_tile_sends ) {
+            /* This MPI is not intercepted the way it is called (static
+             * library, large-count variants...). The values are still checked. */
+            fprintf(stderr, "Warning: rank %d saw no tile sent through MPI_Isend, MPI_Send or MPI_Pack: "
+                    "where the engine sent from was not checked\n", rank);
+        }
+    }
+    MPI_Allreduce(MPI_IN_PLACE, &nb_err, 1, MPI_INT32_T, MPI_SUM, MPI_COMM_WORLD);
+#endif
+
+    parsec_data_free(dist.mat);
+    parsec_tiled_matrix_destroy((parsec_tiled_matrix_t*)&dist);
+    PARSEC_OBJ_RELEASE(adt.arena);
+    parsec_matrix_arena_datatype_destruct_free_type(&adt);
+
+    parsec_fini(&parsec);
+#if defined(PARSEC_HAVE_MPI)
+    MPI_Finalize();
+#endif
+
+    if( (0 == rank) && nb_err ) fprintf(stderr, "forward_read: %d error(s)\n", nb_err);
+    return (0 == nb_err) ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+%}
