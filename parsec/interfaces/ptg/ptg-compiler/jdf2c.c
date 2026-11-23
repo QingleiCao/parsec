@@ -6296,7 +6296,7 @@ jdf_generate_code_datatype_lookup(const jdf_t *jdf,
     string_arena_t *sa_cond       = string_arena_new(256);
     string_arena_t *sa_temp       = string_arena_new(256);
 
-    int last_datatype_idx, continue_dependencies, type, skip_condition, generate_exit_label = 0;
+    int last_datatype_idx, continue_dependencies, type, skip_condition;
     uint32_t current_mask = 0;
     expr_info_t info = EMPTY_EXPR_INFO;
 
@@ -6427,21 +6427,21 @@ jdf_generate_code_datatype_lookup(const jdf_t *jdf,
     }
 
     if( type == JDF_DEP_FLOW_IN ) {
-        if( 0 < strlen(string_arena_get_string(sa_coutput)) ) {
-            coutput("  if( (*flow_mask) & 0x80000000U ) { /* these are the input dependencies remote datatypes  */\n"
-                    "%s"
-                    "    goto no_mask_match;\n"
-                    "  }\n",
-                    string_arena_get_string(sa_coutput));
-            generate_exit_label = 1;
-        }
+        /* A query about an input carries the index of a flow, while the output
+         * section below matches masks of dependency indexes. Keep it out of
+         * that section even when the class has no data input: its control
+         * inputs are asked about too, and must match nothing. */
+        coutput("  if( (*flow_mask) & 0x80000000U ) { /* these are the input dependencies remote datatypes  */\n"
+                "%s"
+                "    goto no_mask_match;\n"
+                "  }\n",
+                string_arena_get_string(sa_coutput));
         type = JDF_DEP_FLOW_OUT;
         goto redo;  /* generate the code for the output dependencies */
     } else {
         coutput("\n  /* these are the output dependencies remote datatypes */\n%s", string_arena_get_string(sa_coutput));
     }
-    if( generate_exit_label )
-        coutput(" no_mask_match:\n");
+    coutput(" no_mask_match:\n");
 
     coutput("  data->data                             = NULL;\n"
             "  data->remote.src_datatype = data->remote.dst_datatype = PARSEC_DATATYPE_NULL;\n"
