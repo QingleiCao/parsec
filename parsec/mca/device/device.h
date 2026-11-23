@@ -240,7 +240,9 @@ int  parsec_device_data_copy_try_pin_reader(parsec_data_copy_t *copy);
  * Same, for a reader that wants the value rather than this particular copy of
  * it. A device only ever reclaims a copy that agrees with the host mirror, so
  * when the copy asked for cannot be read the mirror says the same thing and is
- * pinned instead.
+ * pinned instead. So is it when the copy asked for is in accelerator memory
+ * and the communication engine may not read accelerator memory
+ * (mpi_gpu_aware without 2).
  *
  * Returns the copy that was pinned, which the caller must read from and later
  * hand back to parsec_device_data_copy_unpin_reader(), or NULL if the value is
