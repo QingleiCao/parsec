@@ -1,0 +1,311 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+/*
+ * One task class whose two written flows go to different sets of ranks.
+ *
+ * PROD(p) runs on rank p. Its flow A goes to every other rank, and its flow B
+ * to every other rank but the one that follows p. A broadcast orders the ranks
+ * from its root, so with p in position 0, A goes to the positions 1 .. NP-1 and
+ * B to the positions 2 .. NP-1.
+ *
+ * A rank receives a single activation for PROD(p), from its parent in the
+ * tree of the first flow it consumes, and that parent can only hand over what
+ * it consumes itself. Here the rank in position 1 consumes A alone and the
+ * ranks behind it consume A and B:
+ *   - a chain makes position 1 the parent of position 2 (3 ranks and more);
+ *   - a binomial tree makes position 1 the parent of position 3 (4 ranks and
+ *     more);
+ *   - a star has the root serve every rank.
+ *
+ * SPLIT(p), run in place of PROD(p) with the option -t, is the same with a
+ * single written flow: it sends its flow C whole to the positions 1 .. NP-1,
+ * and the first half of it, through another remote type, to the positions
+ * 2 .. NP-1. The communication engine counts one output per type, so these are
+ * two outputs with two sets of ranks again.
+ *
+ * The -t flavor is meant for payloads sent by rendezvous
+ * (--mca runtime_comm_short_limit 0). When the two payloads of one flow come
+ * inside the activation message, the receiver hands the copy of the last one
+ * to all the consumers of the flow, under every topology: another problem than
+ * the one tested here.
+ *
+ * Every consumer checks the values it was given, and every rank checks that it
+ * ran all its consumers.
+ */
+
+#include "parsec/data_dist/matrix/two_dim_rectangle_cyclic.h"
+#include "parsec/sys/atomic.h"
+#include "tests/tests_runtime.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define NB 16  /* default number of integers in a tile */
+
+/* The value of the element e of the flow A (0), B (1) or C (2) written on rank p */
+#define VALUE(flow, p, e) (1000000 * ((p) + 1) + 4 * (e) + (flow))
+
+static int32_t nb_errors = 0;
+static int32_t nb_recv_a = 0;
+static int32_t nb_recv_b = 0;
+static int32_t nb_recv_full = 0;
+static int32_t nb_recv_half = 0;
+
+static void check_tile(const char *name, int p, int rank, const int *tile, int nb, int flow)
+{
+    for(int e = 0; e < nb; e++) {
+        int expected = VALUE(flow, p, e);
+        if( tile[e] != expected ) {
+            fprintf(stderr, "Rank %d: flow %s written on rank %d holds %d at index %d, expected %d\n",
+                    rank, name, p, tile[e], e, expected);
+            (void)parsec_atomic_fetch_inc_int32(&nb_errors);
+            return;
+        }
+    }
+}
+%}
+
+descA      [type = "parsec_matrix_block_cyclic_t*"]
+descB      [type = "parsec_matrix_block_cyclic_t*" aligned = descA]
+descC      [type = "parsec_matrix_block_cyclic_t*" aligned = descA]
+NP         [type = int]
+NPROD      [type = int]  /* the number of PROD tasks: NP, or 0 with -t */
+NSPLIT     [type = int]  /* the number of SPLIT tasks: NP with -t, or 0 */
+NH         [type = int]  /* the number of integers of the type HALF */
+
+PROD(p)
+
+  p = 0 .. NPROD-1
+
+: descA(p, 0)
+
+RW A <- descA(p, 0)
+     -> A RECV_A(p, 1 .. NP-1)
+RW B <- descB(p, 0)
+     -> B RECV_B(p, 2 .. NP-1)
+
+BODY
+    for(int e = 0; e < descA->super.mb; e++) {
+        ((int*)A)[e] = VALUE(0, p, e);
+        ((int*)B)[e] = VALUE(1, p, e);
+    }
+END
+
+RECV_A(p, d)
+
+  p = 0 .. NPROD-1
+  d = 1 .. NP-1
+  r = (p + d) % NP
+
+: descA(r, 0)
+
+READ A <- A PROD(p)
+
+BODY
+    check_tile("A", p, r, (int*)A, descA->super.mb, 0);
+    (void)parsec_atomic_fetch_inc_int32(&nb_recv_a);
+END
+
+RECV_B(p, d)
+
+  p = 0 .. NPROD-1
+  d = 2 .. NP-1
+  r = (p + d) % NP
+
+: descA(r, 0)
+
+READ B <- B PROD(p)
+
+BODY
+    check_tile("B", p, r, (int*)B, descA->super.mb, 1);
+    (void)parsec_atomic_fetch_inc_int32(&nb_recv_b);
+END
+
+SPLIT(p)
+
+  p = 0 .. NSPLIT-1
+
+: descA(p, 0)
+
+RW C <- descC(p, 0)
+     -> C RECV_FULL(p, 1 .. NP-1)
+     -> C RECV_HALF(p, 2 .. NP-1)      [type_remote = HALF]
+
+BODY
+    for(int e = 0; e < descA->super.mb; e++) {
+        ((int*)C)[e] = VALUE(2, p, e);
+    }
+END
+
+RECV_FULL(p, d)
+
+  p = 0 .. NSPLIT-1
+  d = 1 .. NP-1
+  r = (p + d) % NP
+
+: descA(r, 0)
+
+READ C <- C SPLIT(p)
+
+BODY
+    check_tile("C", p, r, (int*)C, descA->super.mb, 2);
+    (void)parsec_atomic_fetch_inc_int32(&nb_recv_full);
+END
+
+RECV_HALF(p, d)
+
+  p = 0 .. NSPLIT-1
+  d = 2 .. NP-1
+  r = (p + d) % NP
+
+: descA(r, 0)
+
+READ C <- C SPLIT(p)                   [type_remote = HALF]
+
+BODY
+    check_tile("C (first half)", p, r, (int*)C, NH, 2);
+    (void)parsec_atomic_fetch_inc_int32(&nb_recv_half);
+END
+
+extern "C" %{
+
+/* One tile of nb integers per rank: tile (p, 0) lives on rank p */
+static void tiles_init(parsec_matrix_block_cyclic_t *desc, const char *name,
+                       int rank, int size, int nb)
+{
+    parsec_matrix_block_cyclic_init( desc, PARSEC_MATRIX_INTEGER, PARSEC_MATRIX_TILE,
+                                     rank,
+                                     nb, 1, nb * size, 1,
+                                     0, 0, nb * size, 1,
+                                     size, 1, 1, 1, 0, 0);
+    desc->mat = parsec_data_allocate( (size_t)desc->super.nb_local_tiles *
+                                      (size_t)desc->super.bsiz *
+                                      (size_t)parsec_datadist_getsizeoftype(PARSEC_MATRIX_INTEGER) );
+    parsec_data_collection_set_key((parsec_data_collection_t*)desc, name);
+    (void)name;  /* the key is only kept by a build with profiling */
+}
+
+static void tiles_fini(parsec_matrix_block_cyclic_t *desc)
+{
+    parsec_data_free(desc->mat);
+    parsec_tiled_matrix_destroy((parsec_tiled_matrix_t*)desc);
+}
+
+int main(int argc, char *argv[])
+{
+    parsec_multiflow_bcast_taskpool_t *tp;
+    parsec_matrix_block_cyclic_t descA, descB, descC;
+    parsec_arena_datatype_t *adt = PARSEC_OBJ_NEW(parsec_arena_datatype_t);
+    parsec_arena_datatype_t *adt_half = PARSEC_OBJ_NEW(parsec_arena_datatype_t);
+    parsec_datatype_t otype;
+    parsec_context_t *parsec;
+    int rank = 0, size = 1, cores = -1, nb = NB, nh, types = 0, rc, i;
+    int expected_all, expected_but_one;
+
+    int pargc = 0; char **pargv = NULL;
+    for( i = 1; i < argc; i++ ) {
+        if( 0 == strncmp(argv[i], "--", 3) ) {
+            pargc = argc - i;
+            pargv = argv + i;
+            break;
+        }
+        if( 0 == strncmp(argv[i], "-c=", 3) ) {
+            cores = strtol(argv[i]+3, NULL, 10);
+            continue;
+        }
+        if( 0 == strncmp(argv[i], "-n=", 3) ) {
+            nb = strtol(argv[i]+3, NULL, 10);
+            if( nb <= 0 ) nb = NB;
+            continue;
+        }
+        if( 0 == strncmp(argv[i], "-t", 3) ) {
+            types = 1;
+            continue;
+        }
+        if( 0 == strncmp(argv[i], "-h", 2) ) {
+            printf("-c=<nb> the number of cores per rank\n"
+                   "-n=<nb> the number of integers in a tile (default %d)\n"
+                   "-t      one flow sent under two remote types, instead of two flows\n", NB);
+            exit(0);
+        }
+    }
+    rc = parsec_tests_context_init(cores, PARSEC_TEST_THREAD_SERIALIZED,
+                                   &pargc, &pargv,
+                                   &parsec, &rank, &size);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_init");
+
+    /* descA(p, 0) feeds the flow A of PROD(p), descB(p, 0) its flow B, and
+     * descC(p, 0) the flow C of SPLIT(p) */
+    tiles_init(&descA, "descA", rank, size, nb);
+    tiles_init(&descB, "descB", rank, size, nb);
+    tiles_init(&descC, "descC", rank, size, nb);
+    parsec_translate_matrix_type(PARSEC_MATRIX_INTEGER, &otype);
+    parsec_matrix_adt_define_rect(adt, otype,
+                                  descA.super.mb, descA.super.nb, descA.super.mb);
+    /* HALF: the first half of a tile */
+    nh = (nb + 1) / 2;
+    parsec_matrix_adt_define_rect(adt_half, otype, nh, 1, nh);
+
+    tp = parsec_multiflow_bcast_new( &descA, &descB, &descC, size,
+                                     types ? 0 : size, types ? size : 0, nh );
+    assert( NULL != tp );
+    tp->arenas_datatypes[PARSEC_multiflow_bcast_DEFAULT_ADT_IDX] = *adt;
+    tp->arenas_datatypes[PARSEC_multiflow_bcast_HALF_ADT_IDX] = *adt_half;
+
+    rc = parsec_context_add_taskpool( parsec, (parsec_taskpool_t*)tp );
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+
+    rc = parsec_context_wait(parsec);
+    parsec_taskpool_free(&tp->super);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+
+    /* Every other rank sends its A (its whole C with -t) here, and all of them
+     * but the previous rank send their B (the first half of their C). */
+    expected_all = size - 1;
+    expected_but_one = (size > 2) ? size - 2 : 0;
+    if( types ) {
+        if( nb_recv_full != expected_all || nb_recv_half != expected_but_one || nb_recv_a || nb_recv_b ) {
+            fprintf(stderr, "Rank %d: ran %d RECV_FULL (expected %d) and %d RECV_HALF (expected %d)\n",
+                    rank, nb_recv_full, expected_all, nb_recv_half, expected_but_one);
+            nb_errors++;
+        }
+    } else {
+        if( nb_recv_a != expected_all || nb_recv_b != expected_but_one || nb_recv_full || nb_recv_half ) {
+            fprintf(stderr, "Rank %d: ran %d RECV_A (expected %d) and %d RECV_B (expected %d)\n",
+                    rank, nb_recv_a, expected_all, nb_recv_b, expected_but_one);
+            nb_errors++;
+        }
+    }
+    if( 0 == nb_errors ) {
+        if( types )
+            printf("Rank %d/%d: %d flows C and %d first halves of C received and checked\n",
+                   rank, size, nb_recv_full, nb_recv_half);
+        else
+            printf("Rank %d/%d: %d flows A and %d flows B received and checked\n",
+                   rank, size, nb_recv_a, nb_recv_b);
+    }
+    rc = (0 == nb_errors) ? 0 : 1;
+
+    parsec_matrix_adt_free( &adt );
+    parsec_matrix_adt_free( &adt_half );
+    tiles_fini(&descA);
+    tiles_fini(&descB);
+    tiles_fini(&descC);
+
+    {
+        int frc = parsec_tests_context_fini(&parsec);
+        PARSEC_CHECK_ERROR(frc, "parsec_tests_context_fini");
+    }
+
+    return rc;
+}
+
+%}
