@@ -2343,7 +2343,7 @@ static void jdf_generate_ctl_gather_compute(const jdf_t *jdf, const jdf_function
     const jdf_expr_t *le;
     const jdf_function_entry_t *targetf;
     const jdf_param_list_t *pl;
-    int nbopen, depdone;
+    int nbopen;
     assignment_info_t ai;
     jdf_expr_t *ld, *local_defs;
 
@@ -2382,28 +2382,14 @@ static void jdf_generate_ctl_gather_compute(const jdf_t *jdf, const jdf_function
              UTIL_DUMP_LIST_FIELD(sa2, of->locals, next, name, dump_string, NULL,
                                   "  ", "(void)", "; ", ";"));
 
-    if( NULL != dep->local_defs ) {
-        local_defs = dep->local_defs;
-        depdone = 0;
-    } else {
-        local_defs = call->local_defs;
-        depdone = 1;
-    }
+    /* The local definitions of the call are stacked on those of the dependency.
+     * Nobody sets the ones of the dependency before this function is called:
+     * iterate over all of them, the outermost first. */
+    local_defs = (NULL != call->local_defs) ? call->local_defs : dep->local_defs;
     nbopen=0;
     for(ld = jdf_expr_lv_first(local_defs); ld != NULL; ld = jdf_expr_lv_next(local_defs, ld)) {
         assert(ld->alias != NULL);
         assert(-1 != ld->ldef_index);
-        if( !depdone ) {
-            if( ld == call->local_defs ) {
-                depdone=1;
-            } else {
-                coutput("%s  int %s = "JDF2C_NAMESPACE"_tmp_locals.ldef[%d].value;\n"
-                        "%s  (void)%s;\n",
-                        indent(nbopen), ld->alias, ld->ldef_index,
-                        indent(nbopen), ld->alias);
-                continue;
-            }
-        }
         if( ld->op == JDF_RANGE ) {
             coutput("%s  {\n"
                     "%s    int %s;\n"

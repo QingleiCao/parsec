@@ -3,6 +3,10 @@
 # Copyright (c) 2026      NVIDIA Corporation.  All rights reserved.
 #
 
+parsec_addtest_executable(C ctl_gather_ranges)
+target_link_libraries(ctl_gather_ranges PRIVATE tests_runtime_common)
+target_ptg_sources(ctl_gather_ranges PRIVATE "ctl_gather_ranges.jdf")
+
 parsec_addtest_executable(C write_check SOURCES vector.c)
 target_link_libraries(write_check PRIVATE tests_runtime_common)
 target_ptg_sources(write_check PRIVATE "write_check.jdf")
