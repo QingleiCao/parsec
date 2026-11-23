@@ -1549,8 +1549,10 @@ parsec_check_IN_dependencies_with_counter( const parsec_taskpool_t *tp,
                             }
                         }
                     } else {
-                        /* Complicated case: fall back to iterate_predecessors with a counter */
-                        task->task_class->iterate_predecessors(NULL, task, 1 << flow->flow_index,  count_deps_fct, &active);
+                        /* Complicated case: fall back to iterate_predecessors with a counter.
+                         * The iterator selects the input dependencies by their index: count
+                         * the predecessors of this one only, the others are counted in turn. */
+                        task->task_class->iterate_predecessors(NULL, task, 1U << dep->dep_index, count_deps_fct, &active);
                     }
                 } else {
                     if( NULL == dep->ctl_gather_nb)

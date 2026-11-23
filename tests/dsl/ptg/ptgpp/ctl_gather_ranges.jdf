@@ -13,22 +13,31 @@ extern "C" %{
 
 /**
  * A task can wait for the controls of a set of tasks written as a named range
- * at the dependency, "CTL X <- [ k = 0 .. N-1 ] 1 ? X T(k)". When the first
- * control arrives the runtime counts how many the task waits for
- * (parsec_check_IN_dependencies_with_counter). A guard that is an integer
- * constant is the same for every k: the count comes from a function generated
- * for the dependency (ctl_gather_nb), which used to read k instead of
- * iterating over the range, and counted one control per dependency. The task
- * started before the tasks it waits for were done, and again each time the
- * count was reached.
+ * at the dependency, "CTL X <- [ k = 0 .. N-1 ] guard ? X T(k)". When the
+ * first control arrives the runtime counts how many the task waits for
+ * (parsec_check_IN_dependencies_with_counter), in one of two ways:
+ *  - A guard that is an integer constant is the same for every k. The count
+ *    comes from a function generated for the dependency (ctl_gather_nb), which
+ *    used to read k instead of iterating over the range: one control per
+ *    dependency.
+ *  - Any other guard (a variable, an operator, inline code) is evaluated for
+ *    each k. The runtime counts with the function that iterates over the
+ *    predecessors of the task, which selects the input dependencies by their
+ *    index. The runtime used to pass the index of the flow: with the flow at
+ *    index 0, each such dependency counted the tasks of the first one.
+ * A task with a count that is too small starts before the tasks it waits for
+ * are done, and again each time the count is reached. With a count that is
+ * too large it never starts, and the test does not end.
  *
  * LOW(0 .. NL-1) and HIGH(0 .. NH-1) are two sets of tasks of different sizes,
- * spread over the processes. WAIT_CST(0) waits for both, with constant guards.
- * It must run once, after the tasks it waits for.
+ * spread over the processes. Three tasks wait for them, each on another
+ * process when there are enough: WAIT_CST(0) with constant guards, WAIT_IDX(0)
+ * with guards that select every other task of each set, and WAIT_MIX(0) with
+ * one guard of each kind. Each must run once, after the tasks it waits for.
  */
 
-enum { W_CST = 0, W_NB };
-static const char *wait_name[W_NB] = { "WAIT_CST" };
+enum { W_CST = 0, W_IDX, W_MIX, W_NB };
+static const char *wait_name[W_NB] = { "WAIT_CST", "WAIT_IDX", "WAIT_MIX" };
 
 static int32_t *ran_low, *ran_high;  /* How many times LOW(k) and HIGH(j) ran in this process */
 static int32_t  ran_wait[W_NB];      /* How many times each waiting task ran in this process */
@@ -60,6 +69,8 @@ LOW(k)
 : descA(k, 0)
 
   CTL X -> X WAIT_CST(0)
+        -> ((k % 2) == 0) ? X WAIT_IDX(0)
+        -> X WAIT_MIX(0)
 
 BODY
   usleep(1000);  /* Leave a task that starts too early the time to do so */
@@ -71,6 +82,8 @@ HIGH(j)
 : descA(j, 0)
 
   CTL X -> X WAIT_CST(0)
+        -> ((j % 2) == 1) ? X WAIT_IDX(0)
+        -> ((j % 2) == 1) ? X WAIT_MIX(0)
 
 BODY
   usleep(1000);
@@ -90,6 +103,32 @@ BODY
   (void)parsec_atomic_fetch_inc_int32(&ran_wait[W_CST]);
 END
 
+WAIT_IDX(w)
+  w = 0 .. 0
+: descA(1, 0)
+
+  CTL X <- [ k = 0 .. NL-1 ] (k % 2) == 0 ? X LOW(k)
+        <- [ j = 0 .. NH-1 ] (j % 2) == 1 ? X HIGH(j)
+
+BODY
+  waited_for(W_IDX, "LOW",  ran_low,  0, NL, 2, &descA->super.super);
+  waited_for(W_IDX, "HIGH", ran_high, 1, NH, 2, &descA->super.super);
+  (void)parsec_atomic_fetch_inc_int32(&ran_wait[W_IDX]);
+END
+
+WAIT_MIX(w)
+  w = 0 .. 0
+: descA(2, 0)
+
+  CTL X <- [ k = 0 .. NL-1 ] 1 ? X LOW(k)
+        <- [ j = 0 .. NH-1 ] (j % 2) == 1 ? X HIGH(j)
+
+BODY
+  waited_for(W_MIX, "LOW",  ran_low,  0, NL, 1, &descA->super.super);
+  waited_for(W_MIX, "HIGH", ran_high, 1, NH, 2, &descA->super.super);
+  (void)parsec_atomic_fetch_inc_int32(&ran_wait[W_MIX]);
+END
+
 extern "C" %{
 
 #define LOW_PER_PROCESS 8
@@ -107,7 +146,9 @@ int main(int argc, char *argv[])
     PARSEC_CHECK_ERROR(rc, "parsec_tests_context_init");
 
     /* Tile (i, 0), LOW(i) and HIGH(i) live on process i modulo the number of
-     * processes: both sets reach every process. */
+     * processes: both sets reach every process. The second set is the larger,
+     * so that both wrong counts are too small: the test fails instead of
+     * hanging. */
     NL = LOW_PER_PROCESS * world;
     NH = 3 * NL;
     parsec_matrix_block_cyclic_init(&descA, PARSEC_MATRIX_INTEGER, PARSEC_MATRIX_TILE,
