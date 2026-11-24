@@ -1104,11 +1104,11 @@ All systems share the same QAOA kernels (`qaoa_core`), the same backend objects 
 |---|---|
 | **A**, sequential hybrid | The reference of section 3.7 with blocking calls: submit one job, wait, continue, in the order (round, colour, block, step, evaluation). One process. |
 | **B**, MPI + QPU | Blocks on rank `b mod P`; rank 0 owns the backend. Each rank drives its blocks of the current colour as independent state machines with nonblocking requests to rank 0, both evaluations of a step in flight together. Rank 0 submits under the same capacity limit, with a helper thread waiting on the backend. Ranks exchange boundary values at the end of each colour. This is the bulk-synchronous structure of a multicolour Gauss-Seidel code, and what I would expect a competent MPI programmer to write first. |
-| **C-sync**, control | The PaRSEC application with a control dependency that joins each colour before the next starts (control gathers exist in PTG: `tests/dsl/ptg/controlgather/`). Same schedule as B, on the runtime. |
+| **C-sync**, control | The PaRSEC application with a control dependency that joins each colour before the next starts (control gathers exist in PTG: `tests/dsl/ptg/controlgather/`). Same schedule as B, on the runtime. (As built in M8, a binary tree of `JOIN` tasks per colour: a control gather over a named range counts its inputs wrongly on this base; section 9.7.) |
 | **C**, PaRSEC, basic QPU support | The task graph of section 3.6, `max_batch = 1`. |
 | **D**, PaRSEC with coalescing | The same binary with `max_batch > 1`. |
 | **C-block**, experiment E2 only | The quantum call made synchronously inside a CPU task body, holding a worker. The integration that property 1 rules out. |
-| **B-async**, if time allows | Event-driven MPI in which a block starts when its neighbours' updates arrive: the dataflow schedule written by hand. Expected to match C. Its size in lines is reported next to B's and the JDF's. |
+| **B-async**, if time allows | Event-driven MPI in which a block starts when its neighbours' updates arrive: the dataflow schedule written by hand. Expected to match C. Its size in lines is reported next to B's and the JDF's. (Not built in M8; section 9.7.) |
 
 C-sync is what keeps the comparison fair. C-sync against B measures the runtime's overhead on equal schedules. C against C-sync measures the dataflow alone. Without it, a gain of C over B would mix the two.
 
@@ -1153,6 +1153,8 @@ Mock backend throughout, except E7. "Regime" refers to section 3.4 and section 6
 
 Each mock configuration is run at least five times with different latency seeds and the same algorithm seed, and reported as a median with its range. Next to each measured curve the plots show the model's prediction for the same latency samples, drawn differently and labelled as a model.
 
+(As run in M8, section 9.7: the full grids at mean job times of 20 ms (E3) and 10 ms (E5), with the ratios checked at 0.1 s and 1 s; blocks of 8 vertices in E3 and of 12 in E6; E6 on one node; three seeds where the job times do not vary or there is one place. On the grid and the ring the gain of E3 is largest at one place per block of a colour, not at twice that.)
+
 Machines: methane for single-node runs (36 cores, ranks bound to disjoint cores); leconte for the CUDA coexistence test, one rank per GPU; a multi-node run for the MPI-time measurement of E6 if nodes are available.
 
 ## 6.5 Hardware run (E7)
@@ -1190,7 +1192,7 @@ What it is not for: comparing A, B, C and D on hardware. Four runs would use the
 - One QPU. Nothing here supports claims about several.
 - Blocks of at most about 20 qubits on the mock. Larger blocks change the classical side (section 3.4) and are not evaluated.
 - The model of section 6.1 ignores classical time and runtime overhead. If measurements depart from it, the departure is itself a result to explain.
-- The mock computes its answers on the machine under test: 7 to 12 ms per job at 16 qubits (section 9.2). A job whose sampling outlasts its modelled time ends late, and the latency measured is then not the one modelled. The mock counts such jobs; a run is reported only when the count is zero, with as many helper threads as slots and cores for them that the workers do not use.
+- The mock computes its answers on the machine under test: 7 to 12 ms per job at 16 qubits (section 9.2). A job whose sampling outlasts its modelled time ends late, and the latency measured is then not the one modelled. The mock counts such jobs; a run is reported only when the count is zero, with as many helper threads as slots and cores for them that the workers do not use. (In M8 the helper threads shared the cores of rank 0, and the 11 runs of E3 that had a late job were run once more; section 9.7.)
 
 ---
 
@@ -1559,7 +1561,7 @@ What it means:
 The system compiler has no sanitizer runtimes, and PaRSEC's configure then drops the sanitizer flags with only a warning: my first sanitizer runs were on uninstrumented binaries and showed nothing. The runs below use the Spack GCC 12.4, without MPI.
 
 - **Thread sanitizer.** The runtime is not clean under it: 103 reports for the existing `dsl/ptg/ptgpp/write_check`, 50 for `profiling/async`. QPU runs add reports of the same two kinds with the progress thread on one side: its push into the scheduler's buffer against a worker's pop (`hbbuffer.c:63` against `:243`), and its write of `task->status` against a later reuse of the task's memory (`parsec.c:1820`). No report is between two accesses of the QPU layer's own state, after one fix: the counters were reset by plain writes while a test read them.
-- **Address sanitizer.** No memory error in 15,000 quantum tasks, 300 taskpools created and freed one after the other, 100 service restarts, or 400 DTD chains. The leak checker reports one site, 72 bytes per copy of a write-only PTG flow (`arena.c:382`, `arena.c:283`, `data.c:163`); the existing `write_check` reports the same site, and no leak stack has a QPU frame.
+- **Address sanitizer.** No memory error in 15,000 quantum tasks, 300 taskpools created and freed one after the other, 100 service restarts, or 400 DTD chains. The leak checker reports one site, 72 bytes per copy of a write-only PTG flow (80 with the QPU device on: the record has a pointer per device; section 9.7) (`arena.c:382`, `arena.c:283`, `data.c:163`); the existing `write_check` reports the same site, and no leak stack has a QPU frame.
 
 ### Things found in the runtime, none of them caused by this work
 
@@ -2253,7 +2255,7 @@ One deliberate bug at a time in a private copy of the sources, rebuilt, and the 
 The no-MPI builds of section 9.1, seven runs of the application under each: the default run, the two failure modes, one slot, sixteen slots with skipping, jobs that take no time, one worker.
 
 - **Thread sanitizer.** 4,452 reports, none between two accesses of the QPU layer or of the application's own state; six have a frame of the QPU layer on one side and are of the two kinds of section 9.1 (five are the progress thread's write of `task->status` against a later reuse of the task's memory, one is its push into a scheduler queue against a worker's pop).
-- **Address sanitizer.** No memory error. Every leak record (151) is the one of section 9.1, 72 bytes for each copy of a flow that a PTG task only writes (`arena.c:283`); the application has many such flows, so it shows more often. For the controlled instance of section 3.4 that is about a quarter of a megabyte per run.
+- **Address sanitizer.** No memory error. Every leak record (151) is the one of section 9.1, 72 bytes for each copy of a flow that a PTG task only writes (`arena.c:283`; 80 with the QPU device on, section 9.7); the application has many such flows, so it shows more often. For the controlled instance of section 3.4 that is about a quarter of a megabyte per run.
 
 ### What an independent review found
 
@@ -2296,7 +2298,7 @@ None is caused by this work. The first one changes what a PTG application may do
 ### For later milestones
 
 - **M7.** The device's pending heap orders by task priority, and no task of the application has one. Coalescing will meet jobs of different blocks whose circuits differ in size; the result arena is sized for the largest block.
-- **M8, baselines.** C-sync is this graph with a body for `QEXEC` that blocks its worker; the body is one more incarnation, or one more line of `qaoa.jdf`. Baseline B needs the same keys.
+- **M8, baselines.** C-sync is this graph with a body for `QEXEC` that blocks its worker; the body is one more incarnation, or one more line of `qaoa.jdf`. Baseline B needs the same keys. (A body that blocks its worker is C-block of section 6.2, not C-sync; M8 built C-sync as section 6.2 describes it, with a barrier between colours, and C-block in the benchmark of E2; section 9.7.)
 - **M8, measurements.** The driver prints the time from `parsec_context_add_taskpool` to the end of `parsec_context_wait` per run; the comparison with the reference is outside it and can be turned off (`-c 0`). The reference runs on every rank when it is on, which a large run should avoid.
 - **M8, memory.** The 72 bytes that every copy of a written flow leaks add up over a long run.
 - **A second application** written as a PTG has to respect the first two rows of the table above.
@@ -2451,7 +2453,7 @@ Two bugs of a first list taught something. One changed nothing that can be obser
 The no-MPI builds of section 9.1, 29 runs under each: the application with tasks that share jobs (four settings), the runtime test in 17 of its modes, the mock's unit test, and the seven runs of M6.
 
 - **Thread sanitizer.** 10,356 reports. None is between two accesses of the QPU layer or of the tests' own state. 24 have a frame of the QPU layer on one side and are of the two kinds of section 9.1 (13 are the progress thread's push into a scheduler queue against a worker's pop, 11 its write of `task->status` against a later reuse of the task's memory). One is new and belongs to the test that stops the service under a running taskpool: the stopping thread frees the backend that the workers read when they submitted, and nothing but time orders the two. That is the application error the test stages; with a taskpool that is waited for, no thread submits while the service stops. A first version of the test held its own lock while it asked the mock for its counters, which the sanitizer reported as a possible lock inversion; it no longer does.
-- **Address sanitizer.** No memory error in 29 runs, the two that stop the service with work left included. Every leak record (311) is the one of section 9.1, 72 bytes for each copy of a flow that a PTG task only writes.
+- **Address sanitizer.** No memory error in 29 runs, the two that stop the service with work left included. Every leak record (311) is the one of section 9.1, 72 bytes for each copy of a flow that a PTG task only writes (80 with the QPU device on, section 9.7).
 
 ### What an independent review found
 
@@ -2496,3 +2498,261 @@ None is caused by this work. The first two are defects; the last two are how thi
 - **M8, failures.** With faults drawn per circuit a job of n circuits fails more often than a job of one: 39% of the jobs of 16 at 3% per circuit, each followed by 16 jobs of one. The limit and the retry rule interact; an experiment with faults should say so.
 - **M4.** A provider's job of several circuits has to end well for all or for none, with a result per circuit in the order given, and all circuits of a job ask for the same number of shots: that is the contract the service relies on.
 - **A real device.** Sharing changes how many jobs a task takes when jobs fail, so a run on hardware is reproducible in its counts only as far as the simulator is.
+
+## 9.7 M8: baselines, experiments and documentation (2026-11-24)
+
+M1 to M7 were committed on 2026-11-24, before M8 began, in five commits by area on `qinglei/hybrid_HPC_QC` (`9d108b816` the device type and three runtime fixes, `e1accb548` the component, `f55aa7fea` its tests, `38b433993` the application, `8cb244735` this document); each of the first three builds and passes its own suite from scratch (167, 167 and 252 tests). The commits are by area and not by milestone: the same files changed in several milestones. M8 was committed after its experiments, in five commits on top of those: `f0d3a53ae` the seed of the mock's times, `58d5fde3a` the benchmark, `e77de8362` the application, `82a5183f2` the README, and the commit that adds this section. The code of the first three is the code the experiments ran, file for file (checked against the record of the last run, `exp_qpu/provenance/methane-8cb244735-299dd9d803ed/`).
+
+### What exists now
+
+| File | Content |
+|---|---|
+| `tests/apps/qaoa/qaoa_mpi.c` | Baseline B: the algorithm as a hand-written MPI program on the same kernels and the same mock |
+| `tests/apps/qaoa/qaoa.jdf` | C-sync (`-y`): a tree of `JOIN` tasks per colour, a barrier between colours; a log of the timestamps of every job and update |
+| `tests/apps/qaoa/testing_qaoa.c` | `-y`, `-L` (the log), `-M` (a line for scripts); the clock starts after a barrier, and the time is the slowest rank's |
+| `tests/apps/qaoa/qaoa_graph.c` | Block graphs shaped as a ring, a square grid, all pairs, or random pairs (`-g grid:16:10:4:2`) |
+| `tests/apps/qaoa/qaoa_reference.c` | `-G` (the block graph, for the model), `-D` (the seed of the mock's times), a line for scripts |
+| `tests/runtime/qpu/qpu_bench.jdf` | E1 and E2: chains of classical work and quantum jobs, with the QPU body (C), an empty CPU body, a CPU body that holds its worker (C-block), or without the runtime (A) |
+| `parsec/mca/device/qpu/` | `device_qpu_mock_delay_seed`: the mock's times drawn from a seed of their own; `parsec_qpu_mock_time()` |
+| `tools/qpu/README.md` | How to build, write a quantum task, the parameters, the application, the benchmarks |
+| Tests | 22 new: B on 1, 2 and 4 ranks, with spare ranks, on a random block graph, one job at a time; C-sync on 1, 3 and 4 ranks, with failures, with spare ranks, on a complete block graph; the shapes; the benchmark in six settings; the instances pinned by digest |
+
+The experiment harness is outside version control, in `exp_qpu/` of this working tree: the model (`model.py`), the runner (`runner.py`, one CSV row per run, the whole output of each run kept, a provenance record per code version), one script per experiment, `analyze.py` for tables and plots, `retry_late.py` to run again once each run that had a late job, and `host_load.sh` for the load of a shared machine. The scripts and logs of the checks under Verification, Does a test notice and Sanitizers are in `exp_qpu/checks/` (`histamine2/`, `leconte/`, `serotonin/`).
+
+### The systems as built
+
+| System | What it is |
+|---|---|
+| A | `qaoa_reference -b`: one job at a time through the mock, in the order (round, colour, block, step, evaluation) |
+| B | `qaoa_mpi`: blocks on rank b mod P, rank 0 owns the mock and runs a helper thread that keeps at most `max_outstanding` jobs there, first come first served, with the submission interval; colour by colour, both evaluations of a step in flight; `MPI_Iallgatherv` of the states at the end of each colour. Its ranks wait in `MPI_Waitany`, which spins |
+| C-sync | `testing_qaoa -y`: the task graph with a barrier between colours, a binary tree of `JOIN` tasks per colour |
+| C | `testing_qaoa` |
+| D | `testing_qaoa` with `device_qpu_max_batch` above 1 |
+| C-block (E2) | `qpu_bench` with `-b`: the CPU body of the quantum task sleeps for the time of the job, then samples |
+
+All of them run the kernels of `qaoa_core.c` in the reference's order per block and name every job by its key, so all of them end in the reference's final states byte for byte, which every run of every experiment checked.
+
+### How the experiments were run
+
+| | E1, E2 | E3 (and E4 from its logs) | E5 | E6 |
+|---|---|---|---|---|
+| Machine | serotonin: AMD Ryzen 9 7950X, 16 cores, one socket, an exclusive Slurm allocation | methane: Intel Xeon Gold 6140, cores 0 to 17 (first socket) | methane, cores 18 to 35 | methane, cores 18 to 35 |
+| Processes | one, 1 to 14 workers (E1), 8 workers (E2) | 4 ranks of 4 cores (A: one process) | 4 ranks of 4 cores | 1 to 8 ranks of 2 cores |
+| Job times | none (E1); 5 ms (E2) | lognormal, mean 20 ms, coefficient of variation 0, 0.5, 1, 2; checks at 0.1 s and 1 s | 10 ms for a job of one circuit; check at 0.1 s | 0.2 s |
+| Instance | `qpu_bench` chains | 16 blocks of 8 vertices: grid, ring, random, complete; T 8, R 4 (1024 jobs) | 16 blocks of 10, grid | rings of 4 to 64 blocks of 12; T 8, R 2 |
+| Runs per setting | 12 (E1), 3 (E2), in rotating order | 5 seeds of the job times (3 at CV 0 and at one place) | 3 (constant times), 5 (with a queue delay) | 3 |
+
+The build is Release (`-O3 -DNDEBUG`, gcc 11.5, Open MPI 5.0.5, hwloc 2.11.1) of `8cb244735` with the M8 changes before they were committed (their code is that of `e77de8362`). Methane is a login node. E5 and then E6 ran on its second socket from 17:12 to 18:05 UTC, and E3 on its first from 17:59 to 20:56 (and its 11 runs again until 20:59). Methane is shared with the CI runner of another project, which takes cores without warning: `exp_qpu/host_load.sh` logged the load and every process of another user above a tenth of a core every 5 minutes from 18:01 (`exp_qpu/host_load.log`). Such processes were seen between 18:41 and 19:01 (up to 18 cores, at 18:56), 20:06 and 20:21, and 20:26 and 20:51 (under 2 cores), after E5 and E6 had ended. The 364 E3 runs that overlap those windows do not differ from the others: a run's time over the model, divided by the median of the same over its setting, is 0.992 to 1.006 inside the windows and 0.995 to 1.005 outside (5th to 95th percentile), so they are kept. Each run is one process tree in a session of its own, killed with it on a time-out, and writes one CSV row next to its whole output; every row names a provenance record (`exp_qpu/provenance/<id>/`) with the commit, the uncommitted changes, the digests of the programs and of the harness, the configure options and the machine. A run is done again whenever any of those changed.
+
+What every run reports and checks:
+
+- **Time**: from a barrier after setup to the end of the wait, the slowest rank's. **Processor time**: user and system time of all ranks (`getrusage`), the mock's threads included, since the mock runs in rank 0.
+- **Correctness**: every run of A, B, C-sync, C and D compares its final states with the sequential reference byte for byte, and C-sync counts its `JOIN` tasks. A run that fails a check does not count.
+- **Late jobs**: the mock counts the jobs whose sampling outlasted their drawn time; a run with any does not count (section 6.7).
+- **Seeds**: the algorithm's seed is 1 everywhere; the job times come from `device_qpu_mock_delay_seed`, and the answers do not depend on it, so every run of every system computes the same states.
+
+The model (`exp_qpu/model.py`) draws every job time as the mock does, bit for bit (the same mixing function and the same Box-Muller step), so a prediction drawn next to a measurement is for the same job times. It has no classical time and no runtime overhead, as in section 6.1.
+
+### Results
+
+Tables are in `exp_qpu/tables/`, plots in `exp_qpu/plots/`, both made by `analyze.py` from the CSV files and logs alone.
+
+**E1: what a quantum task costs** (240 runs, all passed). `qpu_bench` with jobs of no time, the QPU body (C) against the same chains with an empty CPU body; the difference is what the QPU path adds: the hand-off to the progress thread, the mock's submission and end, and the completion back to the scheduler.
+
+| Workers | 1 | 2 | 4 | 8 | 14 |
+|---|---|---|---|---|---|
+| One chain of 2000 links: added latency per quantum task, us | 65.2 | 62.4 | 50.9 | 40.8 | 36.9 |
+| 64 chains of 200 links: added time per quantum task, us | 7.6 | 8.9 | 7.1 | 6.5 | 5.6 |
+
+The hypothesis holds by three orders of magnitude: a quantum task costs tens of microseconds of latency and a few of throughput, and holds no worker. Why the latency of one chain falls as workers are added was not measured; the likely cause is that with more workers one of them is awake when a job ends, so it is the latency of waking a thread and not work.
+
+**E2: holding a worker** (324 runs, all passed). Chains of 20 links of classical work and a 5 ms job, 8 workers:
+
+| Chains | 1 | 2 | 4 | 8 | 12 | 16 |
+|---|---|---|---|---|---|---|
+| C-block / C, work 1e-4 of a job | 1.00 | 0.99 | 1.02 | 1.03 | 2.05 | 2.09 |
+| C-block / C, work 1 job | 1.00 | 1.00 | 0.99 | 1.00 | 1.90 | 1.90 |
+| C-block / C, work 10 jobs | 1.00 | 1.00 | 1.00 | 1.00 | 1.45 | 1.10 |
+
+With no more chains than workers, a body that blocks costs nothing; beyond, it doubles the time, as the bound of the text says (`ceil(chains / workers)` rounds of jobs). The gap closes only when classical work saturates the workers anyway (10 job times of work, 16 chains: C 2.01 s against a bound of 2.0 s, C-block 2.22 s against 2.2 s). A, one job at a time without the runtime, takes chains times longer throughout. QAOA on a device, with jobs of seconds and 50 to 100 us of classical work per job, sits near 1e-5, at the left end of the plot (shaded), where the effect is all or nothing: it depends only on outstanding jobs against workers.
+
+**E3: dataflow against colour barriers** (1,080 runs at 20 ms and 15 at other time scales; every check of correctness passed, and the 11 runs with a late job were run again). 16 blocks of 8 vertices on 4 ranks, T 8 and R 4 (1,024 jobs). The grid and the ring have two colours of 8 blocks, the random block graph four colours of 6, 4, 4 and 2, the complete one 16 colours of one block. C-sync time over C time, measured (model), medians over the seeds:
+
+| Shape | Places | CV 0 | CV 0.5 | CV 1 | CV 2 |
+|---|---|---|---|---|---|
+| grid | 4 | 1.001 (1.000) | 1.013 (1.014) | 1.026 (1.028) | 1.099 (1.093) |
+| grid | 8 | 1.002 (1.000) | 1.055 (1.044) | 1.131 (1.161) | 1.229 (1.237) |
+| grid | 16 | 1.001 (1.000) | 1.044 (1.046) | 1.107 (1.112) | 1.172 (1.179) |
+| ring | 8 | 1.003 (1.000) | 1.065 (1.061) | 1.157 (1.161) | 1.231 (1.250) |
+| ring | 16 | 1.002 (1.000) | 1.086 (1.088) | 1.127 (1.132) | 1.179 (1.181) |
+| random | 4 | 1.005 (1.000) | 1.057 (1.057) | 1.116 (1.129) | 1.225 (1.228) |
+| random | 8 | 1.048 (1.043) | 1.091 (1.086) | 1.155 (1.160) | 1.247 (1.245) |
+| random | 16 | 1.006 (1.000) | 1.082 (1.083) | 1.157 (1.156) | 1.245 (1.245) |
+| complete | 2 | 1.000 (1.000) | 1.000 (1.000) | 1.003 (1.000) | 1.000 (1.000) |
+| complete | 16 | 1.000 (1.000) | 0.999 (1.000) | 1.000 (1.000) | 1.001 (1.000) |
+
+(All 84 settings, with A, B and the times, are in `exp_qpu/tables/e3.md`; plots `e3_slots` and `e3_cv`.)
+
+The hypothesis holds, with its null results. With the barrier the run takes up to 25% longer at CV 2 (C ends 20% sooner) and up to 16% longer at CV 1, and no longer when every job takes the same time, with one place (1.000 everywhere), or on the complete block graph, where the barrier is the dependency itself. The one gain at CV 0, 1.048 on the random graph at 8 places, is in the model too (1.043): its colours differ in size, so a barrier leaves places empty even when all jobs are equal. Over the 84 settings the measured ratio is within 1% of the model in 78 and within 2.6% in all. On the grid and the ring at CV 1 and 2 the gain is largest at 8 places, one per block of a colour, and not at twice that, where section 6.4 expected it; the model says the same.
+
+Where measurement and model differ most (grid at CV 1 and ring at CV 2, both at 8 places), it is the model of the barrier systems that is off, not C. The model starts the blocks of a colour in block order; B submits them in the order of its ranks (0, 8, 2, 5, ... on the grid) and C-sync in the order its tasks become ready, as the job logs show, and with fewer places than tasks that order decides which blocks finish first. Over all settings B is within 2.5% of its model either way, C-sync from 2.2% below to 3.8% above, and C from 0.2% below to 3.6% above, with a median of 1.0% above (the model has no classical work and no overhead).
+
+B against C-sync, the same schedule by hand and by the runtime: B / C-sync is between 0.973 and 1.011 in every setting. B takes more than 1% less time in 27 of the 84 settings, 23 of which have 16 or 32 places or are on the complete graph, whose colours are one block each. With a place for every task, a run lasts as long as the chain of steps of its slowest block, and every step adds its turnaround. The gap is largest at CV 0, 2.4 to 2.7% at 16 and 32 places (1.29 s against 1.33 s on the grid). E4 shows where the time goes.
+
+The ratios do not depend on the time scale. The grid at CV 1 and 16 places was run again with jobs of 0.1 s (seeds 1 to 3) and 1 s (seeds 1 and 2). With the same seed the job times are the same up to the scale, so the ratios should be equal, and they are:
+
+| Mean job time | C-sync / C, seed 1 | seed 2 | C over the model |
+|---|---|---|---|
+| 20 ms | 1.137 | 1.014 | 1.7% |
+| 0.1 s | 1.142 | 1.013 | 0.4% |
+| 1 s | 1.143 | 1.013 | 0.04% |
+| Model | 1.143 | 1.013 | |
+
+What C adds over the model is about 45 ms per run at every scale (41 to 48 ms) (the classical work and the turnaround of E4), so its share falls as jobs get longer. The medians over all seeds of each scale (1.107, 1.111 and 1.077) differ only because the scales have different seeds (`exp_qpu/tables/e3_scales.md`).
+
+**Late jobs.** 11 of the 1,080 runs had one late job out of 1,024: 10 of the 296 runs at CV 2, one of the 296 at CV 0.5, none at CV 0 or 1. Section 6.7 does not count such a run. Each was run once more with the same command (`exp_qpu/retry_late.py`), all 11 without a late job, and the second run takes the place of the first, so every setting keeps its seeds. The programs were the same: the provenance records of the two differ only in the harness and in one line of the test list (`bench:work`). At CV 2 the shortest drawn jobs are 157 to 235 us, three to four times the 55 us of sampling a block of 8, so a helper thread that waits a tenth of a millisecond for a core ends one late. 6 of the 11 fell in the windows when another user's processes ran, which hold a third of the runs. The mock counts late jobs and not by how much, so the cause of each was not measured.
+
+**E4: how full the places stay** (from the per-job logs of the E3 runs of B, C-sync and C). Busy place-time over places times the run's time, medians over the seeds, with the model; the grid:
+
+| CV | Places | B | C-sync | C | Model, barriers | Model, dataflow |
+|---|---|---|---|---|---|---|
+| 0 | 16 | 0.993 | 0.966 | 0.967 | 1.000 | 1.000 |
+| 1 | 4 | 0.944 | 0.953 | 0.993 | 0.956 | 0.997 |
+| 1 | 8 | 0.812 | 0.809 | 0.915 | 0.800 | 0.924 |
+| 2 | 4 | 0.861 | 0.865 | 0.973 | 0.869 | 0.975 |
+| 2 | 8 | 0.620 | 0.619 | 0.729 | 0.620 | 0.735 |
+| 2 | 16 | 0.334 | 0.332 | 0.374 | 0.335 | 0.379 |
+
+(Every setting is in `exp_qpu/tables/e4.md`, with the time a place was free while a task waited; the plot `e4_series` shows the jobs outstanding over time in one run of each system, grid, CV 1, 4 places.)
+
+At 4 places, where section 6.4 put the model at 0.97 to 1.00 for dataflow and 0.86 to 0.98 for barriers, the grid and the ring measure 0.973 to 0.996 for C and 0.861 to 0.996 for B and C-sync. The random block graph is lower for both (at CV 2, C 0.851 and C-sync 0.718), and so is its model (0.851 and 0.721). The gain of E3 is a gain in busy places. Every system is at most 1.2 points above its model, and at most 2 points below it in 243 of 252 cases. Six of the 9 others are C and C-sync at CV 0 with a place for every task: the grid and the ring at 16 places (3.3 to 3.6 points below) and the complete graph at 2 (2.8). The last three are 2.0 to 2.3 points below: C and C-sync on the random graph at CV 0 with 8 places, and C-sync on the ring at CV 1 with 4.
+
+At CV 0 with 16 places a place was hardly ever free while a task waited (7 ms over a run of 1.3 s on the grid): the places waited for the next step. The logs give the turnaround of a step on the critical path (medians over three seeds; grid, ring and complete at CV 0). C takes 480 to 540 us from retrieving a result at rank 0 to the next step's job reaching the device, of which 360 to 390 us pass before `EVAL` begins on the block's rank. B takes 16 to 25 us from sending a result to receiving the next request, with its ranks spinning. On the 64 steps of the grid's critical path that is 31 to 35 ms of the 44 ms C takes over its model. How the 0.37 ms divides between the remote dependency and waking a sleeping worker was not measured. It is the one place where the runtime costs more than hand-written MPI, and it matters only for jobs of tens of milliseconds (1.7% of the time at 20 ms, 0.04% at 1 s).
+
+With one place the order reverses. A place is free while a task waits for 53 to 55 us per job in C and C-sync and 117 to 126 us in B (grid, ring and random): the time from a job's end to the next submission. B's helper thread retrieves a result 65 to 127 us after the job ends, C's progress thread 47 to 61 us, which makes B 0.3% slower than C with one place (20.61 s against 20.54 s on the grid at CV 0).
+
+**E5: tasks that share jobs** (205 runs, all passed). Time with every task its own job over time with the limit, measured (model, as a range over the two ways tasks arrive at the device):
+
+| Regime | Limit 2 | 4 | 8 | 16 | Section 6.1 |
+|---|---|---|---|---|---|
+| 1 place | 1.74 (1.73 to 1.74) | 2.75 (2.74) | 3.79 (3.82) | 3.88 (3.88) | 1.73, 2.74, 3.82, 3.88 |
+| 1 place, queue delay | 1.94 (1.92 to 1.99) | 3.72 (3.62 to 3.68) | 6.50 (6.60 to 6.74) | 6.52 (6.93 to 6.95) | 1.93, 3.68, 6.38, 6.57 |
+| Submission interval | 2.00 (2.00) | 4.01 (3.99) | 8.03 (7.97) | 15.80 (15.83) | 2.00, 3.99, 7.97, 15.8 |
+| Interval, 3 places, queue delay | 2.00 (2.00) | 3.97 (3.97 to 3.98) | 6.79 (6.52 to 6.84) | 7.58 (7.32 to 7.78) | 2.00, 3.94, 6.80, 7.01 |
+| 3 places | 1.73 (1.73 to 1.74) | 2.46 (2.64 to 2.66) | 2.25 (2.30 to 2.37) | 2.16 (1.75 to 2.29) | 1.73, 2.66, 2.24, 1.79 |
+| 64 places | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+
+With one place or a submission interval, the measurement is the model within 2% (the queue delay rows within 6%: five draws of an exponential per setting). The non-monotone row of section 6.1 is there: with three places, a limit of 4 beats 16 in the model, and the device peaks at 4 too, but 7% lower than the model (2.46 against 2.64). The reason is in the logs: at a limit of 4 the device made 288 to 334 jobs where the model makes 272 or 273, more of them of one to three tasks. The released tasks reach the device over tens of microseconds, after their `EVAL`, `STEP` and `QEXEC` ran, and a place that is free takes what waits at once and never holds it back to fill a job; the model takes in the tasks of one event at the same instant. A third variant of the model, where all tasks an event releases arrive together, gives 2.73 and moves away from the measurement, so the gap is the trickle and not the rule. With jobs of 0.1 s the one-place row is 1.74, 2.75, 3.80, 3.88: the ratios do not depend on the time scale. With unlimited places sharing changes nothing, as expected.
+
+Every row of the second table of section 6.1, for the share of a job that does not depend on what it carries:
+
+| T_fixed / T_circ | Places | Limit 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| 0 | 1 | 1.00 (1.00) | 1.00 (1.00) | 1.00 (1.00) | 1.00 (1.00) |
+| 1 | 1 | 1.34 (1.33) | 1.60 (1.60) | 1.77 (1.77) | 1.78 (1.78) |
+| 5.6 | 1 | 1.74 (1.73) | 2.75 (2.74) | 3.79 (3.82) | 3.88 (3.88) |
+| 20 | 1 | 1.91 (1.91) | 3.50 (3.49) | 5.80 (5.84) | 5.98 (6.00) |
+| 0 | 3 | 1.00 (1.00) | 1.00 (1.00) | 0.99 (0.90 to 0.99) | 0.98 (0.82 to 1.00) |
+| 1 | 3 | 1.34 (1.33) | 1.52 (1.57 to 1.58) | 1.39 (1.16 to 1.48) | 1.37 (1.06 to 1.45) |
+| 5.6 | 3 | 1.73 (1.73 to 1.74) | 2.46 (2.64 to 2.66) | 2.25 (2.30 to 2.37) | 2.16 (1.75 to 2.29) |
+| 20 | 3 | 1.90 (1.90 to 1.91) | 2.87 (3.34 to 3.36) | 2.90 (3.24 to 3.29) | 2.72 (2.90 to 3.16) |
+
+Sharing a job gains in proportion to the share of a job that is fixed, and nothing when there is none: with T_fixed = 0 a job of n circuits takes as long as n jobs of one. With one place the device is the model to 1%. With three places it is below the model at limits of 4 and 8 for the reason above, by up to 14% when the fixed share is large.
+
+**E6: spreading the graph over ranks** (120 runs, all passed). Rings of 4 to 64 blocks of 12 vertices (48 to 768 vertices), jobs of 0.2 s, a place for every job, so the critical path is 32 jobs in a row and the model gives 6.40 s for every size:
+
+| Blocks (vertices) | System | 1 rank, s | 2 ranks | 4 ranks | 8 ranks | Processor time, 1 / 8 ranks, s |
+|---|---|---|---|---|---|---|
+| 4 (48) | B | 6.407 | 6.407 | 6.407 | 6.408 | 6.5 / 51.3 |
+| 4 (48) | C | 6.413 | 6.423 | 6.428 | 6.425 | 0.4 / 1.5 |
+| 16 (192) | B | 6.421 | 6.420 | 6.421 | 6.418 | 6.7 / 51.7 |
+| 16 (192) | C | 6.416 | 6.430 | 6.437 | 6.439 | 0.7 / 6.8 |
+| 64 (768) | B | 6.443 | 6.457 | 6.466 | 6.451 | 7.5 / 52.9 |
+| 64 (768) | C | 6.429 | 6.448 | 6.456 | 6.465 | 1.5 / 7.9 |
+
+(8 and 32 blocks lie between; `exp_qpu/tables/e6.md`.) The lines are flat, as expected: from 1 to 8 ranks C adds 12 to 36 ms over 6.4 s, at most 1.1 ms per job on the critical path, and B adds at most 23 ms. Both stay within 1% of the model at every size. Part of what grows with the number of blocks is there on one rank too (from 4 to 64 blocks, C goes from 13 to 29 ms over the model on one rank and B from 7 to 43 ms): most likely the work of taking in up to 128 results that end at the same moment, which was not measured apart. B holds a core per rank for the whole run (51 to 53 s of processor on 8 ranks); C uses 1.5 to 8 s. This bounds what the runtime adds per rank through shared memory; it says nothing about a network (departure 4) and is not a scaling result.
+
+### Verification
+
+All runs with the code as it stands at the end of M8 (`8cb244735` and the M8 changes, committed since as `f0d3a53ae` to `e77de8362`), on 2026-11-24, on histamine2 (AMD EPYC 7302, 16 cores, one socket, an exclusive Slurm allocation) unless said otherwise: methane was running the experiments.
+
+| Check | Result |
+|---|---|
+| The modified tree with the option off, full suite | 168 of 168 pass, as after M7 |
+| The modified tree with the option on, full suite | 298 of 298 pass: the 277 of M7 and 21 new ones |
+| Every QPU and QAOA test 100 times in a row | 13,100 of 13,100 pass (131 tests) |
+| QPU and QAOA tests in a profiling build and in a Release build | 131 of 131 each |
+| The same in a build without MPI, under the address sanitizer | 96 of 96 (the 35 others need MPI) |
+| MPI by hand, two or four cores per rank, on 2, 3, 4 and 8 ranks: B, C-sync and C on every instance, with failing evaluations, the QPU on the last rank, more ranks than blocks, the three broadcast trees, the 11 schedulers, two virtual processes, one worker | 123 loops, 361 runs, none failed. (A 124th loop is the control of section 9.6: the existing `dsl/ptg/startup` under the scheduler `llp`, which fails 3 times of 3 as before) |
+| Compiler warnings in the new and changed sources, and warnings of the PTG compiler on them, in six builds from scratch | None |
+| **leconte, CUDA build with the option on**, full suite, one V100 per GPU test | 390 of 390 pass: the 66 GPU tests one at a time and the 324 others. The application with the CUDA device enabled, on 1 and 3 ranks, passes |
+| `runtime/qpu/bench:work`, added after the mutations below (so not in the rows above) | 20 of 20 in the Debug build and 20 of 20 in the Release build; the run takes 21.4 to 22.3 ms against the 20 ms its work cannot take less than |
+
+Not done in M8: a multi-node run, and a run on a real device, as before.
+
+### Does a test notice
+
+One deliberate bug at a time in a private copy of the sources, rebuilt, and the 129 QPU and QAOA tests of that copy run (the two `qpu_fallback` tests are not in that set). 17 of 18 were caught at first; the 18th was caught once a test was added for it.
+
+| Deliberate bug | Tests that fail |
+|---|---|
+| **B** | |
+| A job named by the key of the next step; by a key without the round | 6 each: every test of B |
+| The two evaluations of a step swapped when the optimizer takes them in | 6 |
+| A step that should be skipped submits its jobs anyway | 1: `apps/qaoa/mpi:rand`, the one instance where steps are skipped |
+| Each rank keeps its own states and never takes the others' | 5: every test of B on more than one rank |
+| Each block stops one step short | 6 |
+| The helper thread keeps twice `max_outstanding` jobs at the mock | 1: `mpi:1slot` |
+| **C-sync** | |
+| The first task of a colour does not wait for the barrier | 4 |
+| The barrier's tree leaves out its left subtrees | 4 |
+| An update counted for the next colour | 6: every test of C-sync |
+| **The mock's seed of the times** | |
+| The job times drawn from the seed of the samples; a circuit's time drawn with the bits of the queue delay; the samples drawn from the seed of the times | 1 each: `runtime/qpu/mock` |
+| **The shapes of block graphs** | |
+| A ring's pairs reversed; a grid whose rows wrap onto the next; a random graph of three neighbours instead of four | 1 each: `apps/qaoa/math` (the instances pinned by digest) |
+| **The benchmark** | |
+| The blocking body does not hold its worker | 2: `bench:block`, `bench:sequential` |
+| The classical work of a link is not done | None at first; 1 (`bench:work`) once it was added |
+
+The last bug taught something. Every test of the benchmark gave each link 20 us of work, less than what the runtime and the mock add per link, so its check that a run took at least as long as its work could not fail. `bench:work` gives each link 2 ms of work, longer than anything else in the run; with it the copy has 130 tests, all pass before and after, and the bug fails `bench:work` alone.
+
+### Sanitizers
+
+The no-MPI builds of section 9.1 with gcc 12.4 (histamine2's own compiler has no sanitizer libraries), 35 runs under each: the 29 of M7, the benchmark in three modes, and C-sync with failures and on another shape of block graph.
+
+- **Thread sanitizer.** 16,043 reports. Two have the QPU layer on both sides, both in the test that stops the service under a running taskpool: the stopping thread frees the backend while a worker submits (`device_qpu_progress.c:1215`) and while the mock's wake-up runs (`device_qpu_backend_mock.c:1144`). That is the application error the test stages, as in section 9.6; M7 had one report of it, this run two. 20 have the QPU layer on one side, all of the two kinds of section 9.1: 15 are the progress thread's push into a scheduler queue against a worker's pop, 5 an access to a task in the QPU layer (`device_qpu_progress.c:321` and `:1189`) against a later reuse of the task's memory from the pool. None is in code that M8 changed.
+- **Address sanitizer.** No memory error in 35 runs. Every leak record (425) is the one of section 9.1, a copy of a flow that a PTG task only writes. Sections 9.1, 9.5 and 9.6 give 72 bytes per copy. The record holds a pointer per device, so its size depends on how many devices a run has: 80 bytes with the QPU device on (413 records here, and the logs of M7 show 80 too), 72 in the two benchmark runs without it (12 records).
+
+### What an independent review found
+
+An independent reviewer read the new code and the harness while the first campaign ran, and modelled the device's admission rule against the model's. It found no correctness problem in B (the order of kernel calls per block, the keys, the messages, the end of a colour and of the run, ranks without blocks) and found the `JOIN` barrier exact at every colour and round boundary. What it found was in what was timed and in the harness; the first campaign was stopped, set aside (`exp_qpu/superseded/`) and run again from scratch after the fixes.
+
+| Finding | What was done |
+|---|---|
+| C and C-sync started their clock on rank 0 without a barrier, after a reference computed on every rank, and reported rank 0's time; B used a barrier and the slowest rank's time. With 16-qubit blocks (E6 as planned) the skew would have been tenths of a second and grown with ranks, in C only | A barrier before the clock in `testing_qaoa`, and the slowest rank's time |
+| The C-sync barrier was a chain of `JOIN` tasks in block order, up to 7 remote hops after the last update of a colour, against one collective in B: about 30 ms over 8 barriers, charged to the runtime | A binary tree (depth 3 for 8 blocks) |
+| B's ranks spin in `MPI_Waitany` while PaRSEC's idle threads sleep, so B reacts faster and burns cores | Kept (it is what B is), and the processor time of every run of every system is now reported next to its time |
+| E6 with 16-qubit blocks on two cores per rank would have measured the mock's sampling (7 to 12 ms of processor per job) and not MPI | Blocks of 12 (a departure); a run with a job that ended late now counts as failed, as section 6.7 asks |
+| Every run of A was recorded as failed (the reference prints no verdict in a single run) | It prints one, and the real count of late jobs |
+| The runner skipped a configuration found in its CSV whatever code produced it, hashed the sources but not the programs, and a hang would have stopped a whole campaign and left ranks running | The provenance id covers the sources, the programs run and the harness; a run is done again under another id; a run that hangs is killed with its process group and recorded |
+| The model gave a freed place to the tasks its end released before those that were waiting; the device does the opposite. That moved D with three places from 1.75 to 2.29 at a limit of 16 | Fixed; the model also has a variant where the two evaluations of a step arrive together, and D's prediction is drawn as the band between the two |
+| Nothing failed if `-y` never reached the taskpool (the states are the same with or without the barrier); B's limits and the mock's queue and job draws were untested; a ring that changed its edges went unnoticed | The driver counts the `JOIN` tasks (one per update with `-y`, none without); B checks its limits and the mock's watchdogs; the mock's test covers all three draws; the instances are pinned by digest, generated once by the committed code and once by the new |
+| B freed a send buffer before its request completed; B counted a refused job as failed twice; `qpu_bench` ignored unknown options | Fixed; `qpu_bench` also fails a run that took less time than its work and jobs allow |
+
+
+### Departures from the plan
+
+1. **Time scales.** Section 6.4 runs E3 and E5 at mean job times of 0.1 s and 1 s. The full grids ran at 20 ms (E3) and 10 ms per job (E5), which keeps classical work under half a percent of a job and makes about a thousand runs fit in hours; the ratios were then checked at 0.1 s and 1 s on one setting of E3 and at 0.1 s on one row of E5.
+2. **Smaller blocks.** E3 uses blocks of 8 vertices and E6 blocks of 12, not 10 and 16. The mock samples every circuit on the machine under test, and section 6.7 counts a run only when no job outlasted its drawn time: with blocks of 10, 46 of the first 64 E3 runs at a coefficient of variation of 2 had such jobs, and none at lower ones (the shortest drawn times are 157 to 235 us over the five seeds; sampling takes 125 us at 10 qubits and 55 us at 8), and with blocks of 16 E6 would have measured the mock. The schedule does not depend on the size of a block, and a probe gave the same times within 0.4% for blocks of 10, 8 and 6, with no late job at 8 or 6. The runs on blocks of 10 are kept in `exp_qpu/superseded/`.
+3. **Helpers share cores with workers.** Section 6.7 asks for helper threads with cores the workers do not use. They share the cores of rank 0; the count of late jobs, zero in every reported run, is the check instead.
+4. **E6 on one node.** The compute nodes were down, so E6 ran 1 to 8 ranks on the second socket of methane: MPI through shared memory, not a network. It bounds what the runtime adds per rank, not what a network adds.
+5. **E1 up to 14 workers**, not 36: it ran on serotonin (16 cores, nothing else on it) and left two cores for the progress thread and the mock.
+6. **C-sync is a tree of `JOIN` tasks**, not a control gather (section 6.2): a gather over a named range counts its inputs wrongly on this base (fork draft PR #19).
+7. **B waits by spinning** in `MPI_Waitany`, which is what a first MPI version does; its processor time is reported next to its time.
+8. **E4 has no runs of its own**: it is read from the per-job timestamps of E3, which every run of B, C-sync and C writes.
+9. **Not done**: B-async (section 6.2, "if time allows"), a replayed hardware trace in E3 (it needs E7), and E8 (optional).
+10. **The component changed in M8**: `device_qpu_mock_delay_seed` and `parsec_qpu_mock_time()`, so that the job times can vary while the answers stay the same, and the model can be checked against the mock's own draws.
+11. **The model** has three ways for released tasks to reach the device (one at a time, a step's two evaluations together, all at once); D's prediction is drawn as the range of the first two, which bracket the measurement with one place and not with three (E5).
+12. **Runs with a late job were run once more.** Section 6.7 only says such a run is not reported. The 11 of E3 were run again with the same command and replaced by the second run, so that every setting keeps its seeds; the first runs stay in the CSV, marked.
+13. **The places at which dataflow gains most.** Section 6.4 expected the gain of E3 at places "at or above twice the blocks per colour"; on the grid and the ring at CV 1 and 2 it is largest at one place per block of a colour, in the model as in the measurement.
