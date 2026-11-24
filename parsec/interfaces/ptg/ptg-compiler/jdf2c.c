@@ -1376,6 +1376,47 @@ static int jdf_dep_data_lookup_reads_local_defs(const jdf_dep_t *dl)
     return 0;
 }
 
+static int jdf_local_defs_have_range(const jdf_expr_t *defs)
+{
+    for( ; NULL != defs; defs = defs->next ) {
+        if( JDF_RANGE == defs->op )
+            return 1;
+    }
+    return 0;
+}
+
+/* A reference to a data collection, rather than to a task or to NEW / NULL */
+#define JDF_CALL_IS_DATA_COLLECTION(CALL) ((NULL == (CALL)->var) && (NULL != (CALL)->parameters))
+
+/**
+ * Tell if the final write of the output dependency dl, toward a data
+ * collection, reads the local definitions of the dependency: its guard, the
+ * parameters of the data collection or the datatypes it is written with.
+ */
+static int jdf_dep_final_write_reads_local_defs(const jdf_dep_t *dl)
+{
+    const jdf_expr_t *defs = dl->local_defs;
+    const jdf_call_t *call;
+    int to_memory = 0, reads = 0;
+
+    if( NULL == defs )
+        return 0;
+    for(call = dl->guard->calltrue; NULL != call;
+        call = (call == dl->guard->calltrue) ? dl->guard->callfalse : NULL) {
+        if( NULL != call->var )
+            continue;
+        to_memory = 1;
+        reads |= jdf_call_reads_local_defs(call, defs);
+    }
+    if( !to_memory )
+        return 0;
+    return reads ||
+           ((JDF_GUARD_UNCONDITIONAL != dl->guard->guard_type) &&
+            jdf_expr_reads_local_defs(dl->guard->guard, defs)) ||
+           jdf_datatype_reads_local_defs(&dl->datatype_local, defs) ||
+           jdf_datatype_reads_local_defs(&dl->datatype_data, defs);
+}
+
 /**
  * Bring the local definitions of the stack defs in scope, from the outermost
  * to the innermost: add to sa a block that declares each of them and, for a
@@ -2199,6 +2240,64 @@ static void jdf_generate_expression( const jdf_t *jdf, const jdf_function_entry_
     }
 }
 
+/**
+ * The guard of a dependency toward a data collection, when it reads a range of
+ * the dependency: the runtime evaluates it as a function of the locals (to
+ * count the inputs of a data flow, or to list the final outputs), not as a
+ * range. It holds if the guard, negated if asked, holds for some index of the
+ * range: an output then writes every such tile, an input reads the first one.
+ */
+static void jdf_generate_cond_over_range(const jdf_t *jdf, const jdf_function_entry_t *f,
+                                         const jdf_expr_t *guard, int negate,
+                                         jdf_expr_t *defs, const char *name)
+{
+    string_arena_t *sa = string_arena_new(64);
+    string_arena_t *sa2 = string_arena_new(64);
+    string_arena_t *sa3 = string_arena_new(64);
+    expr_info_t info = EMPTY_EXPR_INFO;
+    assignment_info_t ai;
+    int nb_open_ldef;
+
+    info.sa = sa;
+    info.prefix = "";
+    info.suffix = "";
+    info.assignments = "locals";
+
+    ai.sa = sa;
+    ai.holder = "locals->";
+    ai.expr = NULL;
+
+    coutput("static inline int %s_fct(const __parsec_%s_internal_taskpool_t *__parsec_tp, %s *locals)\n"
+            "{\n"
+            "%s\n",
+            name, jdf_basename, parsec_get_name(jdf, f, "parsec_assignment_t"),
+            UTIL_DUMP_LIST(sa2, f->locals, next, dump_local_assignments, &ai,
+                           "", "  ", "\n", "\n"));
+    coutput("%s\n"
+            "  (void)__parsec_tp;\n",
+            UTIL_DUMP_LIST_FIELD(sa3, f->locals, next, name, dump_string, NULL,
+                                 "", "  (void)", ";", ";"));
+    string_arena_init(sa2);
+    nb_open_ldef = jdf_local_defs_open(sa2, "  ", defs, NULL, "locals->", &info);
+    coutput("%s", string_arena_get_string(sa2));
+    coutput("    if( %s(%s) ) return 1;\n", negate ? "!" : "", dump_expr((void**)guard, &info));
+    string_arena_init(sa2);
+    jdf_local_defs_close(sa2, "  ", nb_open_ldef);
+    coutput("%s"
+            "  return 0;\n"
+            "}\n"
+            "static const parsec_expr_t %s = {\n"
+            "  .op = PARSEC_EXPR_OP_INLINE,\n"
+            "  .u_expr.v_func = { .type = %s, /* PARSEC_RETURN_TYPE_INT32 */\n"
+            "                     .func = { .inline_func_int32 = (parsec_expr_op_int32_inline_func_t)%s_fct }\n"
+            "                   }\n"
+            "};\n",
+            string_arena_get_string(sa2), name, enum_type_name(0), name);
+    string_arena_free(sa);
+    string_arena_free(sa2);
+    string_arena_free(sa3);
+}
+
 static void jdf_generate_affinity( const jdf_t *jdf, const jdf_function_entry_t *f, const char *name)
 {
     string_arena_t *sa1 = string_arena_new(64);
@@ -2630,7 +2729,9 @@ static void jdf_generate_ctl_gather_compute(const jdf_t *jdf, const jdf_function
 }
 
 static void jdf_generate_direct_data_function(const jdf_t *jdf, const char *mem,
-                                              const jdf_expr_t *parameters,
+                                              const jdf_call_t *call,
+                                              jdf_expr_t *local_defs,
+                                              const jdf_expr_t *guard, int negate,
                                               const jdf_function_entry_t *f,
                                               const char *function_name)
 {
@@ -2641,6 +2742,8 @@ static void jdf_generate_direct_data_function(const jdf_t *jdf, const char *mem,
     string_arena_t *sa3 = string_arena_new(64);
     string_arena_t *sa4 = string_arena_new(64);
     string_arena_t *sa5 = string_arena_new(64);
+    const jdf_expr_t *parameters = call->parameters;
+    int nb_open_ldef;
 
     info.sa = sa5;
     info.prefix = "";
@@ -2650,6 +2753,53 @@ static void jdf_generate_direct_data_function(const jdf_t *jdf, const char *mem,
     ai.sa = sa2;
     ai.holder = "assignments->";
     ai.expr = NULL;
+
+    if( jdf_call_reads_local_defs(call, local_defs) ) {
+        /* The parameters read the local definitions of the dependency:
+         * compute them in a copy of the locals, and the data inside their
+         * scope. Over a range, this is the data of the first index for which
+         * the guard holds. */
+        string_arena_t *sa6 = string_arena_new(64);
+        string_arena_t *sa7 = string_arena_new(64);
+
+        info.assignments = "&"JDF2C_NAMESPACE"_tmp_locals";
+        UTIL_DUMP_LIST(sa4, parameters, next,
+                       dump_expr, (void*)&info,
+                       "", "", ", ", "");
+        if( (NULL != guard) && jdf_local_defs_have_range(local_defs) )
+            string_arena_add_string(sa7, "%s(%s) && ", negate ? "!" : "", dump_expr((void**)guard, &info));
+        nb_open_ldef = jdf_local_defs_open(sa6, "  ", local_defs, NULL,
+                                           JDF2C_NAMESPACE"_tmp_locals.", &info);
+        coutput("static parsec_data_t *%s(const __parsec_%s_internal_taskpool_t *__parsec_tp, const %s *assignments)\n"
+                "{\n"
+                "%s\n"
+                "  /* Silence Warnings: should look into parameters to know what variables are useful */\n"
+                "%s\n"
+                "  %s "JDF2C_NAMESPACE"_tmp_locals = *assignments; (void)"JDF2C_NAMESPACE"_tmp_locals;\n"
+                "%s"
+                "  if( %s(__parsec_tp->super.super.context->my_rank == (int32_t)rank_of_%s(%s)) )\n"
+                "    return data_of_%s(%s);\n",
+                function_name, jdf_basename, parsec_get_name(jdf, f, "parsec_assignment_t"),
+                UTIL_DUMP_LIST(sa1, f->locals, next,
+                               dump_local_assignments, &ai, "", "  ", "\n", "\n"),
+                UTIL_DUMP_LIST_FIELD(sa3, f->locals, next, name,
+                                     dump_string, NULL, "", "  (void)", ";\n", ";"),
+                parsec_get_name(jdf, f, "parsec_assignment_t"),
+                string_arena_get_string(sa6),
+                string_arena_get_string(sa7),
+                mem, string_arena_get_string(sa4),
+                mem, string_arena_get_string(sa4));
+        string_arena_init(sa6);
+        jdf_local_defs_close(sa6, "  ", nb_open_ldef);
+        coutput("%s"
+                "  return NULL;\n"
+                "}\n"
+                "\n",
+                string_arena_get_string(sa6));
+        string_arena_free(sa6);
+        string_arena_free(sa7);
+        goto done;
+    }
 
     UTIL_DUMP_LIST(sa4, parameters, next,
                    dump_expr, (void*)&info,
@@ -2673,6 +2823,7 @@ static void jdf_generate_direct_data_function(const jdf_t *jdf, const char *mem,
             mem, string_arena_get_string(sa4),
             mem, string_arena_get_string(sa4));
 
+ done:
     string_arena_free(sa1);
     string_arena_free(sa2);
     string_arena_free(sa3);
@@ -2693,12 +2844,14 @@ static int jdf_generate_dependency( const jdf_t *jdf, jdf_dataflow_t *flow, jdf_
     JDF_OBJECT_ONAME(call) = strdup(depname);
 
     if( dep->dep_flags & JDF_DEP_FLOW_IN ) {
+        int range_in_parameters;
         /* First: do we have a control gather because of the parameters? */
         for( le = call->parameters; le != NULL; le = le->next ) {
             if( le->op == JDF_RANGE ) {
                 break;
             }
         }
+        range_in_parameters = (NULL != le);
         if( NULL == le ) {
             /* If not, do we have one because the call has a ranged local definition ? */
             for(le = call->local_defs; le != NULL; le = le->next) {
@@ -2715,7 +2868,11 @@ static int jdf_generate_dependency( const jdf_t *jdf, jdf_dataflow_t *flow, jdf_
                 }
             }
         }
-        if( NULL != le ) {
+        if( (NULL != le) && !range_in_parameters && JDF_CALL_IS_DATA_COLLECTION(call) ) {
+            /* A range of the dependency toward a data collection: the flow
+             * reads the tile of the first index for which the guard holds */
+            string_arena_add_string(sa2, "NULL");
+        } else if( NULL != le ) {
             /* At least one range in input: must be a control gather */
             if( !(flow->flow_flags & JDF_FLOW_TYPE_CTL) ) {
                 jdf_fatal(JDF_OBJECT_LINENO(dep), "This dependency features a range as input but is not a Control dependency\n");
@@ -2771,7 +2928,8 @@ static int jdf_generate_dependency( const jdf_t *jdf, jdf_dataflow_t *flow, jdf_
         if ( NULL != call->parameters ) {
             tmp_fct_name = string_arena_new(64);
             string_arena_add_string(tmp_fct_name, "%s_direct_access", JDF_OBJECT_ONAME(dep));
-            jdf_generate_direct_data_function(jdf, call->func_or_mem, call->parameters, f,
+            jdf_generate_direct_data_function(jdf, call->func_or_mem, call, dep->local_defs,
+                                              dep->guard->guard, (call == dep->guard->callfalse), f,
                                               string_arena_get_string(tmp_fct_name));
             string_arena_add_string(sa,
                                     "  .task_class_id = PARSEC_LOCAL_DATA_TASK_CLASS_ID, /* %s_%s */\n"
@@ -2860,7 +3018,10 @@ static int jdf_generate_dataflow( const jdf_t *jdf, const jdf_function_entry_t* 
             sprintf(sep, ",\n ");
         } else if( dl->guard->guard_type == JDF_GUARD_BINARY ) {
             sprintf(condname, "expr_of_cond_for_%s", JDF_OBJECT_ONAME(dl));
-            jdf_generate_expression(jdf, f, dl->guard->guard, condname);
+            if( JDF_CALL_IS_DATA_COLLECTION(dl->guard->calltrue) && jdf_expr_is_range(dl->guard->guard) )
+                jdf_generate_cond_over_range(jdf, f, dl->guard->guard, 0, dl->local_defs, condname);
+            else
+                jdf_generate_expression(jdf, f, dl->guard->guard, condname);
             sprintf(condname, "&expr_of_cond_for_%s", JDF_OBJECT_ONAME(dl));
             indepnorange = jdf_generate_dependency(jdf, flow, dl, dl->guard->calltrue,
                                                    JDF_OBJECT_ONAME(dl), condname, f) && indepnorange;
@@ -2871,7 +3032,10 @@ static int jdf_generate_dataflow( const jdf_t *jdf, const jdf_function_entry_t* 
 
             sprintf(depname, "%s_iftrue", JDF_OBJECT_ONAME(dl));
             sprintf(condname, "expr_of_cond_for_%s", depname);
-            jdf_generate_expression(jdf, f, dl->guard->guard, condname);
+            if( JDF_CALL_IS_DATA_COLLECTION(dl->guard->calltrue) && jdf_expr_is_range(dl->guard->guard) )
+                jdf_generate_cond_over_range(jdf, f, dl->guard->guard, 0, dl->local_defs, condname);
+            else
+                jdf_generate_expression(jdf, f, dl->guard->guard, condname);
             sprintf(condname, "&expr_of_cond_for_%s", depname);
             indepnorange = jdf_generate_dependency(jdf, flow, dl, dl->guard->calltrue, depname, condname, f) && indepnorange;
             string_arena_add_string(psa, "%s&%s", sep, depname);
@@ -2884,7 +3048,10 @@ static int jdf_generate_dataflow( const jdf_t *jdf, const jdf_function_entry_t* 
             /* The negation reads the local definitions that the guard reads */
             if( jdf_expr_reads_local_defs(dl->guard->guard, dl->guard->guard->local_variables) )
                 not.local_variables = dl->guard->guard->local_variables;
-            jdf_generate_expression(jdf, f, &not, condname);
+            if( JDF_CALL_IS_DATA_COLLECTION(dl->guard->callfalse) && jdf_expr_is_range(dl->guard->guard) )
+                jdf_generate_cond_over_range(jdf, f, dl->guard->guard, 1, dl->local_defs, condname);
+            else
+                jdf_generate_expression(jdf, f, &not, condname);
             sprintf(condname, "&expr_of_cond_for_%s", depname);
             indepnorange = jdf_generate_dependency(jdf, flow, dl, dl->guard->callfalse, depname, condname, f) && indepnorange;
             string_arena_add_string(psa, "%s&%s", sep, depname);
@@ -6378,9 +6545,19 @@ jdf_generate_code_flow_final_writes(const jdf_t *jdf,
     info.assignments = "&this_task->locals";
 
     for(dl = flow->deps; dl != NULL; dl = dl->next) {
+        int nb_open_ldef = 0;
+
         if( dl->dep_flags & JDF_DEP_FLOW_IN )
             /** No final write for input-only flows */
             continue;
+
+        if( jdf_dep_final_write_reads_local_defs(dl) ) {
+            string_arena_t *sa_ldef = string_arena_new(64);
+            nb_open_ldef = jdf_local_defs_open(sa_ldef, "  ", dl->local_defs, NULL,
+                                               "this_task->locals.", &info);
+            coutput("%s", string_arena_get_string(sa_ldef));
+            string_arena_free(sa_ldef);
+        }
 
         switch( dl->guard->guard_type ) {
         case JDF_GUARD_UNCONDITIONAL:
@@ -6413,6 +6590,12 @@ jdf_generate_code_flow_final_writes(const jdf_t *jdf,
                 coutput("  }\n");
             }
             break;
+        }
+        if( nb_open_ldef > 0 ) {
+            string_arena_t *sa_ldef = string_arena_new(64);
+            jdf_local_defs_close(sa_ldef, "  ", nb_open_ldef);
+            coutput("%s", string_arena_get_string(sa_ldef));
+            string_arena_free(sa_ldef);
         }
     }
 
