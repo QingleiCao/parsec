@@ -11,6 +11,10 @@ parsec_addtest_executable(C local_defs)
 target_link_libraries(local_defs PRIVATE tests_runtime_common)
 target_ptg_sources(local_defs PRIVATE "local_defs.jdf")
 
+parsec_addtest_executable(C data_local_defs)
+target_link_libraries(data_local_defs PRIVATE tests_runtime_common)
+target_ptg_sources(data_local_defs PRIVATE "data_local_defs.jdf")
+
 parsec_addtest_executable(C jdf_forward_RW_NULL)
 target_link_libraries(jdf_forward_RW_NULL PRIVATE tests_runtime_common)
 target_ptg_sources(jdf_forward_RW_NULL PRIVATE "forward_RW_NULL.jdf")

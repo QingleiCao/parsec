@@ -1,0 +1,215 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include "parsec/data_dist/matrix/two_dim_rectangle_cyclic.h"
+#include "parsec/sys/atomic.h"
+#include "tests/tests_runtime.h"
+
+/**
+ * A dependency can define names for itself, a range as in
+ * "<- [ a = t .. t ] descA(a, 0)", and give them to the data collection it
+ * reads or writes. Such a dependency did not compile:
+ *  - a range on an input from a data collection was refused, as if the
+ *    input came from a range of tasks;
+ *  - the function that finds the data of the dependency
+ *    (<dependency>_direct_access, the direct_data of the parsec_dep_t) and
+ *    the final write of an output, in the complete hook, did not declare
+ *    the names; given through inline C, they were read from a slot of the
+ *    locals that nothing had set.
+ * Over a range, an output writes every tile for which its guard holds, and
+ * an input reads the tile of the first index for which its guard holds.
+ *
+ * Every dependency of this test marked with a number reads a name it defines.
+ * T(t) and its tiles live on process t modulo the number of processes P, and
+ * so does U(u), next to T(2*u). descA(t) holds 100+t. T(t) computes 1000+t:
+ *  - an odd T(t) writes it into descB(t) and into descC(t);
+ *  - an even T(t) sends it to U(t/2), which writes it into descB(t), and
+ *    1001+t into descC(t);
+ *  - each T(t) of the first P writes it into the tiles d of descD with
+ *    d modulo P equal to t, all in its process.
+ * Every task must run once, and every tile must end with its value.
+ */
+
+static int32_t nb_errors = 0;
+static int32_t nb_ran = 0;
+
+static void check(const char *what, int idx, const char *flow, int32_t value, int32_t expected)
+{
+    if( expected != value ) {
+        fprintf(stderr, "%s(%d): read %d instead of %d on flow %s\n",
+                what, idx, (int)value, (int)expected, flow);
+        (void)parsec_atomic_fetch_inc_int32(&nb_errors);
+    }
+}
+
+%}
+
+descA      [type = "parsec_matrix_block_cyclic_t*"]
+descB      [type = "parsec_matrix_block_cyclic_t*" aligned=descA]
+descC      [type = "parsec_matrix_block_cyclic_t*" aligned=descA]
+descD      [type = "parsec_matrix_block_cyclic_t*" aligned=descA]
+N          [type = int]
+P          [type = int]
+
+T(t)
+  t = 0 .. N-1
+: descA(t, 0)
+
+  /* (1) A range of one index given to the data collection of an input */
+  READ  A <- [ a = t .. t ] descA(a, 0)
+  /* (2) The same through inline C, behind a guard that reads it */
+  READ  I <- [ i = t .. t ] i >= 0 ? descA(%{ return i; %}, 0)
+  /* (3) A range of several indices, of which the guard keeps one */
+  READ  F <- [ f = t % P .. N-1 .. P ] f == t ? descA(f, 0)
+  /* (4) A single value rather than a range */
+  READ  S <- [ s = t ] descA(s, 0)
+  WRITE W <- NEW
+          /* (5) An output toward a data collection, guard and tile read the name */
+          -> [ w = t .. t ] w % 2 == 1 ? descB(w, 0)
+          /* (6) A data collection on the false side of a guard with two calls */
+          -> [ v = t .. t ] v % 2 == 0 ? V U(v / 2) : descC(v, 0)
+          /* (7) An output written to every tile of a range */
+          -> [ d = t .. N-1 .. P ] t < P ? descD(d, 0)
+
+BODY
+  check("T", t, "A", ((int32_t*)A)[0], 100 + t);
+  check("T", t, "I", ((int32_t*)I)[0], 100 + t);
+  check("T", t, "F", ((int32_t*)F)[0], 100 + t);
+  check("T", t, "S", ((int32_t*)S)[0], 100 + t);
+  ((int32_t*)W)[0] = 1000 + t;
+  (void)parsec_atomic_fetch_inc_int32(&nb_ran);
+END
+
+U(u)
+  u = 0 .. N/2-1
+: descA(2*u, 0)
+
+  READ  V <- W T(2*u)
+  /* (8) An unconditional output toward a data collection */
+  WRITE X <- NEW
+          -> [ y = 2*u .. 2*u ] descC(y, 0)
+  /* (9) An output that writes the data it read, through a name */
+  RW    B <- descB(2*u, 0)
+          -> [ z = 2*u .. 2*u ] descB(z, 0)
+
+BODY
+  check("U", u, "V", ((int32_t*)V)[0], 1000 + 2*u);
+  ((int32_t*)X)[0] = ((int32_t*)V)[0] + 1;
+  ((int32_t*)B)[0] = ((int32_t*)V)[0];
+  (void)parsec_atomic_fetch_inc_int32(&nb_ran);
+END
+
+extern "C" %{
+
+#define TILES_PER_PROCESS 8
+
+static int32_t *tile_of(parsec_matrix_block_cyclic_t *d, int t)
+{
+    parsec_data_t *data = d->super.super.data_of(&d->super.super, t, 0);
+    return (int32_t*)parsec_data_copy_get_ptr(parsec_data_get_copy(data, 0));
+}
+
+static void init_collection(parsec_matrix_block_cyclic_t *d, const char *key,
+                            int rank, int world, int N)
+{
+    parsec_matrix_block_cyclic_init(d, PARSEC_MATRIX_INTEGER, PARSEC_MATRIX_TILE,
+                                    rank,
+                                    1, 1,        /* Tile size */
+                                    N, 1,        /* Global matrix size */
+                                    0, 0,        /* Starting point in the global matrix */
+                                    N, 1,        /* Submatrix size */
+                                    world, 1,    /* process grid */
+                                    1, 1,        /* k-cyclicity */
+                                    0, 0);
+    d->mat = parsec_data_allocate(d->super.nb_local_tiles * d->super.bsiz *
+                                  parsec_datadist_getsizeoftype(PARSEC_MATRIX_INTEGER));
+    parsec_data_collection_set_key(&d->super.super, (char*)key);
+    (void)key;
+}
+
+static void fini_collection(parsec_matrix_block_cyclic_t *d)
+{
+    parsec_data_free(d->mat);
+    parsec_tiled_matrix_destroy((parsec_tiled_matrix_t*)d);
+}
+
+int main(int argc, char *argv[])
+{
+    parsec_context_t *parsec;
+    parsec_data_local_defs_taskpool_t *tp;
+    parsec_matrix_block_cyclic_t descA, descB, descC, descD;
+    int32_t local[2], global[2];
+    int rc, rank, world, N, t;
+
+    rc = parsec_tests_context_init(-1, PARSEC_TEST_THREAD_SERIALIZED,
+                                   &argc, &argv, &parsec, &rank, &world);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_init");
+
+    N = TILES_PER_PROCESS * world;
+    init_collection(&descA, "A", rank, world, N);
+    init_collection(&descB, "B", rank, world, N);
+    init_collection(&descC, "C", rank, world, N);
+    init_collection(&descD, "D", rank, world, N);
+    for(t = 0; t < N; t++) {
+        if( (int)descA.super.super.rank_of(&descA.super.super, t, 0) != rank ) continue;
+        tile_of(&descA, t)[0] = 100 + t;
+        tile_of(&descB, t)[0] = -1;
+        tile_of(&descC, t)[0] = -1;
+        tile_of(&descD, t)[0] = -1;
+    }
+
+    tp = parsec_data_local_defs_new(&descA, &descB, &descC, &descD, N, world);
+    parsec_arena_datatype_set_type(&tp->arenas_datatypes[PARSEC_data_local_defs_DEFAULT_ADT_IDX],
+                                   sizeof(int32_t), PARSEC_ARENA_ALIGNMENT_SSE,
+                                   parsec_datatype_int32_t);
+
+    rc = parsec_context_add_taskpool(parsec, (parsec_taskpool_t*)tp);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+    rc = parsec_context_wait(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+
+    /* Every tile of this process holds its value */
+    for(t = 0; t < N; t++) {
+        if( (int)descA.super.super.rank_of(&descA.super.super, t, 0) != rank ) continue;
+        check("descA", t, "tile", tile_of(&descA, t)[0], 100 + t);
+        check("descB", t, "tile", tile_of(&descB, t)[0], 1000 + t);
+        check("descC", t, "tile", tile_of(&descC, t)[0], (t % 2) ? 1000 + t : 1001 + t);
+        check("descD", t, "tile", tile_of(&descD, t)[0], 1000 + t % world);
+    }
+
+    local[0] = nb_errors;
+    local[1] = nb_ran;
+    rc = parsec_tests_allreduce(parsec, local, global, 2,
+                                parsec_datatype_int32_t, PARSEC_TESTS_REDUCE_SUM);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_allreduce");
+
+    if( 0 == rank ) {
+        if( (0 != global[0]) || (N + N/2 != global[1]) ) {
+            fprintf(stderr, "%d error(s), %d task(s) ran instead of %d\n",
+                    (int)global[0], (int)global[1], N + N/2);
+        } else {
+            printf("The %d tasks ran once and the %d tiles of each collection hold their values\n",
+                   N + N/2, N);
+        }
+    }
+
+    PARSEC_OBJ_DESTRUCT(&tp->arenas_datatypes[PARSEC_data_local_defs_DEFAULT_ADT_IDX]);
+    parsec_taskpool_free((parsec_taskpool_t*)tp);
+    fini_collection(&descA);
+    fini_collection(&descB);
+    fini_collection(&descC);
+    fini_collection(&descD);
+
+    rc = parsec_tests_context_fini(&parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
+    return ((0 == global[0]) && (N + N/2 == global[1])) ? 0 : 1;
+}
+
+%}
