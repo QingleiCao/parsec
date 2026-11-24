@@ -83,6 +83,83 @@ static qaoa_local_t *local_new(const qaoa_instance_t *inst, const qaoa_config_t 
  * Graphs, partitions, colourings
  * --------------------------------------------------------------------- */
 
+/* A digest of the edges of an instance: its vertices, and every edge with
+ * its weight, in order. */
+static uint64_t instance_digest(const qaoa_instance_t *inst)
+{
+    uint64_t h = (uint64_t)inst->graph.n * 1000003u + (uint64_t)inst->graph.m;
+    for( int e = 0; e < inst->graph.m; e++ ) {
+        uint64_t w;
+        memcpy(&w, &inst->graph.ew[e], sizeof(w));
+        h = parsec_qpu_mix64(h ^ ((uint64_t)inst->graph.eu[e] << 32) ^ (uint64_t)inst->graph.ev[e]);
+        h = parsec_qpu_mix64(h ^ w);
+    }
+    return h;
+}
+
+/* The instances are what they were when the experiments of the design
+ * document were run: a generator that draws otherwise changes every result
+ * without failing any comparison with the reference, which draws the same. */
+static void test_instances_pinned(void)
+{
+    static const struct { const char *name; uint64_t digest; } named[] = {
+        { "edge2", 0x6b0b8ed280f43317ULL }, { "edge2-split", 0x6b0b8ed280f43317ULL }, { "tri", 0x31f46f0d85a7f757ULL },
+        { "c4", 0xe531c6c99bab3d15ULL }, { "c4-cross", 0xe531c6c99bab3d15ULL }, { "path6", 0x4a09018076703014ULL },
+        { "rand12", 0x30b181fbf9c3e511ULL }, { "rand12neg", 0x6ba3241af3157171ULL }, { "rand16", 0x39d42d8a7edacdf0ULL },
+        { "disc16", 0x4d55e496763aef9aULL }, { "ring64", 0x6ecee435d4f49515ULL }, { NULL, 0 }
+    };
+    static const struct { const char *spec; uint64_t digest; } generated[] = {
+        { "8:10:4:3", 0x38ceaccd1191c9eaULL }, { "16:12:5:3", 0x825fef787dda8d8aULL },
+        { "grid:16:10:4:2", 0x27dcbcd042ccecfbULL }, { "ring:16:10:4:2", 0x07bd516d4477b4a1ULL },
+        { "rand:16:10:4:2", 0xb52a8b53a7a64f81ULL }, { "complete:16:10:4:1", 0x8789ff4dea11bcc7ULL },
+        { "ring:64:16:4:2", 0x9cad48f32954a174ULL }, { NULL, 0 }
+    };
+    qaoa_instance_t inst;
+
+    for( int i = 0; NULL != named[i].name; i++ ) {
+        EXPECT(0 == qaoa_instance_named(&inst, named[i].name), "%s could not be built", named[i].name);
+        EXPECT(named[i].digest == instance_digest(&inst), "%s has other edges than it had (digest %016llx)", named[i].name,
+               (unsigned long long)instance_digest(&inst));
+        qaoa_instance_free(&inst);
+    }
+    for( int i = 0; NULL != generated[i].spec; i++ ) {
+        EXPECT(0 == qaoa_instance_spec(&inst, generated[i].spec, 1), "%s could not be built", generated[i].spec);
+        EXPECT(generated[i].digest == instance_digest(&inst), "%s has other edges than it had (digest %016llx)", generated[i].spec,
+               (unsigned long long)instance_digest(&inst));
+        qaoa_instance_free(&inst);
+    }
+    /* A ring made either way is the same ring. */
+    {
+        qaoa_instance_t a, b;
+        (void)qaoa_instance_blocks(&a, 2, 5, 2, 3, 7);
+        (void)qaoa_instance_spec(&b, "ring:2:5:2:3", 7);
+        EXPECT((0xae40eb35dfe977a5ULL == instance_digest(&a)) && (instance_digest(&a) == instance_digest(&b)),
+               "two blocks in a ring differ between the two ways of making them");
+        qaoa_instance_free(&a);
+        qaoa_instance_free(&b);
+    }
+    /* The shapes are the ones asked for: colours, and neighbours per block. */
+    {
+        static const struct { const char *spec; int colours, max_deg; } shapes[] = {
+            { "grid:16:10:4:2", 2, 4 }, { "ring:16:10:4:2", 2, 2 }, { "complete:16:10:4:1", 16, 15 }, { NULL, 0, 0 }
+        };
+        for( int i = 0; NULL != shapes[i].spec; i++ ) {
+            (void)qaoa_instance_spec(&inst, shapes[i].spec, 1);
+            EXPECT((shapes[i].colours == inst.part.nb_colours) && (shapes[i].max_deg == inst.part.max_deg),
+                   "%s has %d colours and %d neighbours at most, expected %d and %d", shapes[i].spec, inst.part.nb_colours,
+                   inst.part.max_deg, shapes[i].colours, shapes[i].max_deg);
+            qaoa_instance_free(&inst);
+        }
+        (void)qaoa_instance_spec(&inst, "rand:16:10:4:2", 1);
+        for( int b = 0; b < inst.part.nb_blocks; b++ ) {
+            EXPECT(inst.part.deg[b] >= 4, "rand:16:10:4:2: block %d has %d neighbours, fewer than four", b, inst.part.deg[b]);
+        }
+        qaoa_instance_free(&inst);
+        EXPECT(0 != qaoa_instance_spec(&inst, "grid:15:10:4:2", 1), "a grid of 15 blocks was made");
+        EXPECT(0 != qaoa_instance_spec(&inst, "torus:16:10:4:2", 1), "a shape that does not exist was made");
+    }
+}
+
 static void test_structure(void)
 {
     for( int i = 0; NULL != qaoa_instance_names[i]; i++ ) {
@@ -992,6 +1069,7 @@ static void test_statistics(void)
 
 int main(void)
 {
+    test_instances_pinned();
     test_structure();
     test_decomposition();
     test_bit_order();

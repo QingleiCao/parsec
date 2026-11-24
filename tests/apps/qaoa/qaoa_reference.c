@@ -25,13 +25,20 @@
  *
  * Options:
  *   -i NAME        one of the fixed instances (see qaoa_graph.h)
- *   -g K:N:C:X     instead: K blocks of N vertices, C chords per block, X
- *                  edges between neighbouring blocks
+ *   -g [TOPO:]K:N:C:X  instead: K blocks of N vertices, C chords per block,
+ *                  X edges between neighbouring blocks; the blocks joined as
+ *                  a ring (default), a square grid, all pairs (complete) or
+ *                  a ring with random pairs added (rand)
  *   -p LAYERS  -T STEPS  -R ROUNDS  -s SHOTS  -P PATIENCE  -S SEED
  *   -b             every job through the mock backend, one at a time, each
  *                  taking the time the mock is set to: a blocking quantum
  *                  call. This is the sequential baseline.
  *   -d SPEC        the mock's delay for -b (default const:0)
+ *   -D SEED        the seed of the mock's times for -b (default: that of its
+ *                  samples, which is the seed of the run)
+ *   -G             print the blocks of the instance, their colours and their
+ *                  neighbours, one block per line, and nothing else (for the
+ *                  models of the experiments)
  *   -t             print the time spent in each kind of step
  *   -v             print one line per round
  */
@@ -74,12 +81,15 @@ static int sample_failing(const parsec_qpu_circuit_t *circuit, const double *par
     return qaoa_sample_direct(circuit, params, shots, key, result, max_entries, &f->direct);
 }
 
+static int delay_seed = 0;
+
 static parsec_qpu_backend_t *mock_open(const char *delay, uint64_t seed)
 {
     parsec_qpu_backend_t *backend = NULL;
 
     /* What parsec_init() would have read from the MCA parameters. */
     parsec_qpu_params.mock_seed        = (int)seed;
+    parsec_qpu_params.mock_delay_seed  = delay_seed;
     parsec_qpu_params.mock_slots       = 1;
     parsec_qpu_params.mock_delay       = (char*)delay;
     parsec_qpu_params.mock_queue_delay = (char*)"const:0";
@@ -220,9 +230,11 @@ static int single_run(const qaoa_instance_t *inst, const qaoa_config_t *cfg, int
     qaoa_direct_t direct = { NULL, cfg->seed };
     parsec_qpu_backend_t *backend = NULL;
     qaoa_run_t run;
+    parsec_qpu_mock_stats_t mock;
     int64_t t0, t1;
     int rc;
 
+    memset(&mock, 0, sizeof(mock));
     if( blocking && (NULL == (backend = mock_open(delay, cfg->seed))) ) {
         fprintf(stderr, "qaoa_reference: the mock backend did not open with delay %s\n", delay);
         return 1;
@@ -231,7 +243,10 @@ static int single_run(const qaoa_instance_t *inst, const qaoa_config_t *cfg, int
     rc = blocking ? qaoa_sequential_run(inst, cfg, qaoa_sample_blocking, backend, 0, &run)
                   : qaoa_sequential_run(inst, cfg, qaoa_sample_direct, &direct, 0, &run);
     t1 = parsec_qpu_now_ns();
-    if( NULL != backend ) (void)parsec_qpu_backend_mock_ops.close(backend);
+    if( NULL != backend ) {
+        parsec_qpu_mock_stats(&mock);
+        (void)parsec_qpu_backend_mock_ops.close(backend);
+    }
     parsec_qpu_sampler_free(direct.sampler);
     if( 0 != rc ) {
         fprintf(stderr, "qaoa_reference: the run failed\n");
@@ -244,6 +259,9 @@ static int single_run(const qaoa_instance_t *inst, const qaoa_config_t *cfg, int
            blocking ? ", every job through the mock backend" : "");
     printf("cut %.4f -> %.4f in %.3f ms; %ld jobs (%ld failed), %ld of %ld updates accepted, %ld skipped\n",
            run.cut_initial, run.cut_final, (t1 - t0) * 1e-6, run.jobs, run.failed_jobs, run.accepted, run.updates, run.skipped);
+    printf("qaoa_result system=A instance=%s blocks=%d colours=%d ranks=1 rounds=%d steps=%d layers=%d shots=%d time_ms=%.3f "
+           "jobs=%ld circuits=%ld late=%llu owner=0\n", inst->name, inst->part.nb_blocks, inst->part.nb_colours, cfg->rounds,
+           cfg->steps, cfg->layers, cfg->shots, (t1 - t0) * 1e-6, run.jobs, run.jobs, (unsigned long long)mock.late);
     if( verbose ) {
         for( int r = 0; r < cfg->rounds; r++ ) printf("  round %d: cut %.4f\n", r, run.cut_after_round[r]);
     }
@@ -296,12 +314,13 @@ int main(int argc, char *argv[])
     qaoa_config_t cfg;
     qaoa_instance_t inst;
     const char *name = NULL, *generated = NULL, *delay = "const:0";
-    int blocking = 0, timers = 0, chosen = 0;
+    int blocking = 0, timers = 0, chosen = 0, partition = 0;
 
     qaoa_config_default(&cfg);
     for( int i = 1; i < argc; i++ ) {
         if( 0 == strcmp(argv[i], "-b") ) { blocking = 1; chosen = 1; continue; }
         if( 0 == strcmp(argv[i], "-t") ) { timers = 1; chosen = 1; continue; }
+        if( 0 == strcmp(argv[i], "-G") ) { partition = 1; chosen = 1; continue; }
         if( 0 == strcmp(argv[i], "-v") ) { verbose = 1; continue; }
         if( i + 1 >= argc ) { fprintf(stderr, "qaoa_reference: %s needs a value\n", argv[i]); return 1; }
         chosen = 1;
@@ -314,23 +333,35 @@ int main(int argc, char *argv[])
         else if( 0 == strcmp(argv[i], "-P") ) cfg.patience = atoi(argv[++i]);
         else if( 0 == strcmp(argv[i], "-S") ) cfg.seed = strtoull(argv[++i], NULL, 0);
         else if( 0 == strcmp(argv[i], "-d") ) delay = argv[++i];
+        else if( 0 == strcmp(argv[i], "-D") ) delay_seed = atoi(argv[++i]);
         else { fprintf(stderr, "qaoa_reference: unknown option %s\n", argv[i]); return 1; }
     }
 
     if( chosen ) {
         int rc;
         if( NULL != generated ) {
-            int k = 0, n = 0, c = 0, x = 0;
-            if( (4 != sscanf(generated, "%d:%d:%d:%d", &k, &n, &c, &x)) || (0 != qaoa_instance_blocks(&inst, k, n, c, x, cfg.seed)) ) {
-                fprintf(stderr, "qaoa_reference: -g takes blocks:vertices:chords:cross, and %s is not a graph that exists\n", generated);
+            if( 0 != qaoa_instance_spec(&inst, generated, cfg.seed) ) {
+                fprintf(stderr, "qaoa_reference: -g takes [ring|grid|complete|rand:]blocks:vertices:chords:cross, and %s is not a graph that exists\n", generated);
                 return 1;
             }
         } else if( 0 != qaoa_instance_named(&inst, (NULL != name) ? name : "ring64") ) {
             fprintf(stderr, "qaoa_reference: no instance named %s\n", name);
             return 1;
         }
+        if( partition ) {
+            const qaoa_partition_t *p = &inst.part;
+            printf("# %s: %d blocks, %d colours; block colour size neighbours...\n", inst.name, p->nb_blocks, p->nb_colours);
+            for( int b = 0; b < p->nb_blocks; b++ ) {
+                printf("%d %d %d", b, p->colour[b], qaoa_block_size(p, b));
+                for( int k = 0; k < p->deg[b]; k++ ) printf(" %d", qaoa_block_nbr(p, b, k));
+                printf("\n");
+            }
+            qaoa_instance_free(&inst);
+            return 0;
+        }
         rc = single_run(&inst, &cfg, blocking, delay, timers);
         qaoa_instance_free(&inst);
+        printf("qaoa_reference: %s\n", rc ? "FAILED" : "passed");
         return rc;
     }
 

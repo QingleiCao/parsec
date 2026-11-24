@@ -96,6 +96,13 @@ void qaoa_sizes(qaoa_sizes_t *sizes, const qaoa_instance_t *inst, const qaoa_con
  *               and filled by qaoa_empty_boundaries(): the boundary of a
  *               block that has no neighbour
  *
+ * @param[in] colour_sync  the blocks of a colour start only once every block
+ *               of the colour before has had its update: the schedule of a
+ *               code with a barrier between colours (C-sync). The results
+ *               are the same
+ * @param[in] log  keep the timestamps of every job and every update of this
+ *               process (qaoa_taskpool_log)
+ *
  * Returns NULL for a configuration that is not a run: no round, no step, no
  * shot, or a number of layers outside 1 .. QAOA_MAX_LAYERS.
  *
@@ -108,14 +115,38 @@ void qaoa_sizes(qaoa_sizes_t *sizes, const qaoa_instance_t *inst, const qaoa_con
 parsec_taskpool_t *qaoa_taskpool_new(const qaoa_instance_t *inst, const qaoa_config_t *cfg,
                                      parsec_data_collection_t *X, parsec_data_collection_t *Q,
                                      parsec_data_collection_t *A, parsec_data_collection_t *G,
-                                     parsec_data_collection_t *E, const qaoa_sizes_t *sizes);
+                                     parsec_data_collection_t *E, const qaoa_sizes_t *sizes,
+                                     int colour_sync, int log);
 /** To be called once the taskpool has been waited for. */
 void qaoa_taskpool_free(parsec_taskpool_t *tp);
+
+/** One job of the log: the timestamps of its result (nanoseconds on the
+ *  monotonic clock of the rank that owns the QPU), and when its EVAL ran on
+ *  the rank of its block. Indexed ((r K + b) T + t) 2 + e; done is 0 for a
+ *  job whose EVAL ran on another rank. */
+typedef struct qaoa_job_record_s {
+    int64_t  t_hook, t_submit, t_start, t_end, t_retrieve, t_eval;
+    uint32_t batch, attempts, status, done;
+} qaoa_job_record_t;
+
+/** One update of the log: when its BUILD began and its UPDATE ended, on the
+ *  rank of its block. Indexed r K + b; 0 for a block of another rank. */
+typedef struct qaoa_update_record_s {
+    int64_t t_build, t_update;
+} qaoa_update_record_t;
+
+/** The log of the last taskpool made with log set, until it is freed; NULL
+ *  otherwise. */
+void qaoa_taskpool_log(const qaoa_job_record_t **jobs, const qaoa_update_record_t **updates);
 
 /** Tasks of this process, since it started, that read the state of a block
  *  after another number of updates than their place in the graph implies:
  *  zero, unless a dependency of the graph is wrong. */
 int qaoa_taskpool_violations(void);
+
+/** JOIN tasks of the colour-synchronous control run in this process since
+ *  it started: one per update when colour_sync is set, none otherwise. */
+int qaoa_taskpool_joins(void);
 
 END_C_DECLS
 

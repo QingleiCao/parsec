@@ -25,8 +25,10 @@
  *
  * Options, before "--":
  *   -i NAME        one of the fixed instances (see qaoa_graph.h)
- *   -g K:N:C:X     instead: K blocks of N vertices, C chords per block, X
- *                  edges between neighbouring blocks
+ *   -g [TOPO:]K:N:C:X  instead: K blocks of N vertices, C chords per block,
+ *                  X edges between neighbouring blocks; the blocks joined as
+ *                  a ring (default), a square grid, all pairs (complete) or
+ *                  a ring with random pairs added (rand)
  *   -p LAYERS  -T STEPS  -R ROUNDS  -s SHOTS  -P PATIENCE  -S SEED
  *   -F MODE        what happens to the jobs:
  *                    none   nothing (default)
@@ -38,6 +40,12 @@
  *                           second one works (to be run with
  *                           --mca device_qpu_mock_faults fail:first=1): the
  *                           application sees nothing of it
+ *   -y             colour-synchronous: the blocks of a colour start once every
+ *                  block of the colour before has had its update (C-sync)
+ *   -L PREFIX      write the timestamps of every job and every update of
+ *                  this rank to PREFIX.<rank>.jobs and PREFIX.<rank>.updates
+ *                  (one run only)
+ *   -M             print one line per run that a script can read
  *   -C             tasks are to share jobs in this run (to be given with a
  *                  device_qpu_max_batch above one and fewer places at the
  *                  backend than tasks that wait): it is an error if none did
@@ -56,6 +64,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 
 enum { FAIL_NONE, FAIL_KEYS, FAIL_FIRST };
 
@@ -63,6 +72,9 @@ static int verbose = 0;
 static int fail_mode = FAIL_NONE;
 static int compare = 1;
 static int expect_shared = 0;
+static int colour_sync = 0;
+static int machine = 0;
+static const char *log_prefix = NULL;
 /* Over all the runs of this process, as rank 0 reads them in the reports. */
 static long all_evaluations = 0, all_failed = 0;
 /* Over all the runs of this process, on the rank that owns the QPU. */
@@ -140,7 +152,9 @@ static int run_one(parsec_context_t *parsec, int rank, int world, const qaoa_ins
     parsec_taskpool_t *tp;
     qaoa_sizes_t sizes;
     qaoa_run_t ref;
-    int64_t t0, t1;
+    int64_t t0, t1, cpu_us = 0;
+    int elapsed_us = 0, joins_before;
+    struct rusage ru0, ru1;
     const int violations = qaoa_taskpool_violations();
     int errors = 0, rc, owner, have_ref = 0;
 
@@ -184,7 +198,7 @@ static int run_one(parsec_context_t *parsec, int rank, int world, const qaoa_ins
     E = qaoa_tiles_new(rank, world, -1, K, sizes.boundary);     /* an empty boundary per block, next to its state */
     qaoa_empty_boundaries(E, inst);
 
-    tp = qaoa_taskpool_new(inst, cfg, X, Q, A, G, E, &sizes);
+    tp = qaoa_taskpool_new(inst, cfg, X, Q, A, G, E, &sizes, colour_sync, NULL != log_prefix);
     if( NULL == tp ) {
         if( 0 == rank ) fprintf(stderr, "testing_qaoa: %d round(s) of %d step(s), %d layer(s) and %d shot(s) is not a run\n",
                                 R, T, cfg->layers, cfg->shots);
@@ -200,7 +214,13 @@ static int run_one(parsec_context_t *parsec, int rank, int world, const qaoa_ins
     parsec_qpu_service_stats(&before);
     parsec_qpu_mock_stats(&mock_before);
     if( FAIL_KEYS == fail_mode ) parsec_qpu_mock_set_fault_fn(fault_by_key, NULL);
+    joins_before = qaoa_taskpool_joins();
 
+    /* Every rank starts the clock together: what each did before (the
+     * reference among others) is not in the time of the run. (Without MPI
+     * there is no barrier, and no other rank.) */
+    (void)parsec_tests_barrier(parsec);
+    getrusage(RUSAGE_SELF, &ru0);
     t0 = parsec_qpu_now_ns();
     rc = parsec_context_add_taskpool(parsec, tp);
     PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
@@ -209,6 +229,27 @@ static int run_one(parsec_context_t *parsec, int rank, int world, const qaoa_ins
     rc = parsec_context_wait(parsec);
     PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
     t1 = parsec_qpu_now_ns();
+    getrusage(RUSAGE_SELF, &ru1);
+
+    /* The time of the run is that of the rank that took longest, and its
+     * processor time that of all the ranks; and with the colour-synchronous
+     * control, every update went through a JOIN. */
+    {
+        int pair[2] = { (int)((t1 - t0) / 1000), rank }, longest[2] = { pair[0], rank };
+        int64_t local[2] = { ((int64_t)(ru1.ru_utime.tv_sec - ru0.ru_utime.tv_sec) + (int64_t)(ru1.ru_stime.tv_sec - ru0.ru_stime.tv_sec)) * 1000000LL
+                             + (int64_t)(ru1.ru_utime.tv_usec - ru0.ru_utime.tv_usec) + (int64_t)(ru1.ru_stime.tv_usec - ru0.ru_stime.tv_usec),
+                             (int64_t)(qaoa_taskpool_joins() - joins_before) }, total[2] = { local[0], local[1] };
+        if( PARSEC_SUCCESS != parsec_tests_allreduce(parsec, pair, longest, 1, parsec_datatype_int32_t, PARSEC_TESTS_REDUCE_MAXLOC_INT) ) {
+            longest[0] = pair[0];
+        }
+        if( PARSEC_SUCCESS != parsec_tests_allreduce(parsec, local, total, 2, parsec_datatype_int64_t, PARSEC_TESTS_REDUCE_SUM) ) {
+            total[0] = local[0]; total[1] = local[1];
+        }
+        elapsed_us = longest[0];
+        cpu_us     = total[0];
+        EXPECT(total[1] == (colour_sync ? (int64_t)R * K : 0), "%lld JOIN tasks ran, %s", (long long)total[1],
+               colour_sync ? "one per update was expected" : "and there was to be none");
+    }
 
     if( FAIL_KEYS == fail_mode ) parsec_qpu_mock_set_fault_fn(NULL, NULL);
     parsec_qpu_service_stats(&after);
@@ -281,11 +322,63 @@ static int run_one(parsec_context_t *parsec, int rank, int world, const qaoa_ins
          * what the other ranks saw is checked below and summed at the end. */
         printf("%-12s %-22s cut %8.4f -> %8.4f  %4u jobs asked for, %3u/%-3u updates accepted, %2u skipped, %7.1f ms on %d rank(s)%s\n",
                inst->name, setting, cut_initial, cut_final, total.evaluations + total.failed, total.accepted, total.updates,
-               total.skipped, (t1 - t0) * 1e-6, world,
+               total.skipped, elapsed_us * 1e-3, world,
                !have_ref ? "" : (different ? ": final states NOT those of the reference"
                                            : ": final states equal to the reference, bit for bit"));
         all_evaluations += (long)total.evaluations + (long)total.failed;
         all_failed      += (long)total.failed;
+    }
+
+    /* ---- the log, from every rank ---- */
+    if( NULL != log_prefix ) {
+        const qaoa_job_record_t *jobs = NULL;
+        const qaoa_update_record_t *updates = NULL;
+        char path[1024];
+        FILE *file;
+
+        qaoa_taskpool_log(&jobs, &updates);
+        snprintf(path, sizeof(path), "%s.%d.jobs", log_prefix, rank);
+        if( (NULL != jobs) && (NULL != (file = fopen(path, "w"))) ) {
+            fprintf(file, "# r b t e t_hook t_submit t_start t_end t_retrieve t_eval batch attempts status (ns, the run began at %lld)\n",
+                    (long long)t0);
+            for( int r = 0; r < R; r++ ) for( int b = 0; b < K; b++ ) for( int t = 0; t < T; t++ ) for( int e = 0; e < 2; e++ ) {
+                const qaoa_job_record_t *j = &jobs[(((size_t)r * K + b) * T + t) * 2 + e];
+                if( !j->done ) continue;
+                fprintf(file, "%d %d %d %d %lld %lld %lld %lld %lld %lld %u %u %u\n", r, b, t, e,
+                        (long long)j->t_hook, (long long)j->t_submit, (long long)j->t_start, (long long)j->t_end,
+                        (long long)j->t_retrieve, (long long)j->t_eval, j->batch, j->attempts, j->status);
+            }
+            fclose(file);
+        } else {
+            EXPECT(0, "could not write %s", path);
+        }
+        snprintf(path, sizeof(path), "%s.%d.updates", log_prefix, rank);
+        if( (NULL != updates) && (NULL != (file = fopen(path, "w"))) ) {
+            fprintf(file, "# r b colour t_build t_update (ns; the run began at %lld and ended at %lld)\n", (long long)t0, (long long)t1);
+            for( int r = 0; r < R; r++ ) for( int b = 0; b < K; b++ ) {
+                const qaoa_update_record_t *u = &updates[(size_t)r * K + b];
+                if( 0 == u->t_build ) continue;
+                fprintf(file, "%d %d %d %lld %lld\n", r, b, inst->part.colour[b], (long long)u->t_build, (long long)u->t_update);
+            }
+            fclose(file);
+        } else {
+            EXPECT(0, "could not write %s", path);
+        }
+    }
+
+    /* ---- one line for a script, from rank 0 ---- */
+    if( machine && (0 == rank) ) {
+        parsec_qpu_stats_t s1;
+        parsec_qpu_mock_stats_t m1;
+        parsec_qpu_service_stats(&s1);
+        parsec_qpu_mock_stats(&m1);
+        printf("qaoa_result system=%s instance=%s blocks=%d colours=%d ranks=%d rounds=%d steps=%d layers=%d shots=%d "
+               "time_ms=%.3f cpu_s=%.3f jobs=%lld circuits=%lld late=%lld owner=%d\n",
+               colour_sync ? "C-sync" : ((info.max_batch > 1) ? "D" : "C"), inst->name, K, inst->part.nb_colours, world,
+               R, T, cfg->layers, cfg->shots, elapsed_us * 1e-3, cpu_us * 1e-6,
+               (0 == owner) ? (long long)(s1.jobs_submitted - before.jobs_submitted) : -1LL,
+               (0 == owner) ? (long long)(m1.circuits - mock_before.circuits) : -1LL,
+               (0 == owner) ? (long long)(m1.late - mock_before.late) : -1LL, owner);
     }
 
     /* ---- the QPU, on the rank that owns it and on the others ---- */
@@ -410,6 +503,8 @@ int main(int argc, char *argv[])
     for( int i = 1; i < test_argc; i++ ) {
         if( 0 == strcmp(argv[i], "-v") ) { verbose = 1; continue; }
         if( 0 == strcmp(argv[i], "-C") ) { expect_shared = 1; continue; }
+        if( 0 == strcmp(argv[i], "-y") ) { colour_sync = 1; continue; }
+        if( 0 == strcmp(argv[i], "-M") ) { machine = 1; continue; }
         if( i + 1 >= test_argc ) { fprintf(stderr, "testing_qaoa: %s needs a value\n", argv[i]); return 1; }
         if(      0 == strcmp(argv[i], "-i") ) { name = argv[++i]; chosen = 1; }
         else if( 0 == strcmp(argv[i], "-g") ) { generated = argv[++i]; chosen = 1; }
@@ -420,6 +515,7 @@ int main(int argc, char *argv[])
         else if( 0 == strcmp(argv[i], "-P") ) { cfg.patience = atoi(argv[++i]); chosen = 1; }
         else if( 0 == strcmp(argv[i], "-S") ) { cfg.seed = strtoull(argv[++i], NULL, 0); chosen = 1; }
         else if( 0 == strcmp(argv[i], "-c") ) compare = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-L") ) log_prefix = argv[++i];
         else if( 0 == strcmp(argv[i], "-F") ) {
             const char *mode = argv[++i];
             if(      0 == strcmp(mode, "none") )  fail_mode = FAIL_NONE;
@@ -435,9 +531,8 @@ int main(int argc, char *argv[])
 
     if( chosen ) {
         if( NULL != generated ) {
-            int k = 0, n = 0, c = 0, x = 0;
-            if( (4 != sscanf(generated, "%d:%d:%d:%d", &k, &n, &c, &x)) || (0 != qaoa_instance_blocks(&inst, k, n, c, x, cfg.seed)) ) {
-                fprintf(stderr, "testing_qaoa: -g takes blocks:vertices:chords:cross, and %s is not a graph that exists\n", generated);
+            if( 0 != qaoa_instance_spec(&inst, generated, cfg.seed) ) {
+                fprintf(stderr, "testing_qaoa: -g takes [ring|grid|complete|rand:]blocks:vertices:chords:cross, and %s is not a graph that exists\n", generated);
                 parsec_tests_abort(parsec, 1);
             }
         } else if( 0 != qaoa_instance_named(&inst, (NULL != name) ? name : "ring64") ) {

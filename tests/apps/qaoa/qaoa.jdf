@@ -61,6 +61,19 @@ extern "C" %{
  * data flow whose guards are all false is never satisfied. So BUILD proposes
  * step 0 itself, and a block with no neighbour reads its boundary from E(b),
  * a tile that holds an empty one.
+ *
+ * The colour-synchronous control (colour_sync). With it, the blocks of a
+ * colour start only once every block of the colour before has had its
+ * update, as in a code that puts a barrier between colours: the JOIN tasks
+ * of a colour form a binary tree, one per block of the colour, each waiting
+ * for the update of its block and for its two children; the root lets the
+ * BUILD tasks of the next colour go. The results are the same; only the
+ * order is stricter. (A tree of tasks and not a gather of controls over a
+ * named range: at this commit the runtime counts some of those wrong.)
+ *
+ * The log (qaoa_taskpool_log): when asked for, EVAL keeps the timestamps of
+ * the result of each job, and BUILD and UPDATE the times an update began
+ * and ended, per process, for the measurements.
  */
 
 #include "qaoa_core.h"
@@ -101,12 +114,55 @@ static int32_t qaoa_violations = 0;
         }                                                                   \
     } while(0)
 
+/* What the colour-synchronous control checks: the updates of each colour of
+ * each round done in this process. A BUILD that is let go by the colour
+ * before finds all of that colour's blocks of this process done. */
+static int32_t *qaoa_phase_done = NULL;
+/* JOIN tasks run in this process since it started. */
+static int32_t qaoa_joins = 0;
+
+/* The log of the measurements, when asked for: one record per job, one per
+ * update, indexed as the tasks are. */
+static qaoa_job_record_t    *qaoa_job_log = NULL;
+static qaoa_update_record_t *qaoa_update_log = NULL;
+#define JOB_RECORD(r, b, t, e)  (&qaoa_job_log[((((size_t)(r) * K + (b)) * T) + (t)) * 2 + (e)])
+#define UPDATE_RECORD(r, b)     (&qaoa_update_log[(size_t)(r) * K + (b)])
+
+/* The blocks of colour c in block order: how many, the i-th, and the place
+ * of block b among those of its colour. */
+static inline int colour_count(const qaoa_instance_t *inst, int c)
+{
+    int n = 0;
+    for( int b = 0; b < inst->part.nb_blocks; b++ ) n += (inst->part.colour[b] == c);
+    return n;
+}
+
+static inline int colour_block(const qaoa_instance_t *inst, int c, int i)
+{
+    for( int b = 0; b < inst->part.nb_blocks; b++ ) {
+        if( (inst->part.colour[b] == c) && (0 == i--) ) return b;
+    }
+    return -1;
+}
+
+static inline int colour_index(const qaoa_instance_t *inst, int b)
+{
+    int i = 0;
+    for( int a = 0; a < b; a++ ) i += (inst->part.colour[a] == inst->part.colour[b]);
+    return i;
+}
+
 /* The tables of the partition, as the dependencies below use them. */
 #define DEG(b)       (inst->part.deg[(b)])
 #define NBR(b, k)    qaoa_block_nbr(&inst->part, (b), (k))
 #define REV(b, k)    qaoa_block_rev(&inst->part, (b), (k))
 /* a is updated before b within a round */
 #define BEFORE(a, b) (inst->part.colour[(a)] < inst->part.colour[(b)])
+#define COLOUR(b)    (inst->part.colour[(b)])
+#define NCOL         (inst->part.nb_colours)
+#define CCOUNT(c)    colour_count(inst, (c))
+#define CBLOCK(c, i) colour_block(inst, (c), (i))
+#define CINDEX(b)    colour_index(inst, (b))
 %}
 
 inst           [ type = "const qaoa_instance_t*" ]
@@ -120,6 +176,7 @@ K              [ type = int ]
 R              [ type = int ]
 T              [ type = int ]
 circuit_bytes  [ type = int ]
+colour_sync    [ type = int ]
 
 /**************************************************
  * INIT(b): the first assignment of block b
@@ -179,12 +236,16 @@ END
  **************************************************/
 BUILD(r, b)
 
-r  = 0 .. R-1
-b  = 0 .. K-1
-dg = %{ return DEG(b); %}
+r    = 0 .. R-1
+b    = 0 .. K-1
+dg   = %{ return DEG(b); %}
+pc   = %{ return (COLOUR(b) > 0) ? COLOUR(b) - 1 : NCOL - 1; %}
+pr   = %{ return (COLOUR(b) > 0) ? r : r - 1; %}
+wait = %{ return colour_sync && (pr >= 0); %}
 
 : X(b)
 
+CTL   Y   <- wait ? J JOIN(pr, pc, 0)
 READ  x   <- (r == 0) ? x INIT(b) : x UPDATE(r-1, b)
 READ  h   <- (dg > 0) ? h GATHER(r, b, dg-1) : E(b)
 WRITE P   <- NEW                                    [ type = LOCAL ]
@@ -203,6 +264,22 @@ BODY
 {
     TRACE("BUILD(%d, %d)", r, b);
     EXPECT_UPDATES(x, r, "BUILD(%d, %d)", r, b);
+    if( NULL != qaoa_update_log ) UPDATE_RECORD(r, b)->t_build = parsec_qpu_now_ns();
+    if( wait ) {
+        /* Let go by the colour before: every block of it in this process
+         * has had its update of that round. */
+        const parsec_data_collection_t *dc = (const parsec_data_collection_t*)X;
+        int mine = 0;
+        for( int a = 0; a < K; a++ ) {
+            mine += (COLOUR(a) == pc) && ((uint32_t)dc->myrank == ((parsec_data_collection_t*)X)->rank_of((parsec_data_collection_t*)X, a));
+        }
+        if( parsec_atomic_fetch_add_int32(&qaoa_phase_done[pr * NCOL + pc], 0) != mine ) {
+            if( 0 == parsec_atomic_fetch_inc_int32(&qaoa_violations) ) {
+                fprintf(stderr, "qaoa: BUILD(%d, %d) started before the %d block(s) of colour %d of round %d in this process had their update\n",
+                        r, b, mine, pc, pr);
+            }
+        }
+    }
     qaoa_local_build((qaoa_local_t*)P, inst, cfg, r, b, (const qaoa_state_t*)x, (const qaoa_boundary_t*)h);
     if( 0 != qaoa_circuit_build((parsec_qpu_circuit_t*)C, (size_t)circuit_bytes, (const qaoa_local_t*)P, cfg) ) {
         fprintf(stderr, "qaoa: the circuit of block %d does not fit in %d bytes\n", b, circuit_bytes);
@@ -292,6 +369,20 @@ BODY
 {
     TRACE("EVAL(%d, %d, %d, %d)", r, b, t, e);
     qaoa_eval((qaoa_eval_t*)F, (const qaoa_local_t*)P, (const parsec_qpu_result_t*)RES);
+    if( NULL != qaoa_job_log ) {
+        const parsec_qpu_result_t *res = (const parsec_qpu_result_t*)RES;
+        qaoa_job_record_t *rec = JOB_RECORD(r, b, t, e);
+        rec->t_hook     = res->t_hook;
+        rec->t_submit   = res->t_submit;
+        rec->t_start    = res->t_start;
+        rec->t_end      = res->t_end;
+        rec->t_retrieve = res->t_retrieve;
+        rec->t_eval     = parsec_qpu_now_ns();
+        rec->batch      = res->batch;
+        rec->attempts   = res->attempts;
+        rec->status     = res->status;
+        rec->done       = 1;
+    }
 }
 END
 
@@ -308,6 +399,7 @@ dg = %{ return DEG(b); %}
 
 READ  S <- S STEP(r, b, T)
 READ  P <- P BUILD(r, b)
+CTL   U -> colour_sync ? U JOIN(r, %{ return COLOUR(b); %}, %{ return CINDEX(b); %})
 RW    x <- (r == 0) ? x INIT(b) : x UPDATE(r-1, b)
         -> (r < R-1) ? x BUILD(r+1, b)
         -> (r < R-1) ? x UPDATE(r+1, b)
@@ -332,6 +424,40 @@ BODY
     report->skipped     = (0 != local->skip);
     report->evaluations = opt->evaluations;
     report->failed      = opt->failed;
+    if( NULL != qaoa_update_log ) UPDATE_RECORD(r, b)->t_update = parsec_qpu_now_ns();
+    if( colour_sync ) (void)parsec_atomic_fetch_inc_int32(&qaoa_phase_done[r * NCOL + COLOUR(b)]);
+}
+END
+
+/**************************************************
+ * JOIN(r, c, i): with colour_sync, the i-th block of colour c and the blocks
+ * below it in the tree (2i+1, 2i+2, ...) have had their update of round r.
+ * The root, JOIN(r, c, 0), lets the next colour go.
+ **************************************************/
+JOIN(r, c, i)
+
+r      = 0 .. %{ return colour_sync ? R-1 : -1; %}
+c      = 0 .. %{ return NCOL - 1; %}
+i      = 0 .. %{ return CCOUNT(c) - 1; %}
+blk    = %{ return CBLOCK(c, i); %}
+n      = %{ return CCOUNT(c); %}
+nnext  = %{ return ((0 == i) && (c + 1 < NCOL)) ? CCOUNT(c + 1) : 0; %}
+nfirst = %{ return ((0 == i) && (c + 1 == NCOL) && (r + 1 < R)) ? CCOUNT(0) : 0; %}
+
+: X(blk)
+
+CTL U <- U UPDATE(r, blk)
+CTL L <- (2 * i + 1 < n) ? J JOIN(r, c, 2 * i + 1)
+CTL H <- (2 * i + 2 < n) ? J JOIN(r, c, 2 * i + 2)
+CTL J -> ((i > 0) && (1 == i % 2)) ? L JOIN(r, c, (i - 1) / 2)
+      -> ((i > 0) && (0 == i % 2)) ? H JOIN(r, c, (i - 1) / 2)
+      -> [ p = 0 .. nnext-1 ] (nnext > 0) ? Y BUILD(r, %{ return CBLOCK(c + 1, p); %})
+      -> [ q = 0 .. nfirst-1 ] (nfirst > 0) ? Y BUILD(r+1, %{ return CBLOCK(0, q); %})
+
+BODY
+{
+    TRACE("JOIN(%d, %d, %d) for block %d", r, c, i, blk);
+    (void)parsec_atomic_fetch_inc_int32(&qaoa_joins);
 }
 END
 
@@ -416,6 +542,11 @@ int qaoa_taskpool_violations(void)
     return (int)qaoa_violations;
 }
 
+int qaoa_taskpool_joins(void)
+{
+    return (int)qaoa_joins;
+}
+
 /* The kinds of data that flow between the tasks, and the size of each. */
 #define QAOA_NB_KINDS 9
 static void qaoa_kinds(const qaoa_sizes_t *sizes, int index[QAOA_NB_KINDS], size_t bytes[QAOA_NB_KINDS])
@@ -434,7 +565,8 @@ static void qaoa_kinds(const qaoa_sizes_t *sizes, int index[QAOA_NB_KINDS], size
 parsec_taskpool_t *qaoa_taskpool_new(const qaoa_instance_t *instance, const qaoa_config_t *config,
                                      parsec_data_collection_t *dcX, parsec_data_collection_t *dcQ,
                                      parsec_data_collection_t *dcA, parsec_data_collection_t *dcG,
-                                     parsec_data_collection_t *dcE, const qaoa_sizes_t *sizes)
+                                     parsec_data_collection_t *dcE, const qaoa_sizes_t *sizes,
+                                     int colour_sync, int log)
 {
     parsec_qaoa_taskpool_t *tp;
     int index[QAOA_NB_KINDS];
@@ -447,7 +579,21 @@ parsec_taskpool_t *qaoa_taskpool_new(const qaoa_instance_t *instance, const qaoa
         (config->layers < 1) || (config->layers > QAOA_MAX_LAYERS) ) return NULL;
 
     tp = parsec_qaoa_new(instance, config, dcX, dcQ, dcA, dcG, dcE,
-                         instance->part.nb_blocks, config->rounds, config->steps, (int)sizes->circuit);
+                         instance->part.nb_blocks, config->rounds, config->steps, (int)sizes->circuit, !!colour_sync);
+
+    /* One taskpool at a time: what these point to is of the last one made. */
+    free(qaoa_phase_done); qaoa_phase_done = NULL;
+    free(qaoa_job_log);    qaoa_job_log    = NULL;
+    free(qaoa_update_log); qaoa_update_log = NULL;
+    if( colour_sync ) {
+        qaoa_phase_done = (int32_t*)calloc((size_t)config->rounds * (size_t)instance->part.nb_colours, sizeof(int32_t));
+    }
+    if( log ) {
+        qaoa_job_log    = (qaoa_job_record_t*)calloc((size_t)config->rounds * instance->part.nb_blocks * config->steps * 2,
+                                                     sizeof(qaoa_job_record_t));
+        qaoa_update_log = (qaoa_update_record_t*)calloc((size_t)config->rounds * instance->part.nb_blocks,
+                                                        sizeof(qaoa_update_record_t));
+    }
 
     qaoa_kinds(sizes, index, bytes);
     for( int i = 0; i < QAOA_NB_KINDS; i++ ) {
@@ -481,6 +627,15 @@ void qaoa_taskpool_free(parsec_taskpool_t *taskpool)
     qaoa_arena_unset(&tp->arenas_datatypes[PARSEC_qaoa_DEFAULT_ADT_IDX]);
     PARSEC_OBJ_DESTRUCT(&tp->arenas_datatypes[PARSEC_qaoa_DEFAULT_ADT_IDX]);
     parsec_taskpool_free(taskpool);
+    free(qaoa_phase_done); qaoa_phase_done = NULL;
+    free(qaoa_job_log);    qaoa_job_log    = NULL;
+    free(qaoa_update_log); qaoa_update_log = NULL;
+}
+
+void qaoa_taskpool_log(const qaoa_job_record_t **jobs, const qaoa_update_record_t **updates)
+{
+    *jobs    = qaoa_job_log;
+    *updates = qaoa_update_log;
 }
 
 %}

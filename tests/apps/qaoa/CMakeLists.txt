@@ -29,4 +29,11 @@ if(PARSEC_HAVE_QPU)
   qaoa_addtest_executable(testing_qaoa SOURCES testing_qaoa.c qaoa_data.c)
   target_ptg_sources(testing_qaoa PRIVATE "qaoa.jdf")
   target_link_libraries(testing_qaoa PRIVATE tests_runtime_common)
+
+  # Baseline B: the same algorithm as a hand-written MPI program, on the
+  # same kernels and the same mock backend, without the runtime.
+  if(MPI_C_FOUND)
+    qaoa_addtest_executable(qaoa_mpi SOURCES qaoa_mpi.c)
+    target_link_libraries(qaoa_mpi PRIVATE MPI::MPI_C Threads::Threads)
+  endif(MPI_C_FOUND)
 endif(PARSEC_HAVE_QPU)

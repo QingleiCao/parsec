@@ -153,10 +153,81 @@ int qaoa_graph_random(qaoa_graph_t *g, int n, int m, uint64_t seed, int zero_one
     return rc;
 }
 
+/* The pairs of groups that have edges between them, for a graph of groups
+ * shaped as `topology`. Returns their number, or -1 for a topology that
+ * does not exist or does not fit nb_blocks. */
+static int block_pairs(const char *topology, int nb_blocks, uint64_t seed, int **pa, int **pb)
+{
+    int n = 0, cap = 16, *a = (int*)malloc((size_t)cap * sizeof(int)), *b = (int*)malloc((size_t)cap * sizeof(int));
+#define PAIR(X, Y)                                                                          \
+    do {                                                                                    \
+        if( n == cap ) {                                                                    \
+            cap *= 2;                                                                       \
+            a = (int*)realloc(a, (size_t)cap * sizeof(int)); b = (int*)realloc(b, (size_t)cap * sizeof(int)); \
+        }                                                                                   \
+        a[n] = (X); b[n] = (Y); n++;                                                        \
+    } while(0)
+
+    if( (0 == strcmp(topology, "ring")) || (0 == strcmp(topology, "rand")) ) {
+        /* Group b and b+1, cyclically: one pair for two groups. */
+        for( int g = 0; (g < nb_blocks) && (nb_blocks > 1); g++ ) {
+            if( (2 == nb_blocks) && (1 == g) ) break;
+            PAIR(g, (g + 1) % nb_blocks);
+        }
+        if( 0 == strcmp(topology, "rand") ) {
+            /* Then pairs drawn from the seed until every group has four
+             * neighbours at least, or all it can have. */
+            int *deg = (int*)calloc((size_t)nb_blocks, sizeof(int));
+            const int want = (nb_blocks - 1 < 4) ? nb_blocks - 1 : 4;
+            uint64_t draw = 0;
+            for( int i = 0; i < n; i++ ) { deg[a[i]]++; deg[b[i]]++; }
+            for( int g = 0; g < nb_blocks; g++ ) {
+                while( deg[g] < want ) {
+                    const int other = (int)(mix(mix(seed ^ 0x7a6e5f) ^ (++draw)) % (uint64_t)nb_blocks);
+                    int have = (other == g);
+                    for( int i = 0; (i < n) && !have; i++ ) {
+                        have = ((a[i] == g) && (b[i] == other)) || ((a[i] == other) && (b[i] == g));
+                    }
+                    if( have ) continue;
+                    PAIR(g, other);
+                    deg[g]++; deg[other]++;
+                }
+            }
+            free(deg);
+        }
+    } else if( 0 == strcmp(topology, "grid") ) {
+        /* A square grid, row after row: each group and the ones to its right and below. */
+        int side = 1;
+        while( side * side < nb_blocks ) side++;
+        if( side * side != nb_blocks ) { free(a); free(b); return -1; }
+        for( int g = 0; g < nb_blocks; g++ ) {
+            if( (g % side) + 1 < side ) PAIR(g, g + 1);
+            if( g + side < nb_blocks )  PAIR(g, g + side);
+        }
+    } else if( 0 == strcmp(topology, "complete") ) {
+        for( int g = 0; g < nb_blocks; g++ ) {
+            for( int h = g + 1; h < nb_blocks; h++ ) PAIR(g, h);
+        }
+    } else {
+        free(a); free(b);
+        return -1;
+    }
+#undef PAIR
+    *pa = a; *pb = b;
+    return n;
+}
+
 int qaoa_graph_blocks(qaoa_graph_t *g, int nb_blocks, int block_size, int chords, int cross, uint64_t seed)
+{
+    return qaoa_graph_blocks_shaped(g, "ring", nb_blocks, block_size, chords, cross, seed);
+}
+
+int qaoa_graph_blocks_shaped(qaoa_graph_t *g, const char *topology, int nb_blocks, int block_size, int chords, int cross,
+                             uint64_t seed)
 {
     edge_list_t list = { NULL, NULL, NULL, 0, 0 };
     uint64_t draw = 0;
+    int *pa = NULL, *pb = NULL, nb_pairs;
     int rc;
 
     if( (nb_blocks < 1) || (block_size < 1) || (chords < 0) || (cross < 0) ) return -1;
@@ -164,6 +235,7 @@ int qaoa_graph_blocks(qaoa_graph_t *g, int nb_blocks, int block_size, int chords
      * pairs between two groups. */
     if( chords > block_size * (block_size - 1) / 2 - ((block_size >= 3) ? block_size : block_size - 1) ) return -1;
     if( (nb_blocks > 1) && (cross > block_size * block_size) ) return -1;
+    if( 0 > (nb_pairs = block_pairs(topology, nb_blocks, seed, &pa, &pb)) ) return -1;
 
     for( int b = 0; b < nb_blocks; b++ ) {
         const int base = b * block_size, first = list.m;
@@ -182,18 +254,20 @@ int qaoa_graph_blocks(qaoa_graph_t *g, int nb_blocks, int block_size, int chords
             c++;
         }
     }
-    for( int b = 0; (b < nb_blocks) && (nb_blocks > 1) && (cross > 0); b++ ) {
-        const int next = (b + 1) % nb_blocks, first = list.m;
-        if( (2 == nb_blocks) && (1 == b) ) break;       /* the same two groups again */
+    /* The edges between groups, pair after pair. For a ring these are the
+     * draws they always were. */
+    for( int i = 0; (i < nb_pairs) && (cross > 0); i++ ) {
+        const int first = list.m;
         for( int c = 0; c < cross; ) {
             const uint64_t h = mix(mix(seed) ^ (++draw));
-            const int u = b * block_size + (int)(h % (uint64_t)block_size);
-            const int v = next * block_size + (int)((h >> 32) % (uint64_t)block_size);
+            const int u = pa[i] * block_size + (int)(h % (uint64_t)block_size);
+            const int v = pb[i] * block_size + (int)((h >> 32) % (uint64_t)block_size);
             if( edge_list_has(&list, first, u, v) ) continue;
             edge_list_add(&list, u, v, weight_of(mix(h)));
             c++;
         }
     }
+    free(pa); free(pb);
     rc = qaoa_graph_from_edges(g, nb_blocks * block_size, list.m, list.u, list.v, list.w);
     edge_list_free(&list);
     return rc;
@@ -378,6 +452,29 @@ int qaoa_instance_named(qaoa_instance_t *inst, const char *name)
         rc = qaoa_graph_blocks(&inst->graph, 8, 8, 4, 2, 640);
         if( 0 == rc ) rc = qaoa_partition_contiguous(&inst->part, &inst->graph, 8);
     }
+    if( 0 != rc ) qaoa_instance_free(inst);
+    return rc;
+}
+
+int qaoa_instance_spec(qaoa_instance_t *inst, const char *spec, uint64_t seed)
+{
+    char topology[16] = "ring";
+    int k = 0, n = 0, c = 0, x = 0, rc;
+    const char *numbers = spec;
+    const char *colon = strchr(spec, ':');
+
+    if( (NULL != colon) && ((spec[0] < '0') || (spec[0] > '9')) ) {
+        if( (size_t)(colon - spec) >= sizeof(topology) ) return -1;
+        memcpy(topology, spec, (size_t)(colon - spec));
+        topology[colon - spec] = '\0';
+        numbers = colon + 1;
+    }
+    if( 4 != sscanf(numbers, "%d:%d:%d:%d", &k, &n, &c, &x) ) return -1;
+    memset(inst, 0, sizeof(*inst));
+    rc = qaoa_graph_blocks_shaped(&inst->graph, topology, k, n, c, x, seed);
+    if( 0 == strcmp(topology, "ring") ) snprintf(inst->name, sizeof(inst->name), "blocks%dx%d", k, n);
+    else snprintf(inst->name, sizeof(inst->name), "%s%dx%d", topology, k, n);
+    if( 0 == rc ) rc = qaoa_partition_contiguous(&inst->part, &inst->graph, n);
     if( 0 != rc ) qaoa_instance_free(inst);
     return rc;
 }

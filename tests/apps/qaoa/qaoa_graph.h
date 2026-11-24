@@ -82,6 +82,17 @@ int qaoa_graph_random(qaoa_graph_t *g, int n, int m, uint64_t seed, int zero_one
  *  edges; none at all when cross is 0. Vertex v is in group v / block_size. */
 int qaoa_graph_blocks(qaoa_graph_t *g, int nb_blocks, int block_size, int chords, int cross, uint64_t seed);
 
+/** The same with the groups joined as `topology` says, `cross` edges per
+ *  pair of groups that are joined:
+ *    ring      b and b+1, cyclically (what qaoa_graph_blocks does)
+ *    grid      a square grid of groups, row after row (nb_blocks a square)
+ *    complete  every pair
+ *    rand      the ring, and pairs drawn from the seed until every group has
+ *              four neighbours, or all it can have
+ *  Returns -1 for a topology that does not exist or does not fit. */
+int qaoa_graph_blocks_shaped(qaoa_graph_t *g, const char *topology, int nb_blocks, int block_size, int chords, int cross,
+                             uint64_t seed);
+
 /** The cut of an assignment given as one 0/1 byte per vertex. */
 double qaoa_graph_cut(const qaoa_graph_t *g, const unsigned char *x);
 
@@ -130,6 +141,12 @@ int  qaoa_instance_named(qaoa_instance_t *inst, const char *name);
 /** nb_blocks blocks of block_size vertices as qaoa_graph_blocks() makes
  *  them, partitioned by group. For runs of a chosen size. */
 int  qaoa_instance_blocks(qaoa_instance_t *inst, int nb_blocks, int block_size, int chords, int cross, uint64_t seed);
+
+/** An instance from a specification "[TOPOLOGY:]K:N:C:X": K groups of N
+ *  vertices, C chords per group, X edges per pair of joined groups, joined as
+ *  TOPOLOGY says (ring by default; see qaoa_graph_blocks_shaped), one block
+ *  per group. What -g takes in the programs. Returns 0 or -1. */
+int qaoa_instance_spec(qaoa_instance_t *inst, const char *spec, uint64_t seed);
 
 void qaoa_instance_free(qaoa_instance_t *inst);
 

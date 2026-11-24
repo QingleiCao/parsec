@@ -65,6 +65,16 @@ if(PARSEC_HAVE_QPU)
                ${_qaoa} --mca device_qpu_max_outstanding 3 --mca device_qpu_mock_slots 3 --mca device_qpu_max_batch 4)
   qaoa_addtest(apps/qaoa:coalesce:interval ${SHM_TEST_CMD_LIST} apps/qaoa/testing_qaoa -C -i ring64
                ${_qaoa} --mca device_qpu_max_batch 16 --mca device_qpu_submit_interval 2)
+  # The colour-synchronous control (C-sync): every instance under four
+  # settings, the same states, and no block of a colour started before the
+  # colour before was done.
+  qaoa_addtest(apps/qaoa:sync ${SHM_TEST_CMD_LIST} apps/qaoa/testing_qaoa -y ${_qaoa})
+  qaoa_addtest(apps/qaoa:sync:fail ${SHM_TEST_CMD_LIST} apps/qaoa/testing_qaoa -y -F keys ${_qaoa})
+  # Block graphs of other shapes: a grid, all pairs, random pairs; with C-sync on the random one.
+  qaoa_addtest(apps/qaoa:grid ${SHM_TEST_CMD_LIST} apps/qaoa/testing_qaoa -g grid:16:6:2:2 -T 3 -R 3 ${_qaoa})
+  qaoa_addtest(apps/qaoa:complete ${SHM_TEST_CMD_LIST} apps/qaoa/testing_qaoa -g complete:8:5:2:1 -T 3 -R 3 ${_qaoa})
+  qaoa_addtest(apps/qaoa:rand ${SHM_TEST_CMD_LIST} apps/qaoa/testing_qaoa -g rand:12:6:2:2 -T 3 -R 6 -P 1 ${_qaoa})
+  qaoa_addtest(apps/qaoa:rand:sync ${SHM_TEST_CMD_LIST} apps/qaoa/testing_qaoa -y -g rand:12:6:2:2 -T 3 -R 6 -P 1 ${_qaoa})
   # A generated instance, as for a measurement: 8 blocks of 10 qubits, two layers.
   qaoa_addtest(apps/qaoa:generated ${SHM_TEST_CMD_LIST} apps/qaoa/testing_qaoa -g 8:10:4:3 -p 2 -T 4 -R 3 -s 256 ${_qaoa})
 
@@ -79,6 +89,22 @@ if(PARSEC_HAVE_QPU)
     # The QPU on the last rank.
     qaoa_addtest(apps/qaoa:mp:last ${MPI_TEST_CMD_LIST} 4 apps/qaoa/testing_qaoa ${_qaoa} --mca device_qpu_owner_rank -1)
     qaoa_addtest(apps/qaoa:fail:mp ${MPI_TEST_CMD_LIST} 2 apps/qaoa/testing_qaoa -F keys ${_qaoa})
+    # C-sync on three ranks, and with failing evaluations on four.
+    qaoa_addtest(apps/qaoa:sync:mp:3 ${MPI_TEST_CMD_LIST} 3 apps/qaoa/testing_qaoa -y ${_qaoa})
+    qaoa_addtest(apps/qaoa:sync:fail:mp ${MPI_TEST_CMD_LIST} 4 apps/qaoa/testing_qaoa -y -F keys ${_qaoa})
+    # Baseline B, the hand-written MPI program, on 1, 2 and 4 ranks; on a
+    # random block graph with skipped updates; with one job at a time.
+    foreach(_np 1 2 4)
+      qaoa_addtest(apps/qaoa/mpi:${_np} ${MPI_TEST_CMD_LIST} ${_np} apps/qaoa/qaoa_mpi ${_qaoa})
+    endforeach()
+    qaoa_addtest(apps/qaoa/mpi:rand ${MPI_TEST_CMD_LIST} 3 apps/qaoa/qaoa_mpi -g rand:12:6:2:2 -T 3 -R 6 -P 1 ${_qaoa})
+    # More ranks than blocks: a rank with no block takes part in every exchange.
+    qaoa_addtest(apps/qaoa/mpi:spare ${MPI_TEST_CMD_LIST} 4 apps/qaoa/qaoa_mpi -i rand12 ${_qaoa})
+    # C-sync with more ranks than blocks, and a complete block graph (a colour per block).
+    qaoa_addtest(apps/qaoa:sync:spare ${MPI_TEST_CMD_LIST} 4 apps/qaoa/testing_qaoa -y -i rand12 ${_qaoa})
+    qaoa_addtest(apps/qaoa:sync:complete ${MPI_TEST_CMD_LIST} 3 apps/qaoa/testing_qaoa -y -g complete:8:5:2:1 -T 2 -R 2 ${_qaoa})
+    qaoa_addtest(apps/qaoa/mpi:1slot ${MPI_TEST_CMD_LIST} 2 apps/qaoa/qaoa_mpi -g grid:16:6:2:2 -T 3 -R 2
+                 ${_qaoa} --mca device_qpu_max_outstanding 1 --mca device_qpu_mock_slots 1)
     # Tasks that share jobs, the blocks on four ranks; and with failing evaluations, the QPU on the last of three.
     qaoa_addtest(apps/qaoa:coalesce:mp ${MPI_TEST_CMD_LIST} 4 apps/qaoa/testing_qaoa -C ${_qaoa_one})
     qaoa_addtest(apps/qaoa:coalesce:fail:mp ${MPI_TEST_CMD_LIST} 3 apps/qaoa/testing_qaoa -C -F keys
