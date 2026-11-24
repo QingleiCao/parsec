@@ -148,23 +148,28 @@ int __parsec_execute( parsec_execution_stream_t* es,
 
     rc = parsec_select_best_device(task);
     if( PARSEC_ERROR == rc ) return PARSEC_HOOK_RETURN_ERROR;
-    if( PARSEC_DEV_IS_GPU(task->selected_device->type) ) {
+    if( PARSEC_DEV_HAS_LOAD(task->selected_device->type) ) {
         /* counting load on CPU is useless because it would move from 0->1->0 during the span of execute.
          * If we run get_best_device, the caller core is available to run a task, so directly using time_estimate with a 0 base is accurate. */
         parsec_atomic_fetch_add_int64(&task->selected_device->device_load, task->load);
     }
-    else {
+    /* A device that holds no data (a CPU, a QPU) reads its inputs on the host. */
+    if( !PARSEC_DEV_IS_GPU(task->selected_device->type) ) {
         /* For every input flow, check if we received a GPU copy, and revert to the
          * CPU copy since this is a CPU hook. Note: at this point copy versions
          * should be synchronized already from a pushout. */
         for( int i = 0; i < task->task_class->nb_flows; i++ ) {
             /* Ignore output-only flows */
             if( NULL == task->task_class->in[i] ) continue;
+            /* in[] lists the flows that have an input one after the other,
+             * while the data of a task are indexed by flow: a task class with
+             * an output-only flow has them at different positions. */
+            const int f = task->task_class->in[i]->flow_index;
             /* Make sure data_in is not NULL */
-            if( NULL == task->data[i].data_in ) continue;
+            if( NULL == task->data[f].data_in ) continue;
             if( PARSEC_FLOW_ACCESS_NONE == (PARSEC_FLOW_ACCESS_MASK & task->task_class->in[i]->flow_flags) )  continue;  /* control flow */
 
-            parsec_data_copy_t* copy = task->data[i].data_in;
+            parsec_data_copy_t* copy = task->data[f].data_in;
             if(parsec_mca_device_is_gpu(copy->device_index)) {
                 /* A copy whose device reclaimed its memory has nothing to read
                  * from, and the mirror it was emptied into is the only place its
@@ -174,8 +179,8 @@ int __parsec_execute( parsec_execution_stream_t* es,
                     || copy->coherency_state == PARSEC_DATA_COHERENCY_SHARED);
                 assert(NULL != copy->original && NULL != copy->original->device_copies[0]);
                 assert(copy->version == copy->original->device_copies[0]->version);
-                task->data[i].data_in = copy->original->device_copies[0];
-                PARSEC_DATA_COPY_RETAIN(task->data[i].data_in);
+                task->data[f].data_in = copy->original->device_copies[0];
+                PARSEC_DATA_COPY_RETAIN(task->data[f].data_in);
                 PARSEC_DATA_COPY_RELEASE(copy);
             }
             /* The body is about to read these bytes, and a write-back coming
@@ -184,9 +189,9 @@ int __parsec_execute( parsec_execution_stream_t* es,
              * Remember the flows rather than look for them again afterwards, so
              * what is handed back cannot drift from what was taken.
              */
-            assert(i < MAX_PARAM_COUNT);
-            if( parsec_device_data_copy_pin_reader(task->data[i].data_in) ) {
-                task->pinned_input_mask |= (1U << i);
+            assert(f < MAX_PARAM_COUNT);
+            if( parsec_device_data_copy_pin_reader(task->data[f].data_in) ) {
+                task->pinned_input_mask |= (1U << f);
             }
         }
     }
@@ -531,7 +536,7 @@ int __parsec_complete_execution( parsec_execution_stream_t *es,
     PARSEC_PINS(es, COMPLETE_EXEC_BEGIN, task);
 
     if( task->selected_device /* not set for startup tasks */
-     && PARSEC_DEV_IS_GPU(task->selected_device->type) /* load not counted on CPU devices, see the task_load add comment */ ) {
+     && PARSEC_DEV_HAS_LOAD(task->selected_device->type) /* load not counted on CPU devices, see the task_load add comment */ ) {
         parsec_atomic_fetch_add_int64(&task->selected_device->device_load, -task->load);
         assert(task->selected_device->device_load >= 0);
     }

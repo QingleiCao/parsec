@@ -67,6 +67,11 @@ typedef struct parsec_device_base_component_2_0_0 parsec_device_base_component_t
 #define PARSEC_DEV_CUDA       ((uint8_t)(1 << 2))
 #define PARSEC_DEV_HIP        ((uint8_t)(1 << 3))
 #define PARSEC_DEV_LEVEL_ZERO ((uint8_t)(1 << 4))
+/* A quantum processing unit. It holds no data: a task that runs on one reads
+ * and writes host copies, as a CPU task does. It must stay inside
+ * PARSEC_DEV_ANY_TYPE, where every walk over the incarnations of a task
+ * class looks for the end of the list. */
+#define PARSEC_DEV_QPU        ((uint8_t)(1 << 5))
 #define PARSEC_DEV_TEMPLATE   ((uint8_t)(1 << 7))
 #define PARSEC_DEV_ANY_TYPE   ((uint8_t)    0x3f)
 #define PARSEC_DEV_ALL        ((uint8_t)    0x3f)
@@ -76,6 +81,11 @@ typedef struct parsec_device_base_component_2_0_0 parsec_device_base_component_t
 
 #define PARSEC_DEV_GPU_MASK   (PARSEC_DEV_CUDA|PARSEC_DEV_HIP|PARSEC_DEV_LEVEL_ZERO)
 #define PARSEC_DEV_IS_GPU(t)  (0 != ((t) & PARSEC_DEV_GPU_MASK))
+/* The types whose tasks stay with the device after their hook has returned,
+ * until somebody completes them. The scheduler keeps the load of these
+ * devices: the estimated time of the tasks each one holds. */
+#define PARSEC_DEV_LOAD_MASK  (PARSEC_DEV_GPU_MASK|PARSEC_DEV_QPU)
+#define PARSEC_DEV_HAS_LOAD(t) (0 != ((t) & PARSEC_DEV_LOAD_MASK))
 
 /**
  * Translate a device type spelled out in a configuration string into the set
