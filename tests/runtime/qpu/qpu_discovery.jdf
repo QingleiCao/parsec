@@ -1,0 +1,339 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+/**
+ * The QPU as a device: what the runtime knows of it, on every rank.
+ *
+ * Before any task runs, each rank looks at its devices:
+ *   - the type has a name, "qpu", and "all" covers it while "gpu" does not;
+ *   - with QPU support enabled there is exactly one device of that type on
+ *     every rank, and none when it is not enabled (-x);
+ *   - the rank that owns the QPU has its backend open, described as it was
+ *     configured, and no progress thread yet; the other ranks have no
+ *     backend at all.
+ *
+ * Then one task per rank, TRY(r) on rank r, whose only body is of the QPU
+ * type, submits a job. The runtime has to keep that incarnation and select
+ * the QPU device for it on every rank. On the owner the job runs and CHECK(r)
+ * finds its result. On any other rank the task was misplaced: the submission
+ * is refused, the body ends by itself, and nothing wrote the result.
+ *
+ * TRY(r) writes two flows: the result of its job, and a second one that its
+ * body fills by itself before it submits. The runtime has to be told that
+ * both were written, which shows in the version of their copies.
+ *
+ * At the end every rank checks its device again: one task executed, no load
+ * left, and a service only where the QPU is.
+ *
+ * Options, before "--":
+ *   -o RANK   the rank expected to own the QPU (default 0; -1: the last one;
+ *             -2: no rank, for an owner rank that does not exist)
+ *   -x        QPU support is expected to be off: only the first part runs
+ *   -i        idle: no task is run, so the backend that was opened with the
+ *             device is never used, and has to be closed all the same
+ *   -g N      at least N CUDA devices are expected next to the QPU
+ *   -v        verbose
+ */
+
+#include "qpu_test_common.h"
+#include "parsec/constants.h"
+#include "parsec/parsec_internal.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int verbose = 0;
+static int owner_rank = 0;
+static int32_t nb_errors = 0;
+static int try_seen = 0, check_seen = 0;
+static uint32_t version_before = 0, version_after = 0, aux_before = 0, aux_after = 0;
+static uint32_t pinned_seen = 0, pinned_expected = 0;
+static parsec_hook_return_t try_rc = PARSEC_HOOK_RETURN_DONE;
+
+#define EXPECT(COND, ...)                                                   \
+    do {                                                                    \
+        if( !(COND) ) {                                                     \
+            fprintf(stderr, "qpu_discovery, rank %d: ", rank);              \
+            fprintf(stderr, __VA_ARGS__);                                   \
+            fprintf(stderr, "\n");                                          \
+            errors++;                                                       \
+        }                                                                   \
+    } while(0)
+%}
+
+W        [ type = "parsec_data_collection_t*" ]
+P        [ type = int ]
+
+PREP(r)
+
+r = 0 .. P-1
+
+: W(r)
+
+WRITE C  -> C  TRY(r)
+         -> C  CHECK(r)
+WRITE TH -> TH TRY(r)
+         -> TH CHECK(r)
+
+BODY
+{
+    qpu_test_make_circuit(C, r, 7, 0);
+    qpu_test_make_params(TH, r, 7);
+}
+END
+
+TRY(r)
+
+r = 0 .. P-1
+
+: W(r)
+
+READ  C   <- C  PREP(r)
+READ  TH  <- TH PREP(r)
+WRITE RES -> RES CHECK(r)
+WRITE AUX -> AUX CHECK(r)
+
+BODY [type=QPU]
+{
+    /* The scheduler made this body the reader of its two inputs, each under
+     * its own flow, and of nothing else. (The flows the task writes come
+     * first, so the inputs are not the first flows of the task.) */
+    pinned_seen     = ((parsec_task_t*)this_task)->pinned_input_mask;
+    pinned_expected = (1U << flow_of_qpu_discovery_TRY_for_C.flow_index) |
+                      (1U << flow_of_qpu_discovery_TRY_for_TH.flow_index);
+    memset(RES, 0xff, QPU_TEST_BLOCK);
+    memset(AUX, 0x5c, QPU_TEST_BLOCK);
+    version_before = (uint32_t)_f_RES->version;
+    aux_before     = (uint32_t)_f_AUX->version;
+    try_rc   = PARSEC_QPU_SUBMIT_KEYED(C, TH, RES, 50, qpu_test_key(r, 7));
+    try_seen = 1;
+    /* The task was taken only if the answer is ASYNC. A refusal leaves it
+     * with this body, which then simply ends. */
+    if( PARSEC_HOOK_RETURN_ASYNC == try_rc ) return try_rc;
+}
+END
+
+CHECK(r)
+
+r = 0 .. P-1
+
+: W(r)
+
+READ C   <- C   PREP(r)
+READ TH  <- TH  PREP(r)
+READ RES <- RES TRY(r)
+READ AUX <- AUX TRY(r)
+
+BODY
+{
+    int rank = es->virtual_process->parsec_context->my_rank, errors = 0;
+
+    check_seen = 1;
+    version_after = (uint32_t)_f_RES->version;
+    aux_after     = (uint32_t)_f_AUX->version;
+    for( int i = 0; i < QPU_TEST_BLOCK; i++ ) {
+        if( 0x5c != ((const unsigned char*)AUX)[i] ) {
+            fprintf(stderr, "CHECK(%d): the second flow of the quantum task is not what its body wrote\n", r);
+            errors++;
+            break;
+        }
+    }
+    if( rank == owner_rank ) {
+        errors += qpu_test_check_result(RES, C, TH, 50, qpu_test_key(r, 7), "CHECK", r, 7);
+        /* The runtime was told that the quantum task wrote its result: the
+         * copy is a version further than the body found it. */
+        if( version_after != version_before + 1 ) {
+            fprintf(stderr, "CHECK(%d): the result copy went from version %u to %u across the quantum task\n",
+                    r, version_before, version_after);
+            errors++;
+        }
+        if( aux_after != aux_before + 1 ) {
+            fprintf(stderr, "CHECK(%d): the copy of the second written flow went from version %u to %u across "
+                    "the quantum task\n", r, aux_before, aux_after);
+            errors++;
+        }
+    } else {
+        const unsigned char *bytes = (const unsigned char*)RES;
+        for( int i = 0; i < QPU_TEST_BLOCK; i++ ) {
+            if( 0xff != bytes[i] ) {
+                fprintf(stderr, "CHECK(%d): something wrote the result of a job that was refused\n", r);
+                errors++;
+                break;
+            }
+        }
+    }
+    if( errors > 0 ) nb_errors += errors;
+}
+END
+
+extern "C" %{
+
+int main(int argc, char *argv[])
+{
+    parsec_context_t *parsec;
+    parsec_qpu_discovery_taskpool_t *tp;
+    parsec_data_collection_t *W;
+    parsec_qpu_device_info_t info;
+    parsec_qpu_stats_t stats;
+    parsec_qpu_mock_stats_t mock;
+    int rank = 0, world = 1, rc, test_argc, pargc, errors = 0;
+    int expect_off = 0, expect_gpus = 0, idle = 0, nb_qpus, owner;
+    char **pargv;
+    long total;
+
+    qpu_test_split_args(argc, argv, &test_argc, &pargc, &pargv);
+    for( int i = 1; i < test_argc; i++ ) {
+        if( 0 == strcmp(argv[i], "-v") ) { verbose = 1; continue; }
+        if( 0 == strcmp(argv[i], "-x") ) { expect_off = 1; continue; }
+        if( 0 == strcmp(argv[i], "-i") ) { idle = 1; continue; }
+        if( i + 1 >= test_argc ) break;
+        if( 0 == strcmp(argv[i], "-o") ) owner_rank = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-g") ) expect_gpus = atoi(argv[++i]);
+    }
+
+    rc = parsec_tests_context_init(-1, PARSEC_TEST_THREAD_SERIALIZED, &pargc, &pargv, &parsec, &rank, &world);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_init");
+    if( -1 == owner_rank ) owner_rank = world - 1;
+    owner = (rank == owner_rank);
+
+    /* The type and its name. */
+    EXPECT(PARSEC_DEV_QPU == parsec_device_type_from_name("qpu", 3), "the device type has no name");
+    EXPECT(PARSEC_DEV_QPU == parsec_device_type_from_name("QPU", 3), "the name of the device type depends on its case");
+    EXPECT(0 != (PARSEC_DEV_QPU & parsec_device_type_from_name("all", 3)), "\"all\" does not cover the QPU type");
+    EXPECT(0 == (PARSEC_DEV_QPU & parsec_device_type_from_name("gpu", 3)), "\"gpu\" covers the QPU type");
+    EXPECT(0 != (PARSEC_DEV_QPU & PARSEC_DEV_ANY_TYPE), "the QPU type is outside the types an incarnation may have");
+    EXPECT(!PARSEC_DEV_IS_GPU(PARSEC_DEV_QPU), "the QPU type is taken for a GPU type");
+
+    /* What this rank has, before any task. */
+    nb_qpus = parsec_context_query(parsec, PARSEC_CONTEXT_QUERY_DEVICES, PARSEC_DEV_QPU);
+    rc = parsec_qpu_device_info(0, &info);
+    parsec_qpu_service_stats(&stats);
+    parsec_qpu_mock_stats(&mock);
+
+    if( expect_gpus > 0 ) {
+        int nb_gpus = parsec_context_query(parsec, PARSEC_CONTEXT_QUERY_DEVICES, PARSEC_DEV_CUDA);
+        if( 0 == nb_gpus ) {
+            /* This machine has no CUDA device to put next to a QPU.
+             * A skip, not a pass (see SKIP_RETURN_CODE in tests/CMakeLists.txt). */
+            parsec_warning("qpu_discovery -g can only run if at least one CUDA device is present");
+            rc = parsec_tests_context_fini(&parsec);
+            PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
+            return -PARSEC_ERR_DEVICE;
+        }
+        EXPECT(nb_gpus >= expect_gpus, "%d CUDA device(s) next to the QPU, expected at least %d", nb_gpus, expect_gpus);
+    }
+
+    if( expect_off ) {
+        EXPECT(0 == nb_qpus, "%d QPU device(s) in a context that did not ask for one", nb_qpus);
+        EXPECT(PARSEC_ERR_NOT_FOUND == rc, "a QPU device is described in a context that did not ask for one (%d)", rc);
+        EXPECT(0 == mock.opens, "a backend was opened in a context that did not ask for a QPU");
+        EXPECT(0 == stats.backend_open, "a backend is open in a context that did not ask for a QPU");
+        EXPECT(0 == stats.running, "a progress thread runs in a context that did not ask for a QPU");
+        goto done;
+    }
+
+    EXPECT(1 == nb_qpus, "%d QPU device(s), expected 1", nb_qpus);
+    EXPECT(PARSEC_SUCCESS == rc, "the QPU device is not described (%d)", rc);
+    EXPECT(PARSEC_ERR_BAD_PARAM == parsec_qpu_device_info(0, NULL),
+           "a description was asked for without a place to put it, and that was not refused");
+    if( PARSEC_SUCCESS != rc ) goto done;
+    {
+        parsec_qpu_device_info_t second;
+        EXPECT(PARSEC_ERR_NOT_FOUND == parsec_qpu_device_info(1, &second), "a second QPU device is described");
+    }
+    EXPECT(info.device_index >= 1, "the QPU device has index %d", info.device_index);
+    EXPECT((owner_rank < 0) || (info.owner_rank == owner_rank), "the QPU is said to be on rank %d, expected %d",
+           info.owner_rank, owner_rank);
+    EXPECT((NULL != info.backend) && (0 == strcmp(info.backend, "mock")), "the backend is not named mock");
+    EXPECT(0 == stats.running, "a progress thread runs before any quantum task was submitted");
+    EXPECT((owner ? 1 : 0) == stats.backend_open, "a backend is %s on a rank that %s the QPU",
+           stats.backend_open ? "open" : "not open", owner ? "owns" : "does not own");
+    EXPECT((uint64_t)(owner ? 1 : 0) == mock.opens, "the mock was opened %llu time(s) on a rank that %s the QPU",
+           (unsigned long long)mock.opens, owner ? "owns" : "does not own");
+    EXPECT(0 == info.latency_estimate_ns,
+           "the device says a job takes %lld ns before any job ran", (long long)info.latency_estimate_ns);
+    /* What a quantum task counts for in the load of the device. The device
+     * layer left it alone when it weighed the devices by their flop rates,
+     * of which a QPU has none. */
+    EXPECT(PARSEC_QPU_TASK_TIME_NS == parsec_mca_device_get((uint32_t)info.device_index)->time_estimate_default,
+           "the scheduler is given %lld ns per quantum task",
+           (long long)parsec_mca_device_get((uint32_t)info.device_index)->time_estimate_default);
+    errors += qpu_test_check_device(owner, 0);
+    if( verbose ) {
+        printf("rank %d: QPU device %d, backend %s, on rank %d%s; %u qubits, at most %u jobs outstanding\n",
+               rank, info.device_index, info.backend, info.owner_rank, info.is_owner ? " (this one)" : "",
+               info.nb_qubits, info.max_outstanding);
+    }
+
+    if( idle ) goto done;
+
+    /* One quantum task on every rank. */
+    W = qpu_test_placement_new(rank, world, -1);
+    tp = parsec_qpu_discovery_new(W, world);
+    qpu_test_block_type_set(&tp->arenas_datatypes[PARSEC_qpu_discovery_DEFAULT_ADT_IDX]);
+
+    rc = parsec_context_add_taskpool(parsec, (parsec_taskpool_t*)tp);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+    rc = parsec_context_wait(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+
+    EXPECT(try_seen, "the QPU body did not run: the runtime did not select the QPU device for it");
+    EXPECT(pinned_seen == pinned_expected, "the QPU body ran as the reader of the flows %#x, and its inputs are the flows %#x",
+           pinned_seen, pinned_expected);
+    EXPECT(check_seen, "the task that reads the result did not run");
+    if( owner ) {
+        EXPECT(PARSEC_HOOK_RETURN_ASYNC == try_rc, "the submission returned %d on the rank that owns the QPU", (int)try_rc);
+        errors += qpu_test_check_service(1, 1, 0, verbose);
+    } else {
+        EXPECT(PARSEC_HOOK_RETURN_ERROR == try_rc, "the submission returned %d on a rank that does not own the QPU, "
+               "not an error", (int)try_rc);
+        parsec_qpu_service_stats(&stats);
+        parsec_qpu_mock_stats(&mock);
+        EXPECT(0 == stats.running, "a progress thread runs on a rank that does not own the QPU");
+        EXPECT(0 == stats.tasks_submitted, "%llu task(s) were taken on a rank that does not own the QPU",
+               (unsigned long long)stats.tasks_submitted);
+        EXPECT(0 == mock.opens, "a backend was opened on a rank that does not own the QPU");
+        /* The body ended by itself: the scheduler counted the task for the
+         * device it had selected, and took back the load it had added. */
+        errors += qpu_test_check_device(0, 1);
+    }
+    errors += nb_errors;
+
+    qpu_test_block_type_unset(&tp->arenas_datatypes[PARSEC_qpu_discovery_DEFAULT_ADT_IDX]);
+    PARSEC_OBJ_DESTRUCT(&tp->arenas_datatypes[PARSEC_qpu_discovery_DEFAULT_ADT_IDX]);
+    parsec_taskpool_free((parsec_taskpool_t*)tp);
+    qpu_test_placement_free(W);
+
+  done:
+    total = qpu_test_sum(parsec, errors);
+    rc = parsec_tests_context_fini(&parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
+
+    /* Whatever was opened is closed, used or not, and nothing runs. */
+    parsec_qpu_service_stats(&stats);
+    if( stats.backend_open || stats.running ) {
+        fprintf(stderr, "qpu_discovery, rank %d: after the context was finalized, %s\n", rank,
+                stats.running ? "a progress thread still runs" : "a backend is still open");
+        total++;
+    }
+    if( PARSEC_ERR_NOT_FOUND != parsec_qpu_device_info(0, &info) ) {
+        fprintf(stderr, "qpu_discovery, rank %d: a QPU device is described after the context was finalized\n", rank);
+        total++;
+    }
+
+    if( 0 == rank ) {
+        printf("qpu_discovery: %d rank(s), %s: %s\n", world,
+               expect_off ? "no QPU expected" : ((owner_rank < 0) ? "no rank owns the QPU" : "one rank owns the QPU"),
+               total ? "FAILED" : "passed");
+    }
+    return total ? 1 : 0;
+}
+
+%}

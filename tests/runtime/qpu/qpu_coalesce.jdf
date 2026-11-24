@@ -1,0 +1,1046 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+/**
+ * Tasks whose circuits go to the backend in one job.
+ *
+ *   GATE(0)   opens once the job of QEXEC(0) is at the backend    on the QPU's rank
+ *   PREP(k)   writes a circuit and its parameters                 on rank k mod P
+ *   QEXEC(k)  submits them and returns ASYNC                      on the QPU's rank
+ *   CHECK(k)  verifies the result against the inputs              on rank k mod P
+ *
+ * QEXEC(0) waits for its inputs only; every other QEXEC also waits for the
+ * gate. So the job of task 0 is at the backend, alone, when the other tasks
+ * are let go, and the backend is held inside that submission until every
+ * one of them has been given to the QPU service. QEXEC(k) has priority
+ * NT - k, so the tasks that wait are taken in the order 1, 2, 3, ... From
+ * then on nothing depends on timing: NT-1 tasks wait together, and which of
+ * them go into which job is a function of the limits alone, which the test
+ * computes and compares, job by job and task by task:
+ *   - one job at a time, or a minimum time between two submissions: jobs of
+ *     device_qpu_max_batch tasks, the last one of what is left;
+ *   - several places free at the backend: the tasks spread evenly over them,
+ *     so that with a place for each no task shares a job.
+ * (The gate is in front of the quantum tasks, which run on its rank, and
+ * not in front of the PREP tasks: a control dependency that reaches a task
+ * class with no data input from another rank is taken for data by the
+ * receiving rank, see the design document.)
+ *
+ * What a run checks, whatever the limits:
+ *   - every CHECK ran once, and the result it received is the one of its own
+ *     inputs: the counts the sampler gives, outside any runtime, for the
+ *     same circuit, parameter values and key. A task gets the same counts in
+ *     a job of its own and in a job it shares;
+ *   - no job carried more tasks than allowed, tasks that asked for different
+ *     numbers of shots, or a task that had a job before with another task;
+ *   - a job ran for the time of a job plus the time of each of its circuits;
+ *   - the number of tasks that say they shared a job of b is a multiple of
+ *     b, and the jobs add up to what the service and the backend counted.
+ *
+ * Options, before "--":
+ *   -n NT       number of tasks (default 17)
+ *   -s SHOTS    shots per job (default 100)
+ *   -d US       time one circuit runs at the backend (default 500)
+ *   -m free     no gate: the tasks arrive as they come, and only what holds
+ *               whatever the timing is checked
+ *   -p 0        the quantum tasks have no priority: those that wait are
+ *               taken in the order they arrived in, which is nobody's to
+ *               say, so the jobs are compared by what they carry and not by
+ *               whom. For a scheduler that gives tasks priorities of its
+ *               own (rnd), and for one that cannot take tasks with
+ *               priorities at this commit (llp, in a build that checks its
+ *               lists: the existing dsl/ptg/startup fails the same way)
+ *   -a          the tasks ask for one more shot three by three (3, 4, 5 do,
+ *               6, 7, 8 do not, ...): a job ends where the number of shots
+ *               changes, and no task is taken from behind one that cannot
+ *               share
+ *   -f K        the circuit of task K fails once: the job that carries it
+ *               fails, and each of its tasks gets a job of its own
+ *   -F K        the circuit of task K fails every time: the tasks that were
+ *               with it end well, and task K completes with a failure
+ *   -w N        with -f or -F: the last N tasks have the highest priority,
+ *               and are let go while the job that is going to fail is at the
+ *               backend. When it has failed, they are ahead of its tasks,
+ *               which wait to be tried again: the job they make ends where
+ *               those begin, since a task that had a job goes alone
+ *   -c K        the job that carries the circuit of task K is cancelled at
+ *               the provider: its tasks complete as cancelled, and none is
+ *               tried again
+ *   -u          the backend takes the job of task 0 and loses every answer
+ *               after that: the job that is asked for next, with the tasks
+ *               it carries, is given up on when that has lasted
+ *               device_qpu_unavailable_timeout, and its tasks and those that
+ *               wait complete as unavailable (one job at a time)
+ *   -A          stop the QPU service by hand while a job of several tasks is
+ *               at the backend and others wait, as the end of a context
+ *               that did not wait for its taskpool does: every task that
+ *               is left is counted, and none is completed. The taskpool
+ *               can then never end, so the program leaves at once (one
+ *               job at a time, one rank, and circuits that run for long
+ *               enough to be caught in flight: -d 100000). With -u, the
+ *               service is stopped while that job is being asked for
+ *   -x          the mock injects faults of its own (device_qpu_mock_faults):
+ *               jobs may fail, hang, be refused, be cancelled or lose their
+ *               answer, and a task may end without a result. What is
+ *               checked is what holds all the same: a result that is there
+ *               is the right one, every task completes once, nothing is
+ *               left behind, no job carries what it may not, and each kind
+ *               of fault that was asked for did happen
+ *   -v          verbose
+ * The limits are those of the QPU device: device_qpu_max_batch,
+ * device_qpu_max_outstanding, device_qpu_submit_interval,
+ * device_qpu_mock_max_circuits, and device_qpu_mock_job_delay for the time of
+ * a job. -f, -F, -c and -u are for one job at a time.
+ */
+
+#include "qpu_test_common.h"
+#include "parsec/sys/atomic.h"
+
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#define MAX_BATCH_SEEN  256          /* job sizes and attempt counts the histograms tell apart */
+#define MEMBERS_KEPT    64           /* tasks of a job the test remembers: what the mock takes by default */
+#define WAIT_LIMIT_NS   30000000000LL
+/* How long the job of task 0 goes on once the other tasks are all with the
+ * service: long enough for them to be put into jobs while it is there, on
+ * any machine that is not stopped. */
+#define FIRST_JOB_NS    50000000LL
+
+static int verbose = 0;
+static int gated = 1;
+static int nt_tasks = 0;
+static int base_shots = 100;
+static int alternate = 0;
+static int fail_once = -1, fail_always = -1, cancel_job = -1;
+static int wave2 = 0;                    /* tasks that are let go later, ahead of everything */
+static int priorities = 1;               /* the quantum tasks have one */
+static int mock_faults = 0;              /* faults come from the parameters of the mock */
+static int lose_after_first = 0;         /* every answer after that of the first job is lost */
+static int stop_in_flight = 0;           /* stop the service with work left */
+static int64_t circuit_ns = 500000;
+static int32_t nb_errors = 0;
+
+/* Per task, on the rank that ran its CHECK. */
+static int32_t *executed = NULL;
+static int32_t *seen_batch = NULL, *seen_attempts = NULL, *seen_status = NULL;
+static int32_t *seen_longer = NULL;      /* its job ran for longer than its circuits make */
+
+/* The gate. */
+static int32_t first_at_backend = 0;     /* the job of task 0 is being submitted */
+static int32_t others_given = 0;         /* tasks other than 0 that are with the QPU service */
+static int32_t gate_timed_out = 0;
+static int64_t gate_since = 0;           /* when the gate was first tried; its task runs on one thread at a time */
+static int64_t gate2_since = 0;
+static int64_t first_job_until = 0;      /* the job of task 0 is at the backend until then at least */
+static int32_t second_wave_open = 0;     /* the job that is going to fail is being submitted */
+static int32_t wave2_given = 0;          /* tasks of the second wave that are with the QPU service */
+
+/* Every job the backend created, as its circuits were shown to the test:
+ * written by the progress thread, read by the main thread at the end. */
+typedef struct {
+    uint64_t tag;
+    int64_t  created;                /* when its first circuit was shown */
+    int      nb;
+    uint32_t shots;
+    int      mixed_shots;
+    uint32_t min_attempt, max_attempt;
+    int      has_fault_key;
+    int      k[MEMBERS_KEPT];        /* its tasks, in the order the backend was given them */
+} seen_job_t;
+
+static pthread_mutex_t jobs_lock = PTHREAD_MUTEX_INITIALIZER;
+static seen_job_t *jobs_seen = NULL;
+static int nb_jobs_seen = 0, cap_jobs_seen = 0;
+
+static void pause_ns(long ns)
+{
+    struct timespec ts = { 0, ns };
+    nanosleep(&ts, NULL);
+}
+
+/* What task k asks for. */
+static inline int shots_of(int k)
+{
+    return base_shots + ((alternate && ((k / 3) & 1)) ? 1 : 0);
+}
+
+/* The task whose circuit has a fate of its own, or -1. */
+static inline int faulty_task(void)
+{
+    return (fail_once >= 0) ? fail_once : (fail_always >= 0) ? fail_always : cancel_job;
+}
+
+/* The time of one circuit. The mock asks for it once per circuit of every
+ * job it creates, with the tag of the job: that is how the test sees what
+ * each job carries. */
+static int64_t coalesce_delay(uint64_t tag, const parsec_qpu_request_t *request, void *arg)
+{
+    const int k = qpu_test_key_a(request->key);
+    seen_job_t *job = NULL;
+
+    (void)arg;
+    pthread_mutex_lock(&jobs_lock);
+    if( (nb_jobs_seen > 0) && (jobs_seen[nb_jobs_seen - 1].tag == tag) ) {
+        job = &jobs_seen[nb_jobs_seen - 1];
+    } else {
+        if( nb_jobs_seen == cap_jobs_seen ) {
+            cap_jobs_seen = (0 == cap_jobs_seen) ? 64 : 2 * cap_jobs_seen;
+            jobs_seen = (seen_job_t*)realloc(jobs_seen, (size_t)cap_jobs_seen * sizeof(seen_job_t));
+        }
+        job = &jobs_seen[nb_jobs_seen++];
+        memset(job, 0, sizeof(*job));
+        job->tag         = tag;
+        job->created     = parsec_qpu_now_ns();
+        job->shots       = request->shots;
+        job->min_attempt = job->max_attempt = request->attempt;
+    }
+    if( job->nb < MEMBERS_KEPT ) job->k[job->nb] = k;
+    job->nb++;
+    if( request->shots != job->shots ) job->mixed_shots = 1;
+    if( request->attempt < job->min_attempt ) job->min_attempt = request->attempt;
+    if( request->attempt > job->max_attempt ) job->max_attempt = request->attempt;
+    if( k == faulty_task() ) job->has_fault_key = 1;
+    pthread_mutex_unlock(&jobs_lock);
+
+    if( gated && (0 == k) && (1 == request->attempt) ) {
+        /* The job of task 0 is on its way in. Let the others go, and keep
+         * the backend at this submission until they are all with the
+         * service: they then wait together, whatever the machine is doing.
+         * The time of the job counts from before this call, so it is made
+         * to last that long and some more. */
+        const int64_t t0 = parsec_qpu_now_ns(), give_up = t0 + WAIT_LIMIT_NS;
+        int64_t now;
+
+        PARSEC_QPU_STORE(&first_at_backend, 1);
+        while( PARSEC_QPU_LOAD(&others_given) < nt_tasks - 1 - wave2 ) {
+            if( parsec_qpu_now_ns() > give_up ) {
+                PARSEC_QPU_STORE(&gate_timed_out, 1);
+                break;
+            }
+            pause_ns(50000);
+        }
+        now = parsec_qpu_now_ns();
+        PARSEC_QPU_STORE(&first_job_until, now + FIRST_JOB_NS);
+        return (now - t0) + FIRST_JOB_NS;
+    }
+    if( gated && (wave2 > 0) && (k == faulty_task()) && (1 == request->attempt) ) {
+        /* The job that is going to fail is on its way in. Let the second
+         * wave go, and keep the backend here until its tasks are all with
+         * the service: they are there, ahead of everybody, when this job
+         * fails and its tasks come back to wait. */
+        const int64_t t0 = parsec_qpu_now_ns(), give_up = t0 + WAIT_LIMIT_NS;
+
+        PARSEC_QPU_STORE(&second_wave_open, 1);
+        while( PARSEC_QPU_LOAD(&wave2_given) < wave2 ) {
+            if( parsec_qpu_now_ns() > give_up ) {
+                PARSEC_QPU_STORE(&gate_timed_out, 1);
+                break;
+            }
+            pause_ns(50000);
+        }
+        return (parsec_qpu_now_ns() - t0) + circuit_ns;
+    }
+    return circuit_ns;
+}
+
+/* The fate of a circuit: the one of task K fails, once or every time, or
+ * has its job cancelled; or every answer after the first is lost. */
+static parsec_qpu_mock_fault_t coalesce_fault(uint64_t tag, const parsec_qpu_request_t *request, uint64_t call, void *arg)
+{
+    const int k = qpu_test_key_a(request->key);
+
+    (void)tag; (void)arg;
+    if( lose_after_first ) return (call >= 2) ? PARSEC_QPU_MOCK_LOST : PARSEC_QPU_MOCK_OK;
+    if( (k == fail_always) || ((k == fail_once) && (1 == request->attempt)) ) return PARSEC_QPU_MOCK_FAIL;
+    if( k == cancel_job ) return PARSEC_QPU_MOCK_CANCELLED;
+    return PARSEC_QPU_MOCK_OK;
+}
+%}
+
+W            [ type = "parsec_data_collection_t*" ]
+Q            [ type = "parsec_data_collection_t*" ]
+NT           [ type = int ]
+WAVE2        [ type = int ]
+PRIORITIES   [ type = int ]
+
+GATE(z)
+
+z = 0 .. 0
+
+: Q(0)
+
+CTL X -> X QEXEC(1 .. NT-WAVE2-1)
+
+BODY
+{
+    /* Not open yet: come back later. The body does not wait here, since it
+     * may be on the only worker of its rank, which the tasks it waits for
+     * need. */
+    if( gated && !PARSEC_QPU_LOAD(&first_at_backend) ) {
+        if( 0 == gate_since ) gate_since = parsec_qpu_now_ns();
+        if( parsec_qpu_now_ns() - gate_since < WAIT_LIMIT_NS ) {
+            pause_ns(20000);
+            return PARSEC_HOOK_RETURN_AGAIN;
+        }
+        PARSEC_QPU_STORE(&gate_timed_out, 1);
+    }
+}
+END
+
+GATE2(z)
+
+z = 0 .. 0
+
+: Q(0)
+
+CTL Y -> Y QEXEC(NT-WAVE2 .. NT-1)
+
+BODY
+{
+    /* As the first gate: it opens when the job that is going to fail is
+     * being submitted. */
+    if( gated && (WAVE2 > 0) && !PARSEC_QPU_LOAD(&second_wave_open) ) {
+        if( 0 == gate2_since ) gate2_since = parsec_qpu_now_ns();
+        if( parsec_qpu_now_ns() - gate2_since < WAIT_LIMIT_NS ) {
+            pause_ns(20000);
+            return PARSEC_HOOK_RETURN_AGAIN;
+        }
+        PARSEC_QPU_STORE(&gate_timed_out, 1);
+    }
+}
+END
+
+PREP(k)
+
+k = 0 .. NT-1
+
+: W(k)
+
+WRITE C  -> C  QEXEC(k)
+         -> C  CHECK(k)
+WRITE TH -> TH QEXEC(k)
+         -> TH CHECK(k)
+
+BODY
+{
+    qpu_test_make_circuit(C, k, 0, 0);
+    qpu_test_make_params(TH, k, 0);
+}
+END
+
+QEXEC(k)
+
+k = 0 .. NT-1
+
+: Q(0)
+
+READ  C   <- C  PREP(k)
+READ  TH  <- TH PREP(k)
+WRITE RES -> RES CHECK(k)
+CTL   X   <- ((k > 0) && (k < NT-WAVE2)) ? X GATE(0)
+CTL   Y   <- (k >= NT-WAVE2) ? Y GATE2(0)
+
+/* The first tasks first; the tasks of the second wave ahead of them all. */
+; PRIORITIES * (NT - k + (k / (NT - WAVE2)) * 2 * NT)
+
+BODY [type=QPU]
+{
+    parsec_hook_return_t rc;
+
+    /* Mark the result, so that a successor released too early shows. */
+    memset(RES, 0xff, QPU_TEST_BLOCK);
+    rc = PARSEC_QPU_SUBMIT_KEYED(C, TH, RES, shots_of(k), qpu_test_key(k, 0));
+    /* The task is not this body's any more. What follows touches none of
+     * it: it tells the gate that one more task is with the service. */
+    if( k >= NT - WAVE2 )  (void)parsec_atomic_fetch_inc_int32(&wave2_given);
+    else if( k > 0 )       (void)parsec_atomic_fetch_inc_int32(&others_given);
+    return rc;
+}
+END
+
+CHECK(k)
+
+k = 0 .. NT-1
+
+: W(k)
+
+READ C   <- C   PREP(k)
+READ TH  <- TH  PREP(k)
+READ RES <- RES QEXEC(k)
+
+BODY
+{
+    const parsec_qpu_result_t *result = (const parsec_qpu_result_t*)RES;
+    const int shots = shots_of(k);
+    int errors = 0;
+
+    if( PARSEC_QPU_RESULT_VERSION != result->version ) {
+        fprintf(stderr, "CHECK(%d): result version is %u\n", k, (unsigned)result->version);
+        errors++;
+    } else if( PARSEC_QPU_STATUS_OK == result->status ) {
+        /* Whatever job it was in, and however many it took: the counts are
+         * those of its own inputs and key. */
+        if( ((uint32_t)shots != result->shots_requested) || ((uint32_t)shots != result->shots_returned) ) {
+            fprintf(stderr, "CHECK(%d): %u shots requested and %u returned, expected %d\n",
+                    k, result->shots_requested, result->shots_returned, shots);
+            errors++;
+        }
+        if( !(PARSEC_QPU_RESULT_MOCK & result->flags) ) {
+            fprintf(stderr, "CHECK(%d): the result is not flagged as mock\n", k);
+            errors++;
+        }
+        errors += qpu_test_check_counts(RES, C, TH, shots, qpu_test_key(k, 0), "CHECK", k, 0);
+        /* The job ran for its own time and that of each of its circuits;
+         * longer only when the mock was still sampling them. */
+        {
+            parsec_qpu_delay_t fixed;
+            /* (The job of task 0 is held open by the gate: for some time,
+             * which is not the time of a circuit.) */
+            int64_t expected = (gated && (0 == k)) ? ((FIRST_JOB_NS < circuit_ns) ? FIRST_JOB_NS : circuit_ns)
+                                                   : (int64_t)result->batch * circuit_ns;
+
+            if( PARSEC_SUCCESS == parsec_qpu_delay_parse(&fixed, (NULL != parsec_qpu_params.mock_job_delay)
+                                                                 ? parsec_qpu_params.mock_job_delay : "const:0") ) {
+                expected += parsec_qpu_delay_draw(&fixed, qpu_test_key(k, 0));    /* a constant in these tests */
+                parsec_qpu_delay_fini(&fixed);
+            }
+            if( result->t_end - result->t_start < expected ) {
+                fprintf(stderr, "CHECK(%d): its job of %u circuit(s) ran for %lld ns, less than the %lld ns they take\n",
+                        k, result->batch, (long long)(result->t_end - result->t_start), (long long)expected);
+                errors++;
+            }
+            seen_longer[k] = (result->t_end - result->t_start > expected) && !(gated && (0 == k));
+        }
+    } else if( 0 != result->nb_entries ) {
+        fprintf(stderr, "CHECK(%d): a result with status %u has %u entries\n", k, (unsigned)result->status, result->nb_entries);
+        errors++;
+    }
+    seen_batch[k]    = (int32_t)result->batch;
+    seen_attempts[k] = (int32_t)result->attempts;
+    seen_status[k]   = (int32_t)result->status;
+    if( errors > 0 ) (void)parsec_atomic_fetch_add_int32(&nb_errors, errors);
+    (void)parsec_atomic_fetch_inc_int32(&executed[k]);
+    if( verbose ) {
+        printf("CHECK(%d) on rank %d: status %u, %u job(s), the last of %u task(s)\n", k,
+               es->virtual_process->parsec_context->my_rank, (unsigned)result->status,
+               (unsigned)result->attempts, result->batch);
+    }
+}
+END
+
+extern "C" %{
+
+#define EXPECT(COND, ...)                                                   \
+    do {                                                                    \
+        if( !(COND) ) {                                                     \
+            fprintf(stderr, "qpu_coalesce: ");                              \
+            fprintf(stderr, __VA_ARGS__);                                   \
+            fprintf(stderr, "\n");                                          \
+            nb_errors++;                                                    \
+        }                                                                   \
+    } while(0)
+
+/* How the tasks 1 .. nt-1, which wait together in that order, go into jobs
+ * once the job of task 0 is alone at the backend. Returns the number of jobs
+ * after that one, their sizes in sizes[], or -1 when that depends on which
+ * job ends first. */
+static int expected_jobs(int nt, int limit, int outstanding, int interval_ms, int *sizes)
+{
+    const int one_at_a_time = (1 == outstanding) || (interval_ms > 0);
+    int next = 1, n = 0, places = outstanding - 1;
+
+    while( next < nt ) {
+        const int left = nt - next;
+        int want, nb = 1;
+
+        if( one_at_a_time ) {
+            /* One submission at a time: each takes all it may. */
+            want = left;
+        } else {
+            /* The places that are free at once. If they cannot take all
+             * the tasks, what is left goes with whichever job ends first. */
+            if( 0 == places ) return -1;
+            want = (left + places - 1) / places;
+            places--;
+        }
+        if( want > limit ) want = limit;
+        /* A job ends before the first task that cannot share it. */
+        while( (nb < want) && (shots_of(next + nb) == shots_of(next)) ) nb++;
+        sizes[n++] = nb;
+        next += nb;
+    }
+    return n;
+}
+
+/* With one job at a time: the job that carries task k the first time (0 is
+ * the job of task 0), and how many tasks it carries. */
+static int first_job_of(int k, int nt, int limit, int *size)
+{
+    int next = 1, job = 0, nb = 1;
+
+    if( 0 == k ) { *size = 1; return 0; }
+    for(;;) {
+        const int left = nt - next;
+
+        nb = 1;
+        while( (nb < left) && (nb < limit) && (shots_of(next + nb) == shots_of(next)) ) nb++;
+        job++;
+        if( k < next + nb ) break;
+        next += nb;
+    }
+    *size = nb;
+    return job;
+}
+
+/* The jobs a task may have, as the service counts them. */
+static int max_attempts_of_a_task(void)
+{
+    const int retries = parsec_qpu_params.max_retries;
+
+    return 1 + ((retries > 0) ? ((retries < 200) ? retries : 200) : 0);
+}
+
+/* -A: wait until the job of task 0 has ended, a job of several tasks is at
+ * the backend (or, with -u, is being asked for) and the rest wait; stop the
+ * service there, as the end of a context that was not waited for does; say
+ * what was found and leave. The tasks that were given up never complete, so
+ * neither does the taskpool: there is no context to wait for or to finalize. */
+static void *stop_with_work_left(void *arg)
+{
+    const int nt = nt_tasks;
+    const int64_t give_up = parsec_qpu_now_ns() + WAIT_LIMIT_NS;
+    parsec_qpu_stats_t stats;
+    int abandoned, problems = 0;
+
+    (void)arg;
+    for(;;) {
+        parsec_qpu_service_stats(&stats);
+        if( lose_after_first ? ((stats.submit_deferred >= 1) && (0 == stats.in_flight) && (1 == stats.tasks_completed))
+                             : ((stats.jobs_coalesced >= 1) && (1 == stats.in_flight)) ) break;
+        if( parsec_qpu_now_ns() > give_up ) {
+            fprintf(stderr, "qpu_coalesce: no job of several tasks was at the backend after %lld s: %llu task(s) submitted, "
+                    "%llu completed, %u job(s) in flight, %u task(s) waiting, %llu submission(s) not taken\n",
+                    (long long)(WAIT_LIMIT_NS / 1000000000LL),
+                    (unsigned long long)stats.tasks_submitted, (unsigned long long)stats.tasks_completed,
+                    stats.in_flight, stats.pending, (unsigned long long)stats.submit_deferred);
+            problems++;
+            break;
+        }
+        pause_ns(100000);
+    }
+    abandoned = parsec_qpu_service_fini();
+    /* Task 0 is done; a job of several tasks was in flight or being asked
+     * for, and all the others waited or were in it. */
+    if( (0 == problems) && ((1 != stats.tasks_completed) || (abandoned != nt - 1)) ) {
+        fprintf(stderr, "qpu_coalesce: the service was stopped with %llu task(s) completed and gave up %d; expected 1 and %d\n",
+                (unsigned long long)stats.tasks_completed, abandoned, nt - 1);
+        problems++;
+    }
+    parsec_qpu_service_stats(&stats);
+    if( stats.running || stats.backend_open ) {
+        fprintf(stderr, "qpu_coalesce: the service was stopped and %s\n",
+                stats.running ? "its progress thread runs" : "its backend is open");
+        problems++;
+    }
+    /* Task 0 was handed back before the job of several tasks went in; the
+     * worker that completes it and runs CHECK(0) may still be at it. */
+    while( (1 != PARSEC_QPU_LOAD(&executed[0])) && (parsec_qpu_now_ns() < give_up) ) pause_ns(100000);
+    if( 1 != PARSEC_QPU_LOAD(&executed[0]) ) {
+        fprintf(stderr, "qpu_coalesce: CHECK(0) ran %d time(s), and its quantum task completed before the service was stopped\n",
+                executed[0]);
+        problems++;
+    }
+    for( int k = 1; k < nt; k++ ) {
+        if( 0 != PARSEC_QPU_LOAD(&executed[k]) ) {
+            fprintf(stderr, "qpu_coalesce: CHECK(%d) ran, and its quantum task was given up\n", k);
+            problems++;
+        }
+    }
+    problems += PARSEC_QPU_LOAD(&nb_errors);      /* what CHECK(0) found */
+    printf("qpu_coalesce: the service was stopped with %d task(s) left: %s\n", abandoned, problems ? "FAILED" : "passed");
+    fflush(NULL);
+    _exit(problems ? 1 : 0);
+    return NULL;
+}
+
+int main(int argc, char *argv[])
+{
+    parsec_context_t *parsec;
+    parsec_qpu_coalesce_taskpool_t *tp;
+    parsec_data_collection_t *W, *Q;
+    parsec_qpu_device_info_t info;
+    int nt = 17;
+    int rank = 0, world = 1, rc, test_argc, pargc, owner, limit, max_attempts, one_at_a_time, exact;
+    char **pargv;
+    long errors, checks;
+    int64_t hist[2 * (MAX_BATCH_SEEN + 1) + 8], total[2 * (MAX_BATCH_SEEN + 1) + 8];
+    /* hist: [b] tasks that ended well in a job of b; [MAX+1+a] tasks that took a jobs;
+     * then: tasks that did not end well, tasks whose job ran long, tasks out of range,
+     * tasks that were cancelled */
+    int64_t *by_batch = hist, *by_attempts = hist + MAX_BATCH_SEEN + 1, *others = hist + 2 * (MAX_BATCH_SEEN + 1);
+
+    qpu_test_split_args(argc, argv, &test_argc, &pargc, &pargv);
+    for( int i = 1; i < test_argc; i++ ) {
+        if( 0 == strcmp(argv[i], "-v") ) { verbose = 1; continue; }
+        if( 0 == strcmp(argv[i], "-a") ) { alternate = 1; continue; }
+        if( 0 == strcmp(argv[i], "-x") ) { mock_faults = 1; continue; }
+        if( 0 == strcmp(argv[i], "-u") ) { lose_after_first = 1; continue; }
+        if( 0 == strcmp(argv[i], "-A") ) { stop_in_flight = 1; continue; }
+        if( i + 1 >= test_argc ) break;
+        if( 0 == strcmp(argv[i], "-n") ) nt = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-s") ) base_shots = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-d") ) circuit_ns = (int64_t)atol(argv[++i]) * 1000;
+        else if( 0 == strcmp(argv[i], "-m") ) gated = (0 != strcmp(argv[++i], "free"));
+        else if( 0 == strcmp(argv[i], "-f") ) fail_once = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-F") ) fail_always = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-c") ) cancel_job = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-w") ) wave2 = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-p") ) priorities = (0 != atoi(argv[++i]));
+    }
+    if( (nt <= 0) || (base_shots <= 0) || (circuit_ns < 0) || (faulty_task() >= nt) ||
+        ((fail_once >= 0) + (fail_always >= 0) + (cancel_job >= 0) + mock_faults + lose_after_first > 1) ||
+        (stop_in_flight && ((faulty_task() >= 0) || mock_faults)) ||
+        (((faulty_task() >= 0) || lose_after_first || stop_in_flight) && (!gated || alternate)) ||
+        (wave2 < 0) || ((wave2 > 0) && (((fail_once < 0) && (fail_always < 0)) || (2 * wave2 >= nt) || (faulty_task() >= nt - wave2) ||
+                                      (faulty_task() < 1))) ||
+        (!priorities && (alternate || (wave2 > 0))) ) {
+        fprintf(stderr, "qpu_coalesce: -n and -s must be positive; -f, -F or -c names one task; of -f, -F, -c, -x and -u one "
+                "is given at most; -A goes alone or with -u; none of these goes with -m free or -a; -w goes with -f or -F, "
+                "for a task that is not of the second wave; and -a and -w need the priorities that -p 0 takes away\n");
+        return 1;
+    }
+    if( mock_faults ) gated = 0;       /* what the jobs carry is then not a matter of the limits alone */
+    nt_tasks = nt;
+
+    /* Before the context: the mock is opened when the QPU device is attached. */
+    parsec_qpu_mock_set_delay_fn(coalesce_delay, NULL);
+    /* A fate decided here replaces the faults of the mock's parameters. */
+    if( (faulty_task() >= 0) || lose_after_first ) parsec_qpu_mock_set_fault_fn(coalesce_fault, NULL);
+
+    rc = parsec_tests_context_init(-1, PARSEC_TEST_THREAD_SERIALIZED, &pargc, &pargv, &parsec, &rank, &world);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_init");
+
+    if( PARSEC_SUCCESS != parsec_qpu_device_info(0, &info) ) {
+        fprintf(stderr, "qpu_coalesce: rank %d has no QPU device\n", rank);
+        parsec_tests_abort(parsec, 1);
+    }
+    owner = info.owner_rank;
+    /* The same on every rank: they come from the parameters. */
+    limit         = qpu_test_max_batch();
+    max_attempts  = max_attempts_of_a_task();
+    one_at_a_time = (1 == parsec_qpu_params.max_outstanding) || (parsec_qpu_params.submit_interval_ms > 0);
+    /* What each task reads is known on every rank when the tasks were let
+     * go together and went one job after the other. */
+    exact         = gated && one_at_a_time && (0 == wave2) && priorities;
+    if( ((faulty_task() >= 0) || lose_after_first) && (1 != parsec_qpu_params.max_outstanding) ) {
+        if( 0 == rank ) fprintf(stderr, "qpu_coalesce: -f, -F, -c and -u are for one job at a time (device_qpu_max_outstanding 1)\n");
+        parsec_tests_abort(parsec, 1);
+    }
+
+    executed      = (int32_t*)calloc((size_t)nt, sizeof(int32_t));
+    seen_batch    = (int32_t*)calloc((size_t)nt, sizeof(int32_t));
+    seen_attempts = (int32_t*)calloc((size_t)nt, sizeof(int32_t));
+    seen_status   = (int32_t*)calloc((size_t)nt, sizeof(int32_t));
+    seen_longer   = (int32_t*)calloc((size_t)nt, sizeof(int32_t));
+
+    W = qpu_test_placement_new(rank, world, -1);
+    Q = qpu_test_placement_new(rank, world, owner);
+
+    tp = parsec_qpu_coalesce_new(W, Q, nt, wave2, priorities);
+    qpu_test_block_type_set(&tp->arenas_datatypes[PARSEC_qpu_coalesce_DEFAULT_ADT_IDX]);
+
+    rc = parsec_context_add_taskpool(parsec, (parsec_taskpool_t*)tp);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+    if( stop_in_flight ) {
+        pthread_t stopper;
+
+        if( (1 != world) || (1 != (int)info.max_outstanding) || ((int)info.max_batch < 2) || (nt < 4) ) {
+            fprintf(stderr, "qpu_coalesce: -A needs one rank, one job at a time, jobs of several tasks and four tasks at least\n");
+            parsec_tests_abort(parsec, 1);
+        }
+        /* From a thread of its own: this one has to be in the wait for the
+         * tasks to run at all. */
+        if( 0 != pthread_create(&stopper, NULL, stop_with_work_left, NULL) ) {
+            fprintf(stderr, "qpu_coalesce: could not create a thread\n");
+            parsec_tests_abort(parsec, 1);
+        }
+    }
+
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+
+    rc = parsec_context_wait(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+    if( stop_in_flight ) {
+        /* Not reached: the tasks that were given up never complete. */
+        fprintf(stderr, "qpu_coalesce: the taskpool ended, and the service was to be stopped under it\n");
+        _exit(1);
+    }
+
+    /* ---- every CHECK ran once, on the rank that owns it; what the tasks
+     * say of their jobs, added up over the ranks ---- */
+    memset(hist, 0, sizeof(hist));
+    checks = 0;
+    for( int k = 0; k < nt; k++ ) {
+        const int mine = ((int)W->rank_of(W, k) == rank);
+
+        EXPECT((mine ? 1 : 0) == executed[k], "rank %d: CHECK(%d) ran %d time(s), expected %d", rank, k, executed[k], mine ? 1 : 0);
+        checks += executed[k];
+        if( !mine || (1 != executed[k]) ) continue;
+        if( (seen_batch[k] < 1) || (seen_batch[k] > MAX_BATCH_SEEN) || (seen_attempts[k] < 0) || (seen_attempts[k] > MAX_BATCH_SEEN) ) {
+            others[2]++;
+            continue;
+        }
+        by_attempts[seen_attempts[k]]++;
+        if( PARSEC_QPU_STATUS_OK == seen_status[k] ) by_batch[seen_batch[k]]++;
+        else others[0]++;
+        others[1] += seen_longer[k];
+        if( PARSEC_QPU_STATUS_CANCELLED == seen_status[k] ) others[3]++;
+
+        if( exact ) {
+            /* What this task reads: the status, how many jobs it took, and
+             * how many tasks the last of them carried. */
+            const int faulty = faulty_task();
+            int size = 1, with_faulty = 0, f_size = 1;
+            int status = PARSEC_QPU_STATUS_OK, attempts = 1, batch;
+
+            if( faulty >= 0 ) with_faulty = (first_job_of(k, nt, limit, &size) == first_job_of(faulty, nt, limit, &f_size));
+            (void)first_job_of(k, nt, limit, &size);
+            batch = size;
+            if( lose_after_first ) {
+                /* No answer came after the job of task 0: the others never had a job. */
+                if( k > 0 ) { status = PARSEC_QPU_STATUS_UNAVAILABLE; attempts = 0; batch = 1; }
+            } else if( with_faulty && (cancel_job >= 0) ) {
+                status = PARSEC_QPU_STATUS_CANCELLED;
+            } else if( with_faulty && (1 == max_attempts) ) {
+                /* The job failed, and that was the one job of each of its tasks. */
+                status = PARSEC_QPU_STATUS_FAILED;
+            } else if( with_faulty && (k == fail_always) ) {
+                /* Every job it may have, the others alone. */
+                status = PARSEC_QPU_STATUS_FAILED; attempts = max_attempts; batch = 1;
+            } else if( with_faulty ) {
+                /* One more job, alone, and that one worked. */
+                attempts = 2; batch = 1;
+            }
+            EXPECT((status == seen_status[k]) && (attempts == seen_attempts[k]) && (batch == seen_batch[k]),
+                   "CHECK(%d): status %d after %d job(s), the last of %d task(s); expected status %d after %d job(s), the last of %d",
+                   k, seen_status[k], seen_attempts[k], seen_batch[k], status, attempts, batch);
+        } else if( !mock_faults ) {
+            /* (With faults of the mock's own, the fate of a task is the mock's to draw.) */
+            const int status = ((k == fail_always) && (max_attempts > 1)) ? PARSEC_QPU_STATUS_FAILED : PARSEC_QPU_STATUS_OK;
+            EXPECT((status == seen_status[k]) || ((faulty_task() >= 0) && (1 == max_attempts)),
+                   "CHECK(%d): status %d, expected %d", k, seen_status[k], status);
+        }
+    }
+    memcpy(total, hist, sizeof(hist));
+    if( PARSEC_SUCCESS != parsec_tests_allreduce(parsec, hist, total, (int)(sizeof(hist) / sizeof(hist[0])),
+                                                 parsec_datatype_int64_t, PARSEC_TESTS_REDUCE_SUM) ) {
+        memcpy(total, hist, sizeof(hist));
+    }
+    by_batch = total; by_attempts = total + MAX_BATCH_SEEN + 1; others = total + 2 * (MAX_BATCH_SEEN + 1);
+
+    if( rank != owner ) {
+        nb_errors += qpu_test_check_service(0, 0, 0, 0);
+    } else {
+        const int faulty = faulty_task();
+        parsec_qpu_stats_t stats;
+        parsec_qpu_mock_stats_t mock;
+        int64_t jobs_by_tasks = 0, tasks_ok = 0, circuits_seen = 0, coalesced_jobs = 0, coalesced_tasks = 0;
+        int with_faulty = 0;       /* tasks in the job that carried the faulty circuit the first time */
+        seen_job_t *jobs;
+        int nb_jobs, next_task = 0, in_order = 1;
+
+        parsec_qpu_service_stats(&stats);
+        parsec_qpu_mock_stats(&mock);
+        /* The jobs the test saw, taken out from under the lock the progress
+         * thread fills them in: nothing below holds it while it asks the
+         * service or the mock for anything. */
+        pthread_mutex_lock(&jobs_lock);
+        nb_jobs = nb_jobs_seen;
+        jobs    = (seen_job_t*)malloc((size_t)(nb_jobs > 0 ? nb_jobs : 1) * sizeof(seen_job_t));
+        if( nb_jobs > 0 ) memcpy(jobs, jobs_seen, (size_t)nb_jobs * sizeof(seen_job_t));
+        pthread_mutex_unlock(&jobs_lock);
+
+        EXPECT(!gate_timed_out, "the gate did not open in %lld s", (long long)(WAIT_LIMIT_NS / 1000000000LL));
+        EXPECT((limit >= 1) && (limit == (int)info.max_batch), "the device puts at most %u task(s) in a job, the parameters say %d",
+               info.max_batch, limit);
+
+        /* ---- what holds whatever the timing ---- */
+        nb_errors += qpu_test_check_invariants(nt, verbose);
+        EXPECT(0 == others[2], "%lld task(s) say their job carried no task, or more than %d", (long long)others[2], MAX_BATCH_SEEN);
+        for( int b = 1; b <= MAX_BATCH_SEEN; b++ ) {
+            EXPECT((0 == by_batch[b]) || (b <= limit), "%lld task(s) say they were in a job of %d, the limit is %d",
+                   (long long)by_batch[b], b, limit);
+            EXPECT(0 == by_batch[b] % b, "%lld task(s) say they were in a job of %d: not a whole number of jobs",
+                   (long long)by_batch[b], b);
+            jobs_by_tasks += by_batch[b] / b;
+            tasks_ok      += by_batch[b];
+        }
+        EXPECT(tasks_ok + others[0] == nt, "%lld tasks ended well and %lld did not, of %d", (long long)tasks_ok, (long long)others[0], nt);
+        EXPECT(others[0] == (int64_t)stats.tasks_failed, "%lld tasks read a status other than OK, the service completed %llu without a result",
+               (long long)others[0], (unsigned long long)stats.tasks_failed);
+        /* The jobs that gave a result are the jobs the backend took, less
+         * those that failed or were cancelled at the provider. (With faults
+         * of the mock's own, a job can also be refused or time out, which
+         * other counters hold.) */
+        if( !mock_faults && !lose_after_first ) {
+            EXPECT(jobs_by_tasks == (int64_t)stats.jobs_submitted - (int64_t)stats.jobs_failed - (int64_t)mock.provider_cancels,
+                   "the tasks account for %lld job(s) that ended well; the service counts %llu jobs, of which %llu failed and "
+                   "%llu were cancelled", (long long)jobs_by_tasks, (unsigned long long)stats.jobs_submitted,
+                   (unsigned long long)stats.jobs_failed, (unsigned long long)mock.provider_cancels);
+        } else {
+            EXPECT(jobs_by_tasks <= (int64_t)stats.jobs_submitted, "the tasks account for %lld job(s) that ended well, the backend took %llu",
+                   (long long)jobs_by_tasks, (unsigned long long)stats.jobs_submitted);
+        }
+        EXPECT(others[1] <= (int64_t)mock.late * limit,
+               "%lld task(s) were in a job that ran for longer than its circuits take, and the backend says %llu job(s) ended late",
+               (long long)others[1], (unsigned long long)mock.late);
+
+        /* (A job that the mock makes hang is not asked how long its circuits run.) */
+        EXPECT(mock_faults ? ((uint64_t)nb_jobs <= mock.submits) : ((uint64_t)nb_jobs == mock.submits),
+               "the test saw %d jobs, the backend created %llu", nb_jobs, (unsigned long long)mock.submits);
+        for( int j = 0; j < nb_jobs; j++ ) {
+            const seen_job_t *job = &jobs[j];
+
+            circuits_seen += job->nb;
+            if( job->nb > 1 ) { coalesced_jobs++; coalesced_tasks += job->nb; }
+            EXPECT(job->nb <= limit, "job %d carried %d circuits, the limit is %d", j, job->nb, limit);
+            EXPECT(!job->mixed_shots, "job %d carried circuits that ask for different numbers of shots", j);
+            EXPECT((1 == job->nb) || (1 == job->max_attempt), "job %d carried %d circuits, one of them at its attempt %u: "
+                   "a task that had a job is retried alone", j, job->nb, job->max_attempt);
+            if( job->has_fault_key && (1 == job->min_attempt) ) with_faulty = job->nb;
+            /* Inside a job the tasks are in the order of the heap: here, of their number. */
+            for( int i = 1; priorities && (i < job->nb) && (i < MEMBERS_KEPT); i++ ) {
+                EXPECT(job->k[i] > job->k[i - 1], "job %d was given task %d after task %d, which has the lower priority",
+                       j, job->k[i], job->k[i - 1]);
+            }
+            /* The tasks that were let go together are taken in that order,
+             * job after job: none is passed over, and none is taken from
+             * behind one that could not share. */
+            if( gated && priorities && (0 == wave2) && (1 == job->max_attempt) ) {
+                for( int i = 0; (i < job->nb) && (i < MEMBERS_KEPT); i++ ) {
+                    if( job->k[i] != next_task ) in_order = 0;
+                    next_task++;
+                }
+            }
+            if( verbose ) {
+                printf("job %d: %d circuit(s), %u shots, attempt %u, tasks", j, job->nb, job->shots, job->max_attempt);
+                for( int i = 0; (i < job->nb) && (i < MEMBERS_KEPT); i++ ) printf(" %d", job->k[i]);
+                printf("\n");
+            }
+        }
+        if( gated && priorities && (0 == wave2) ) {
+            EXPECT(in_order, "the jobs did not take the tasks in the order of their priority, 0, 1, 2, ...: run with -v to see them");
+            EXPECT(lose_after_first || (next_task == nt), "the first jobs of the tasks carried %d tasks in all, expected %d", next_task, nt);
+        }
+        if( gated && (wave2 > 0) ) {
+            /* The tasks of the second wave were ahead of everybody when the
+             * job failed: they went next, together, and nobody with them.
+             * The tasks that came back from the job that failed were right
+             * behind them, and a task that had a job goes alone. */
+            int found = 0;
+
+            for( int j = 0; j < nb_jobs; j++ ) {
+                if( jobs[j].k[0] != nt - wave2 ) continue;
+                found = 1;
+                EXPECT(jobs[j].nb == ((wave2 < limit) ? wave2 : limit), "the job that began with the first task of the second wave "
+                       "carried %d task(s), expected %d: the %d of that wave, and none of those that had failed",
+                       jobs[j].nb, (wave2 < limit) ? wave2 : limit, wave2);
+                EXPECT((j + 1 < nb_jobs) && (jobs[j + 1].max_attempt > 1) && (1 == jobs[j + 1].nb),
+                       "the job after that of the second wave was not one task being tried again");
+            }
+            EXPECT(found, "no job began with task %d, the first of the second wave", nt - wave2);
+            EXPECT(limit > wave2, "-w %d leaves no room in a job of %d for a task that had failed to be taken along", wave2, limit);
+        }
+        if( lose_after_first ) {
+            /* Two jobs were created: that of task 0, and the one that was
+             * asked for after it, with as many tasks as a job takes. It was
+             * given up on, which took it from the backend; its tasks and
+             * all that waited completed as unavailable. */
+            const int second = (nt - 1 < limit) ? nt - 1 : limit;
+
+            EXPECT((2 == nb_jobs) || (1 == nt), "%d jobs were created, expected the one of task 0 and one more", nb_jobs);
+            if( nb_jobs >= 2 ) {
+                EXPECT((1 == jobs[0].nb) && (second == jobs[1].nb), "the two jobs carried %d and %d task(s), expected 1 and %d",
+                       jobs[0].nb, jobs[1].nb, second);
+            }
+            EXPECT((1 == stats.jobs_submitted) && ((1 == mock.abandoned) || (1 == nt)) && (0 == stats.jobs_coalesced),
+                   "the service counts %llu jobs taken, of which %llu carried several tasks, and the backend dropped %llu "
+                   "submission(s) that were given up on; expected 1, 0 and 1", (unsigned long long)stats.jobs_submitted,
+                   (unsigned long long)stats.jobs_coalesced, (unsigned long long)mock.abandoned);
+            EXPECT((int64_t)stats.tasks_unavailable == nt - 1, "%llu tasks completed as unavailable, expected %d",
+                   (unsigned long long)stats.tasks_unavailable, nt - 1);
+            EXPECT((nt - 1 == others[0]) && (1 == by_batch[1]), "%lld tasks read a status other than OK and %lld a result of "
+                   "a job of their own; expected %d and 1", (long long)others[0], (long long)by_batch[1], nt - 1);
+            EXPECT((stats.submit_deferred >= 1) && (0 == stats.retries) && (0 == stats.jobs_failed),
+                   "%llu submissions were not taken, %llu jobs were retries and %llu failed",
+                   (unsigned long long)stats.submit_deferred, (unsigned long long)stats.retries, (unsigned long long)stats.jobs_failed);
+        } else if( !mock_faults ) {
+            EXPECT((uint64_t)circuits_seen == mock.circuits, "the test saw %lld circuits, the backend counts %llu",
+                   (long long)circuits_seen, (unsigned long long)mock.circuits);
+            EXPECT(((uint64_t)coalesced_jobs == stats.jobs_coalesced) && ((uint64_t)coalesced_tasks == stats.tasks_coalesced),
+                   "the test saw %lld jobs carry %lld tasks together; the service counts %llu and %llu",
+                   (long long)coalesced_jobs, (long long)coalesced_tasks,
+                   (unsigned long long)stats.jobs_coalesced, (unsigned long long)stats.tasks_coalesced);
+        } else {
+            /* Jobs did carry several tasks, and each kind of fault that was
+             * asked for happened, or the run was about nothing. */
+            const char *asked = (NULL != parsec_qpu_params.mock_faults) ? parsec_qpu_params.mock_faults : "";
+
+            EXPECT(stats.jobs_coalesced > 0, "no job carried more than one task in a run that injects faults into such jobs");
+            if( strstr(asked, "unavailable") || strstr(asked, "lost") ) {
+                EXPECT(stats.submit_deferred > 0, "no submission was put off, and the mock was to be out of reach or to lose answers");
+            }
+            if( strstr(asked, "fail") || strstr(asked, "reject") || strstr(asked, "noresult") ) {
+                EXPECT(stats.jobs_failed > 0, "no job failed, and the mock was to fail, refuse or lose the results of some");
+            }
+            if( strstr(asked, "hang") || strstr(asked, "late") ) {
+                EXPECT(stats.jobs_timed_out > 0, "no job timed out, and the mock was to make some hang");
+            }
+            if( strstr(asked, "duplicate") || strstr(asked, "late") ) {
+                EXPECT(stats.stray_events > 0, "no end came for a job that was not in flight, and the mock was to report some twice or late");
+            }
+            if( strstr(asked, "cancelled") ) {
+                EXPECT((mock.provider_cancels > 0) && (others[3] > 0), "the mock cancelled %llu job(s) and %lld task(s) read that status; "
+                       "it was to cancel some", (unsigned long long)mock.provider_cancels, (long long)others[3]);
+            }
+        }
+
+        /* ---- the jobs, one by one, when the gate made them a matter of the limits alone ---- */
+        if( gated && !lose_after_first ) {
+            int *sizes = (int*)calloc((size_t)nt + 1, sizeof(int));
+            /* (With a second wave the jobs are not those of one queue taken in order.) */
+            const int n = (wave2 > 0) ? -2
+                        : expected_jobs(nt, limit, (int)info.max_outstanding, parsec_qpu_params.submit_interval_ms, sizes);
+            int first_jobs = 0;        /* jobs whose circuits are all at their first attempt, in order */
+            /* With several places, what the next jobs carry assumes that the
+             * job of task 0 was still there when they were put together. It
+             * is held for 50 ms after the tasks were let go; on a machine
+             * that stopped this process for that long it may have ended. */
+            const int stalled = !one_at_a_time && (nb_jobs >= 2) &&
+                                (jobs[1].created + 1000000 >= PARSEC_QPU_LOAD(&first_job_until));
+
+            EXPECT(-1 != n, "%d tasks, %u jobs outstanding and %d tasks per job: what the jobs carry depends on which ends first; "
+                   "choose limits that take every task at once", nt, info.max_outstanding, limit);
+            if( stalled ) {
+                printf("qpu_coalesce: the job of task 0 may have ended before the others were put into jobs "
+                       "(this process was stopped for 50 ms): the jobs are not compared one by one\n");
+            }
+            for( int j = 0; (j < nb_jobs) && (n >= 0) && !stalled; j++ ) {
+                const seen_job_t *job = &jobs[j];
+                int want;
+
+                if( job->max_attempt > 1 ) continue;      /* a retry: counted below */
+                want = (0 == first_jobs) ? 1 : ((first_jobs - 1 < n) ? sizes[first_jobs - 1] : 0);
+                EXPECT(job->nb == want, "job %d, the %d-th first job of its tasks, carried %d task(s), expected %d",
+                       j, first_jobs + 1, job->nb, want);
+                first_jobs++;
+            }
+            EXPECT((n < 0) || stalled || (first_jobs == n + 1), "%d jobs carried tasks at their first attempt, expected %d", first_jobs, n + 1);
+            free(sizes);
+
+            if( faulty < 0 ) {
+                nb_errors += qpu_test_check_service(1, nt, 0, 0);
+                EXPECT(by_attempts[1] == nt, "%lld of %d tasks took one job", (long long)by_attempts[1], nt);
+            } else if( cancel_job >= 0 ) {
+                /* One job was cancelled at the provider. Its tasks completed
+                 * with that status, and nothing was tried again. */
+                EXPECT(with_faulty >= 1, "no job carried the circuit of task %d", faulty);
+                EXPECT((1 == mock.provider_cancels) && (0 == stats.retries) && (0 == stats.jobs_failed) && (0 == stats.jobs_timed_out),
+                       "the backend cancelled %llu job(s); %llu jobs were retries, %llu failed and %llu timed out; expected 1, 0, 0, 0",
+                       (unsigned long long)mock.provider_cancels, (unsigned long long)stats.retries,
+                       (unsigned long long)stats.jobs_failed, (unsigned long long)stats.jobs_timed_out);
+                EXPECT(((int64_t)stats.tasks_failed == with_faulty) && (others[3] == with_faulty) && (by_attempts[1] == nt),
+                       "%llu tasks completed without a result, %lld read that they were cancelled and %lld took one job; "
+                       "expected %d, %d and %d", (unsigned long long)stats.tasks_failed, (long long)others[3],
+                       (long long)by_attempts[1], with_faulty, with_faulty, nt);
+            } else {
+                /* One job failed with the faulty circuit in it. Each of its
+                 * tasks then had a job of its own, if a task may have a
+                 * second one, and that one worked; except for the faulty
+                 * task when it always fails, which had every job it may. */
+                const int again        = (max_attempts > 1) ? 1 : 0;
+                const int jobs_others  = 1 + again;
+                const int jobs_faulty  = (fail_always >= 0) ? max_attempts : 1 + again;
+                const int failed_tasks = (0 == again) ? with_faulty : ((fail_always >= 0) ? 1 : 0);
+                int64_t want[MAX_BATCH_SEEN + 1];
+
+                EXPECT(with_faulty >= 1, "no job carried the circuit of task %d at its first attempt", faulty);
+                EXPECT((int64_t)stats.retries == (int64_t)(with_faulty - 1) * again + (jobs_faulty - 1),
+                       "%llu jobs were retries; %d task(s) shared the job that failed, and task %d had %d job(s) in all",
+                       (unsigned long long)stats.retries, with_faulty, faulty, jobs_faulty);
+                EXPECT((int64_t)stats.jobs_failed == ((fail_always >= 0) ? max_attempts : 1), "%llu jobs failed, expected %d",
+                       (unsigned long long)stats.jobs_failed, (fail_always >= 0) ? max_attempts : 1);
+                EXPECT((int64_t)stats.tasks_failed == failed_tasks, "%llu tasks completed without a result, expected %d",
+                       (unsigned long long)stats.tasks_failed, failed_tasks);
+                EXPECT(others[0] == failed_tasks, "%lld tasks read a status other than OK, expected %d", (long long)others[0], failed_tasks);
+                memset(want, 0, sizeof(want));
+                want[1]            = nt - with_faulty;
+                want[jobs_others] += with_faulty - 1;
+                want[jobs_faulty] += 1;
+                for( int a = 0; a <= max_attempts; a++ ) {
+                    EXPECT(by_attempts[a] == want[a], "%lld tasks took %d job(s), expected %lld",
+                           (long long)by_attempts[a], a, (long long)want[a]);
+                }
+                /* Whoever was retried was retried alone. */
+                if( again ) {
+                    EXPECT(by_batch[1] >= with_faulty - ((fail_always >= 0) ? 1 : 0),
+                           "%lld tasks got their result from a job of their own, and those of the %d that shared the job that "
+                           "failed had to", (long long)by_batch[1], with_faulty);
+                }
+                EXPECT(mock.failures == stats.jobs_failed, "%llu jobs failed at the backend, the service counts %llu",
+                       (unsigned long long)mock.failures, (unsigned long long)stats.jobs_failed);
+            }
+        } else if( (faulty < 0) && !mock_faults && !lose_after_first ) {
+            nb_errors += qpu_test_check_service(1, nt, 0, 0);
+        }
+        free(jobs);
+
+        if( verbose ) {
+            printf("qpu_coalesce: %d tasks in %llu jobs; %llu jobs carried %llu tasks together, at most %u in one (limit %d); "
+                   "%lld task(s) ended without a result\n",
+                   nt, (unsigned long long)stats.jobs_submitted, (unsigned long long)stats.jobs_coalesced,
+                   (unsigned long long)stats.tasks_coalesced, stats.max_job_tasks, limit, (long long)others[0]);
+        }
+    }
+
+    errors = qpu_test_sum(parsec, nb_errors);
+    checks = qpu_test_sum(parsec, checks);
+    if( checks != (long)nt ) {
+        if( 0 == rank ) fprintf(stderr, "%ld CHECK tasks ran in total, expected %d\n", checks, nt);
+        errors++;
+    }
+
+    qpu_test_block_type_unset(&tp->arenas_datatypes[PARSEC_qpu_coalesce_DEFAULT_ADT_IDX]);
+    PARSEC_OBJ_DESTRUCT(&tp->arenas_datatypes[PARSEC_qpu_coalesce_DEFAULT_ADT_IDX]);
+    parsec_taskpool_free((parsec_taskpool_t*)tp);
+    qpu_test_placement_free(W);
+    qpu_test_placement_free(Q);
+    free(executed);
+    free(seen_batch);
+    free(seen_attempts);
+    free(seen_status);
+    free(seen_longer);
+
+    rc = parsec_tests_context_fini(&parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
+    parsec_qpu_mock_set_delay_fn(NULL, NULL);
+    parsec_qpu_mock_set_fault_fn(NULL, NULL);
+    free(jobs_seen);
+
+    if( 0 == rank ) {
+        printf("qpu_coalesce: %d tasks on %d rank(s): %s\n", nt, world, errors ? "FAILED" : "passed");
+    }
+    return errors ? 1 : 0;
+}
+
+%}

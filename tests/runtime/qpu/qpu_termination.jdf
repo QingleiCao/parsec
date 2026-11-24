@@ -1,0 +1,274 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+/**
+ * Termination with quantum tasks outstanding.
+ *
+ * The quantum tasks are the last tasks of their taskpool: nothing in the
+ * taskpool runs after them, and their result goes straight into a tile of a
+ * data collection. So the only thing that keeps the taskpool alive while a
+ * job is outstanding is the runtime's own accounting, and the only way to
+ * see the result is to look at the tile after the wait has returned.
+ *
+ * Modes:
+ *   default  one taskpool. parsec_context_wait() must not return before the
+ *            jobs are over, and when it returns every result is in place.
+ *   -2       two taskpools: this one, and a second with classical tasks
+ *            only. The second must terminate while the first still has every
+ *            job outstanding.
+ *   -L N     N taskpools one after the other, each freed as soon as its wait
+ *            returns. Under the address sanitizer this is the test that the
+ *            QPU layer keeps no reference past a task's completion.
+ *
+ * The same source is compiled a second time with the four-counter
+ * termination detector (see CMakeLists.txt).
+ *
+ * Options, before "--":
+ *   -n NT    quantum tasks (default 8)
+ *   -c NC    classical tasks of the second taskpool (default 16)
+ *   -s SHOTS shots per job (default 100)
+ *   -q RANK  rank that runs the quantum tasks (default 0)
+ *   -d US    what device_qpu_mock_delay makes a job last, in microseconds;
+ *            the wait has to last at least that long
+ *   -v       verbose
+ */
+
+#include "qpu_test_common.h"
+#include "parsec/sys/atomic.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#if defined(QPU_TERMINATION_DYNAMIC)
+#define QPU_TP_T     parsec_qpu_termination_dynamic_taskpool_t
+#define QPU_TP_NEW   parsec_qpu_termination_dynamic_new
+#define QPU_TP_ADT   PARSEC_qpu_termination_dynamic_DEFAULT_ADT_IDX
+#define QPU_TP_NAME  "qpu_termination (four-counter detector)"
+#else
+#define QPU_TP_T     parsec_qpu_termination_taskpool_t
+#define QPU_TP_NEW   parsec_qpu_termination_new
+#define QPU_TP_ADT   PARSEC_qpu_termination_DEFAULT_ADT_IDX
+#define QPU_TP_NAME  "qpu_termination"
+#endif
+
+static int verbose = 0;
+static int32_t classical_done = 0;
+%}
+
+/* termdet: local */
+
+W        [ type = "parsec_data_collection_t*" ]
+R        [ type = "parsec_data_collection_t*" ]
+NT       [ type = int ]
+NC       [ type = int ]
+SHOTS    [ type = int ]
+
+PREP(k)
+
+k = 0 .. NT-1
+
+: W(k)
+
+WRITE C  -> C  QEXEC(k)
+WRITE TH -> TH QEXEC(k)
+
+BODY
+{
+    qpu_test_make_circuit(C, k, 0, 0);
+    qpu_test_make_params(TH, k, 0);
+}
+END
+
+QEXEC(k)
+
+k = 0 .. NT-1
+
+: R(k)
+
+READ C   <- C  PREP(k)
+READ TH  <- TH PREP(k)
+RW   RES <- R(k)
+         -> R(k)
+
+BODY [type=QPU]
+{
+    /* Whatever a previous taskpool left in the tile must not pass for the
+     * result of this one. */
+    memset(RES, 0xff, QPU_TEST_BLOCK);
+    return PARSEC_QPU_SUBMIT_KEYED(C, TH, RES, SHOTS, qpu_test_key(k, 0));
+}
+END
+
+CLASSICAL(i)
+
+i = 0 .. NC-1
+
+: W(i)
+
+BODY
+{
+    (void)parsec_atomic_fetch_inc_int32(&classical_done);
+}
+END
+
+extern "C" %{
+
+/* Are the results of the nt quantum tasks in their tiles? Returns the number
+ * of problems; with `quiet`, only counts the results that are not there. */
+static int check_tiles(parsec_data_collection_t *R, int nt, int shots, int quiet)
+{
+    unsigned char circuit[QPU_TEST_BLOCK], params[QPU_TEST_BLOCK];
+    int problems = 0;
+
+    for( int k = 0; k < nt; k++ ) {
+        const parsec_qpu_result_t *result = (const parsec_qpu_result_t*)qpu_test_tiles_ptr(R, k);
+        if( quiet ) {
+            if( PARSEC_QPU_RESULT_VERSION != result->version ) problems++;
+            continue;
+        }
+        qpu_test_make_circuit(circuit, k, 0, 0);
+        qpu_test_make_params(params, k, 0);
+        problems += qpu_test_check_result(result, circuit, params, shots, qpu_test_key(k, 0), "tile", k, 0);
+    }
+    return problems;
+}
+
+int main(int argc, char *argv[])
+{
+    parsec_context_t *parsec;
+    parsec_data_collection_t *W, *R;
+    int nt = 8, nc = 16, shots = 100, qrank = 0, two = 0, loops = 1;
+    long delay_us = 0;
+    int rank, world, rc, test_argc, pargc, errors = 0;
+    char **pargv;
+
+    qpu_test_split_args(argc, argv, &test_argc, &pargc, &pargv);
+    for( int i = 1; i < test_argc; i++ ) {
+        if( 0 == strcmp(argv[i], "-v") ) { verbose = 1; continue; }
+        if( 0 == strcmp(argv[i], "-2") ) { two = 1; continue; }
+        if( i + 1 >= test_argc ) break;
+        if( 0 == strcmp(argv[i], "-n") ) nt = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-c") ) nc = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-s") ) shots = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-q") ) qrank = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-d") ) delay_us = atol(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-L") ) loops = atoi(argv[++i]);
+    }
+
+    rc = parsec_tests_context_init(-1, PARSEC_TEST_THREAD_SERIALIZED, &pargc, &pargv, &parsec, &rank, &world);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_init");
+    if( qrank >= world ) qrank = world - 1;
+
+    W = qpu_test_placement_new(rank, world, -1);
+    R = qpu_test_tiles_new(rank, world, qrank, nt);
+
+    if( two ) {
+        /* parsec_taskpool_wait() must not be the first wait of a context: on
+         * one rank of an MPI build it then progresses a communication engine
+         * that only parsec_context_wait() sets up (__parsec_taskpool_wait()
+         * against __parsec_context_wait() in scheduling.c), and crashes.
+         * Nothing to do with QPUs; tests/api/taskpool_wait starts with a
+         * context wait too. So does this one. */
+        QPU_TP_T *warmup = QPU_TP_NEW(W, R, 0, nc, shots);
+        qpu_test_block_type_set(&warmup->arenas_datatypes[QPU_TP_ADT]);
+        rc = parsec_context_add_taskpool(parsec, (parsec_taskpool_t*)warmup);
+        PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+        rc = parsec_context_start(parsec);
+        PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+        rc = parsec_context_wait(parsec);
+        PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+        qpu_test_block_type_unset(&warmup->arenas_datatypes[QPU_TP_ADT]);
+        PARSEC_OBJ_DESTRUCT(&warmup->arenas_datatypes[QPU_TP_ADT]);
+        parsec_taskpool_free((parsec_taskpool_t*)warmup);
+        classical_done = 0;
+    }
+
+    for( int loop = 0; loop < loops; loop++ ) {
+        QPU_TP_T *tp, *classical = NULL;
+        int64_t t0, t1;
+
+        tp = QPU_TP_NEW(W, R, nt, 0, shots);
+        qpu_test_block_type_set(&tp->arenas_datatypes[QPU_TP_ADT]);
+        rc = parsec_context_add_taskpool(parsec, (parsec_taskpool_t*)tp);
+        PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+        if( two ) {
+            classical = QPU_TP_NEW(W, R, 0, nc, shots);
+            qpu_test_block_type_set(&classical->arenas_datatypes[QPU_TP_ADT]);
+            rc = parsec_context_add_taskpool(parsec, (parsec_taskpool_t*)classical);
+            PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+        }
+
+        t0 = parsec_qpu_now_ns();
+        rc = parsec_context_start(parsec);
+        PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+
+        if( two ) {
+            /* The classical taskpool is over long before the first job is. */
+            rc = parsec_taskpool_wait((parsec_taskpool_t*)classical);
+            PARSEC_CHECK_ERROR(rc, "parsec_taskpool_wait");
+            t1 = parsec_qpu_now_ns();
+            if( rank == qrank ) {
+                int missing = check_tiles(R, nt, shots, 1);
+                if( missing != nt ) {
+                    fprintf(stderr, "the classical taskpool ended after %d of the %d quantum tasks had completed "
+                            "(%.1f ms after the start, jobs last %.1f ms)\n",
+                            nt - missing, nt, (t1 - t0) * 1e-6, delay_us * 1e-3);
+                    errors++;
+                }
+            }
+        }
+
+        rc = parsec_context_wait(parsec);
+        PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+        t1 = parsec_qpu_now_ns();
+
+        if( rank == qrank ) {
+            /* Returning from the wait means the results are there. */
+            errors += check_tiles(R, nt, shots, 0);
+            if( (nt > 0) && ((t1 - t0) < delay_us * 1000) ) {
+                fprintf(stderr, "the wait returned after %.3f ms, a job lasts %.3f ms\n",
+                        (t1 - t0) * 1e-6, delay_us * 1e-3);
+                errors++;
+            }
+            if( verbose ) printf("taskpool %d: waited %.3f ms\n", loop, (t1 - t0) * 1e-6);
+        }
+        errors += qpu_test_check_service(rank == qrank, (long)nt * (loop + 1), 0, verbose && (rank == qrank));
+
+        qpu_test_block_type_unset(&tp->arenas_datatypes[QPU_TP_ADT]);
+        PARSEC_OBJ_DESTRUCT(&tp->arenas_datatypes[QPU_TP_ADT]);
+        parsec_taskpool_free((parsec_taskpool_t*)tp);
+        if( two ) {
+            qpu_test_block_type_unset(&classical->arenas_datatypes[QPU_TP_ADT]);
+            PARSEC_OBJ_DESTRUCT(&classical->arenas_datatypes[QPU_TP_ADT]);
+            parsec_taskpool_free((parsec_taskpool_t*)classical);
+        }
+    }
+
+    if( two ) {
+        long done = qpu_test_sum(parsec, classical_done);
+        if( done != (long)nc * loops ) {
+            if( 0 == rank ) fprintf(stderr, "%ld classical tasks ran, expected %ld\n", done, (long)nc * loops);
+            errors++;
+        }
+    }
+    errors = (int)qpu_test_sum(parsec, errors);
+
+    qpu_test_tiles_free(R);
+    qpu_test_placement_free(W);
+
+    rc = parsec_tests_context_fini(&parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
+
+    if( 0 == rank ) {
+        printf("%s: %d quantum task(s), %d taskpool(s), %d rank(s): %s\n",
+               QPU_TP_NAME, nt, loops, world, errors ? "FAILED" : "passed");
+    }
+    return errors ? 1 : 0;
+}
+
+%}

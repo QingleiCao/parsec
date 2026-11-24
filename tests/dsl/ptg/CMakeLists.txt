@@ -28,6 +28,12 @@ if(PARSEC_HAVE_DEV_CAPABILITY_BATCH)
   target_ptg_sources(batch_cpu PRIVATE "batch_cpu.jdf")
 endif(PARSEC_HAVE_DEV_CAPABILITY_BATCH)
 
+# A task class with a body of type QPU and a CPU body. It builds and runs
+# with and without QPU support: without it, the QPU body is left out.
+parsec_addtest_executable(C qpu_fallback)
+target_link_libraries(qpu_fallback PRIVATE tests_runtime_common)
+target_ptg_sources(qpu_fallback PRIVATE "qpu_fallback.jdf")
+
 add_subdirectory(branching)
 add_subdirectory(choice)
 add_subdirectory(controlgather)

@@ -1,0 +1,417 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+/**
+ * Chains of a classical task, a quantum task and a classical task.
+ *
+ *   PREP(k, l)   writes a circuit and its parameters      on rank k mod P
+ *   QEXEC(k, l)  submits them and returns ASYNC            on the QPU's rank
+ *   CHECK(k, l)  verifies the result against the inputs    on rank k mod P
+ *
+ * and CHECK(k, l) enables PREP(k, l+1). There are NT independent chains of
+ * LEN links.
+ *
+ * What a run checks: every CHECK ran exactly once, and only after its
+ * quantum task's result was written; the result it received is the one of
+ * its own inputs: the counts the sampler gives, outside any runtime, for
+ * the same circuit, parameter values and key; the inputs stayed in place and
+ * unchanged while the job was outstanding (the mock compares them at the end
+ * of the job with what they were when it was submitted); and at the end the
+ * QPU service holds nothing.
+ *
+ * Options, before "--":
+ *   -n NT       number of chains (default 16)
+ *   -l LEN      links per chain (default 2)
+ *   -s SHOTS    shots per job (default 100)
+ *   -q RANK     rank that runs the quantum tasks (default 0; too large means the last)
+ *   -e N        every N-th job is empty and must complete without a backend job
+ *   -c N        expect exactly N jobs outstanding at the peak (capacity)
+ *   -O MODE     reverse | random: give the jobs of the chains durations that
+ *               make them end in that order, and require each job to have
+ *               run for its duration and the quantum tasks to be completed
+ *               in the order their jobs ended: the order in which the
+ *               results were written, which is the order in which the
+ *               successors were released (one rank, LEN 1)
+ *   -I N        run N taskpools one after the other and stop the QPU service
+ *               between them, so that each one starts it again: thread,
+ *               backend and all. (A second parsec_init() in the same process
+ *               is not an option: at this commit it crashes in
+ *               parsec_mca_device_attach(), with or without QPU support.)
+ *   -H US       measure the window after a body returns ASYNC (builds with
+ *               instrumentation only): hold every quantum task for US
+ *               microseconds in the EXEC_END instrumentation that follows its
+ *               body, and count how often the task was handed back to the
+ *               scheduler, or was already another task, before the worker
+ *               that ran the body was done with it. -H 0 measures without
+ *               holding. This reports; it does not fail.
+ *   -v          verbose
+ */
+
+#include "qpu_test_common.h"
+#include "parsec/sys/atomic.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int verbose = 0;
+static int32_t nb_errors = 0;
+static int32_t *executed = NULL;     /* [k * LEN + l], on the rank that ran CHECK(k, l) */
+static int32_t order_seq = 0;
+static int *order_seen = NULL;       /* order_seen[i] is the chain whose CHECK ran i-th */
+static int *order_rank = NULL;       /* order_rank[k] is the position chain k must finish in */
+static int64_t *order_start = NULL;  /* order_start[k], order_end[k]: when the job of chain k started and */
+static int64_t *order_end = NULL;    /* ended at the backend */
+static int64_t *order_done = NULL;   /* order_done[k]: when its result was written, just before
+                                      * its task was given back to the scheduler */
+
+#define ORDER_STEP_NS 8000000LL      /* far above any scheduling jitter */
+
+#if defined(PARSEC_PROF_PINS)
+#include "parsec/mca/pins/pins.h"
+#include <time.h>
+
+/* The window after a body returns ASYNC. __parsec_execute() still runs the
+ * EXEC_END instrumentation on the task once the body has returned, and by
+ * then the task belongs to the QPU service, which may complete it. */
+static long window_hold_us = -1;
+static int32_t window_looked = 0, window_handed_off = 0, window_recycled = 0;
+
+static void window_exec_end(parsec_execution_stream_t *es, parsec_task_t *task,
+                            parsec_pins_next_callback_t *cb_data)
+{
+    const parsec_task_class_t *tc = task->task_class;
+    parsec_key_t key;
+
+    (void)es; (void)cb_data;
+    if( (NULL == tc) || (0 != strcmp(tc->name, "QEXEC")) ) return;
+    key = tc->make_key(task->taskpool, task->locals);
+    (void)parsec_atomic_fetch_inc_int32(&window_looked);
+    if( window_hold_us > 0 ) {
+        struct timespec ts = { window_hold_us / 1000000, (window_hold_us % 1000000) * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    if( (task->task_class != tc) || (tc->make_key(task->taskpool, task->locals) != key) ) {
+        (void)parsec_atomic_fetch_inc_int32(&window_recycled);
+    } else if( PARSEC_TASK_STATUS_COMPLETE == task->status ) {
+        (void)parsec_atomic_fetch_inc_int32(&window_handed_off);
+    }
+}
+#endif  /* defined(PARSEC_PROF_PINS) */
+
+/* Steers the mock: the job of chain k takes (order_rank[k] + 1) steps. */
+static int64_t order_delay(uint64_t tag, const parsec_qpu_request_t *request, void *arg)
+{
+    (void)tag; (void)arg;
+    return (int64_t)(order_rank[qpu_test_params_a(request->params)] + 1) * ORDER_STEP_NS;
+}
+%}
+
+W            [ type = "parsec_data_collection_t*" ]
+Q            [ type = "parsec_data_collection_t*" ]
+NT           [ type = int ]
+LEN          [ type = int ]
+SHOTS        [ type = int ]
+EMPTY_EVERY  [ type = int ]
+
+PREP(k, l)
+
+k = 0 .. NT-1
+l = 0 .. LEN-1
+
+: W(k)
+
+WRITE C  -> C  QEXEC(k, l)
+         -> C  CHECK(k, l)
+WRITE TH -> TH QEXEC(k, l)
+         -> TH CHECK(k, l)
+CTL   X  <- (l > 0) ? X CHECK(k, l-1)
+
+BODY
+{
+    qpu_test_make_circuit(C, k, l, (EMPTY_EVERY > 0) && ((k + l) % EMPTY_EVERY == EMPTY_EVERY - 1));
+    qpu_test_make_params(TH, k, l);
+}
+END
+
+QEXEC(k, l)
+
+k = 0 .. NT-1
+l = 0 .. LEN-1
+
+: Q(0)
+
+READ  C   <- C  PREP(k, l)
+READ  TH  <- TH PREP(k, l)
+WRITE RES -> RES CHECK(k, l)
+
+BODY [type=QPU]
+{
+    /* Mark the result, so that a successor released too early shows. */
+    memset(RES, 0xff, QPU_TEST_BLOCK);
+    return PARSEC_QPU_SUBMIT_KEYED(C, TH, RES, SHOTS, qpu_test_key(k, l));
+}
+END
+
+CHECK(k, l)
+
+k = 0 .. NT-1
+l = 0 .. LEN-1
+
+: W(k)
+
+READ C   <- C   PREP(k, l)
+READ TH  <- TH  PREP(k, l)
+READ RES <- RES QEXEC(k, l)
+CTL  X   -> (l < LEN-1) ? X PREP(k, l+1)
+
+BODY
+{
+    int errors = qpu_test_check_result(RES, C, TH, SHOTS, qpu_test_key(k, l), "CHECK", k, l);
+    if( errors > 0 ) (void)parsec_atomic_fetch_add_int32(&nb_errors, errors);
+    (void)parsec_atomic_fetch_inc_int32(&executed[k * LEN + l]);
+    if( NULL != order_seen ) {
+        int32_t seq = parsec_atomic_fetch_inc_int32(&order_seq);
+        order_seen[seq] = k;
+        order_start[k]  = ((const parsec_qpu_result_t*)RES)->t_start;
+        order_end[k]    = ((const parsec_qpu_result_t*)RES)->t_end;
+        order_done[k]   = ((const parsec_qpu_result_t*)RES)->t_retrieve;
+    }
+    if( verbose ) printf("CHECK(%d, %d) on rank %d\n", k, l, es->virtual_process->parsec_context->my_rank);
+}
+END
+
+extern "C" %{
+
+int main(int argc, char *argv[])
+{
+    parsec_context_t *parsec;
+    parsec_qpu_chain_taskpool_t *tp;
+    parsec_data_collection_t *W, *Q;
+    int nt = 16, len = 2, shots = 100, qrank = 0, empty_every = 0, expect_peak = -1, cycles = 1;
+    const char *order_mode = NULL;
+    int rank = 0, world = 1, rc, test_argc, pargc, nb_vp = 1;
+    char **pargv;
+    long errors = 0, checks, empties, failed_cycles = 0;
+
+    qpu_test_split_args(argc, argv, &test_argc, &pargc, &pargv);
+    for( int i = 1; i < test_argc; i++ ) {
+        if( 0 == strcmp(argv[i], "-v") ) { verbose = 1; continue; }
+        if( i + 1 >= test_argc ) break;
+        if( 0 == strcmp(argv[i], "-n") ) nt = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-l") ) len = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-s") ) shots = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-q") ) qrank = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-e") ) empty_every = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-c") ) expect_peak = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-O") ) order_mode = argv[++i];
+        else if( 0 == strcmp(argv[i], "-I") ) cycles = atoi(argv[++i]);
+#if defined(PARSEC_PROF_PINS)
+        else if( 0 == strcmp(argv[i], "-H") ) window_hold_us = atol(argv[++i]);
+#endif
+    }
+    if( (nt <= 0) || (len <= 0) || (shots <= 0) ) {
+        fprintf(stderr, "qpu_chain: -n, -l and -s must be positive\n");
+        return 1;
+    }
+
+    rc = parsec_tests_context_init(-1, PARSEC_TEST_THREAD_SERIALIZED, &pargc, &pargv, &parsec, &rank, &world);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_init");
+
+#if defined(PARSEC_PROF_PINS)
+    parsec_pins_next_callback_t *window_cbs = NULL;
+    if( window_hold_us >= 0 ) {
+        int n = 0;
+        for( int p = 0; p < parsec->nb_vp; p++ ) n += parsec->virtual_processes[p]->nb_cores;
+        window_cbs = (parsec_pins_next_callback_t*)calloc(n, sizeof(parsec_pins_next_callback_t));
+        n = 0;
+        for( int p = 0; p < parsec->nb_vp; p++ ) {
+            for( int t = 0; t < parsec->virtual_processes[p]->nb_cores; t++ ) {
+                (void)parsec_pins_register_callback(parsec->virtual_processes[p]->execution_streams[t],
+                                                    EXEC_END, window_exec_end, &window_cbs[n++]);
+            }
+        }
+    }
+#endif
+
+  for( int cycle = 0; cycle < cycles; cycle++ ) {
+    nb_errors = 0;
+    order_seq = 0;
+    empties   = 0;
+
+    if( qrank >= world ) qrank = world - 1;
+    executed = (int32_t*)calloc((size_t)nt * len, sizeof(int32_t));
+
+    if( NULL != order_mode ) {
+        if( (1 != world) || (1 != len) ) {
+            fprintf(stderr, "qpu_chain: -O needs one rank and -l 1\n");
+            parsec_tests_abort(parsec, 1);
+        }
+        order_seen = (int*)calloc(nt, sizeof(int));
+        order_rank = (int*)calloc(nt, sizeof(int));
+        order_start = (int64_t*)calloc(nt, sizeof(int64_t));
+        order_end  = (int64_t*)calloc(nt, sizeof(int64_t));
+        order_done = (int64_t*)calloc(nt, sizeof(int64_t));
+        for( int k = 0; k < nt; k++ ) order_rank[k] = nt - 1 - k;   /* reverse */
+        if( 0 == strcmp(order_mode, "random") ) {
+            /* A fixed permutation, by a seeded shuffle. */
+            uint64_t s = 20261122;
+            for( int k = nt - 1; k > 0; k-- ) {
+                s = parsec_qpu_mix64(s);
+                int j = (int)(s % (uint64_t)(k + 1)), tmp = order_rank[k];
+                order_rank[k] = order_rank[j]; order_rank[j] = tmp;
+            }
+        }
+        parsec_qpu_mock_set_delay_fn(order_delay, NULL);
+    }
+
+    W = qpu_test_placement_new(rank, world, -1);
+    Q = qpu_test_placement_new(rank, world, qrank);
+
+    tp = parsec_qpu_chain_new(W, Q, nt, len, shots, empty_every);
+    qpu_test_block_type_set(&tp->arenas_datatypes[PARSEC_qpu_chain_DEFAULT_ADT_IDX]);
+
+    rc = parsec_context_add_taskpool(parsec, (parsec_taskpool_t*)tp);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+    rc = parsec_context_wait(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+
+    /* Every CHECK ran once, on the rank that owns it. */
+    checks = 0;
+    for( int k = 0; k < nt; k++ ) {
+        for( int l = 0; l < len; l++ ) {
+            int expected = ((int)W->rank_of(W, k) == rank) ? 1 : 0;
+            if( expected != executed[k * len + l] ) {
+                fprintf(stderr, "rank %d: CHECK(%d, %d) ran %d time(s), expected %d\n",
+                        rank, k, l, executed[k * len + l], expected);
+                nb_errors++;
+            }
+            checks += executed[k * len + l];
+            if( (empty_every > 0) && ((k + l) % empty_every == empty_every - 1) ) empties++;
+        }
+    }
+    /* The service counts from zero each time it starts; the device does not. */
+    qpu_test_expect_also_executed((long)nt * len * cycle);
+    nb_errors += qpu_test_check_service(rank == qrank, (long)nt * len, empties, verbose && (rank == qrank));
+
+    if( expect_peak >= 0 && rank == qrank ) {
+        parsec_qpu_stats_t stats;
+        parsec_qpu_mock_stats_t mock;
+        parsec_qpu_service_stats(&stats);
+        parsec_qpu_mock_stats(&mock);
+        if( (uint32_t)expect_peak != stats.max_in_flight ) {
+            fprintf(stderr, "at most %u jobs were outstanding, expected the limit of %d to be reached\n",
+                    stats.max_in_flight, expect_peak);
+            nb_errors++;
+        }
+        if( (uint32_t)expect_peak != mock.max_held ) {
+            fprintf(stderr, "the backend held at most %u jobs, expected %d\n", mock.max_held, expect_peak);
+            nb_errors++;
+        }
+    }
+
+    if( NULL != order_mode ) {
+        /* Each job ran for the time it was told to, and the tasks were
+         * completed in the order their jobs ended. All of it is read from
+         * the results, where one thread wrote it. The order in which the
+         * workers then got to run the successors is theirs, and is shown for
+         * information only: two successors released a step apart can
+         * overtake each other on a machine that has more to do. */
+        parsec_qpu_mock_stats_t mock;
+        int *by_rank = (int*)calloc(nt, sizeof(int)), overtaken = 0;
+
+        parsec_qpu_mock_stats(&mock);
+        for( int k = 0; k < nt; k++ ) {
+            const int64_t ran = order_end[k] - order_start[k], told = (int64_t)(order_rank[k] + 1) * ORDER_STEP_NS;
+            by_rank[order_rank[k]] = k;
+            /* Longer only if the mock says a job ended late, held up by its sampling. */
+            if( (ran != told) && !((mock.late > 0) && (ran > told)) ) {
+                fprintf(stderr, "the job of chain %d ran for %.3f ms, and was told to run for %.3f ms\n",
+                        k, ran * 1e-6, told * 1e-6);
+                nb_errors++;
+            }
+        }
+        for( int a = 0; a < nt; a++ ) {
+            for( int b = 0; b < nt; b++ ) {
+                if( (order_end[a] < order_end[b]) && (order_done[a] >= order_done[b]) ) {
+                    fprintf(stderr, "the task of chain %d was completed before the one of chain %d, whose job ended first\n", b, a);
+                    nb_errors++;
+                }
+            }
+        }
+        for( int i = 0; i < nt; i++ ) overtaken += (order_rank[order_seen[i]] != i);
+        if( verbose || (overtaken > 0) ) {
+            printf("%d of %d successors ran out of the order in which they were released\n", overtaken, nt);
+        }
+        free(by_rank);
+        parsec_qpu_mock_set_delay_fn(NULL, NULL);
+    }
+
+    errors = qpu_test_sum(parsec, nb_errors);
+    checks = qpu_test_sum(parsec, checks);
+    if( checks != (long)nt * len ) {
+        if( 0 == rank ) fprintf(stderr, "%ld CHECK tasks ran in total, expected %ld\n", checks, (long)nt * len);
+        errors++;
+    }
+
+    qpu_test_block_type_unset(&tp->arenas_datatypes[PARSEC_qpu_chain_DEFAULT_ADT_IDX]);
+    PARSEC_OBJ_DESTRUCT(&tp->arenas_datatypes[PARSEC_qpu_chain_DEFAULT_ADT_IDX]);
+    parsec_taskpool_free((parsec_taskpool_t*)tp);
+    qpu_test_placement_free(W);
+    qpu_test_placement_free(Q);
+    free(executed);   executed   = NULL;
+    free(order_seen); order_seen = NULL;
+    free(order_rank); order_rank = NULL;
+    free(order_start); order_start = NULL;
+    free(order_end);  order_end  = NULL;
+    free(order_done); order_done = NULL;
+    if( errors ) failed_cycles++;
+
+    if( cycle + 1 < cycles ) {
+        /* Take the QPU service down between two taskpools: the progress
+         * thread is joined and the backend closed, and the next submission
+         * has to bring up a fresh one. The last one is left to parsec_fini(). */
+        int abandoned = parsec_qpu_service_fini();
+        if( 0 != abandoned ) {
+            fprintf(stderr, "rank %d: %d task(s) were still with the QPU service after the wait\n", rank, abandoned);
+            failed_cycles++;
+        }
+    }
+  }
+
+#if defined(PARSEC_PROF_PINS)
+    if( window_hold_us >= 0 ) {
+        printf("rank %d: of %d quantum tasks looked at in the instrumentation that follows their body%s, "
+               "%d had been handed back to the scheduler and %d were already another task\n",
+               rank, window_looked, (window_hold_us > 0) ? " (held there)" : "",
+               window_handed_off, window_recycled);
+        for( int p = 0; p < parsec->nb_vp; p++ ) {
+            for( int t = 0; t < parsec->virtual_processes[p]->nb_cores; t++ ) {
+                parsec_pins_next_callback_t *mine = NULL;
+                (void)parsec_pins_unregister_callback(parsec->virtual_processes[p]->execution_streams[t],
+                                                      EXEC_END, window_exec_end, &mine);
+            }
+        }
+    }
+#endif
+    nb_vp = parsec->nb_vp;
+    rc = parsec_tests_context_fini(&parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
+#if defined(PARSEC_PROF_PINS)
+    free(window_cbs);
+#endif
+
+    if( 0 == rank ) {
+        printf("qpu_chain: %d chains of %d on %d rank(s), %d taskpool(s), %d virtual process(es): %s\n",
+               nt, len, world, cycles, nb_vp, failed_cycles ? "FAILED" : "passed");
+    }
+    return failed_cycles ? 1 : 0;
+}
+
+%}

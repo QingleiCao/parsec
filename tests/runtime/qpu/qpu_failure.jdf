@@ -1,0 +1,533 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+/**
+ * Quantum jobs that go wrong.
+ *
+ *   PREP(k)   writes a circuit and its parameters      on rank k mod P
+ *   QEXEC(k)  submits them and returns ASYNC            on the QPU's rank
+ *   CHECK(k)  verifies what came back                   on rank k mod P
+ *
+ * The mock backend is told, job by job and attempt by attempt, what to do
+ * instead of running the job. What each task must end with follows from
+ * that plan alone, and CHECK(k) holds the task to it: the status, the number
+ * of jobs it took, and, when the task ends well, the very counts it would
+ * have had if nothing had gone wrong. Whatever happens, every CHECK runs
+ * exactly once, the run ends normally, and the service ends up holding
+ * nothing.
+ *
+ * Modes (-m):
+ *   mixed       by k modulo 10 (default):
+ *                 0  nothing goes wrong
+ *                 1  the first job fails, the second ends well
+ *                 2  every job fails: the task ends as failed
+ *                 3  the first job never ends and is timed out, the second ends well
+ *                 4  no job ever ends: the task ends as timed out
+ *                 5  the first job ends well and has no results to give
+ *                 6  the end of the job is reported twice
+ *                 7  the first job never ends, and its end is reported after
+ *                    it was cancelled; the second ends well
+ *                 8  the reply to the submission is lost: the job is there,
+ *                    and asking again must find it and not make another
+ *                 9  the first submission is refused for good
+ *               and every seventh submission the backend receives, whatever
+ *               it is for, is not taken and has to be asked again
+ *   once        every first job fails
+ *   always      every job fails
+ *   timeout     every first job never ends
+ *   ambiguous   the reply to every submission is lost
+ *   down:short  the backend takes nothing for its first 150 ms, less than
+ *               device_qpu_unavailable_timeout: every task ends well
+ *   down:long   the backend never takes anything: every task ends as
+ *               unavailable once device_qpu_unavailable_timeout has passed
+ *   down:twice  two taskpools, one after the other, on the same service. For
+ *               the first the backend never takes anything, and every task
+ *               ends as unavailable. For the second it refuses three
+ *               submissions and then works: every task ends well. An outage
+ *               that is over must not count against what comes after it
+ *   lost:down   the backend takes the job and never says so: the reply to
+ *               every submission is lost, also when it is asked again. Every
+ *               task ends as unavailable, and the job the backend took is
+ *               gone from it by then: nothing may keep reading the inputs of
+ *               a task that is completed
+ *   rejected    no fault; to be run with a mock too narrow for the circuits
+ *               (device_qpu_mock_max_qubits 3): every task ends as rejected
+ *
+ * Other options, before "--":
+ *   -n NT       number of tasks (default 40)
+ *   -s SHOTS    shots per job (default 100)
+ *   -q RANK     rank that runs the quantum tasks (default 0; too large means the last)
+ *   -v          verbose
+ */
+
+#include "qpu_test_common.h"
+#include "parsec/sys/atomic.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+enum { MODE_MIXED, MODE_ONCE, MODE_ALWAYS, MODE_TIMEOUT, MODE_AMBIGUOUS, MODE_DOWN_SHORT, MODE_DOWN_LONG, MODE_DOWN_TWICE, MODE_LOST_DOWN, MODE_REJECTED };
+static const char *mode_names[] = { "mixed", "once", "always", "timeout", "ambiguous", "down:short", "down:long", "down:twice", "lost:down", "rejected" };
+
+#define DOWN_SHORT_NS 150000000LL
+
+static int verbose = 0;
+static int mode = MODE_MIXED;
+static int max_attempts = 1;
+static int phase = 0;                /* which taskpool of the run; written between two of them */
+static uint64_t phase_first_call = 0;  /* progress thread only */
+static int32_t nb_errors = 0;
+static int32_t *executed = NULL;     /* [k], on the rank that ran CHECK(k) */
+static int64_t t_first_call = 0;     /* progress thread only */
+static unsigned char *lost_once = NULL;  /* [k]: the reply about task k was lost already; progress thread only */
+static int nb_tasks = 0;
+
+/* What the mock does to the attempt-th job (from 1) of task k. */
+static parsec_qpu_mock_fault_t fault_of(int k, uint32_t attempt)
+{
+    switch( mode ) {
+    case MODE_ONCE:      return (1 == attempt) ? PARSEC_QPU_MOCK_FAIL : PARSEC_QPU_MOCK_OK;
+    case MODE_ALWAYS:    return PARSEC_QPU_MOCK_FAIL;
+    case MODE_TIMEOUT:   return (1 == attempt) ? PARSEC_QPU_MOCK_HANG : PARSEC_QPU_MOCK_OK;
+    case MODE_AMBIGUOUS: return PARSEC_QPU_MOCK_LOST;
+    case MODE_MIXED:
+        switch( k % 10 ) {
+        case 1: return (1 == attempt) ? PARSEC_QPU_MOCK_FAIL : PARSEC_QPU_MOCK_OK;
+        case 2: return PARSEC_QPU_MOCK_FAIL;
+        case 3: return (1 == attempt) ? PARSEC_QPU_MOCK_HANG : PARSEC_QPU_MOCK_OK;
+        case 4: return PARSEC_QPU_MOCK_HANG;
+        case 5: return (1 == attempt) ? PARSEC_QPU_MOCK_NORESULT : PARSEC_QPU_MOCK_OK;
+        case 6: return PARSEC_QPU_MOCK_DUPLICATE;
+        case 7: return (1 == attempt) ? PARSEC_QPU_MOCK_LATE : PARSEC_QPU_MOCK_OK;
+        case 8: return PARSEC_QPU_MOCK_LOST;
+        case 9: return (1 == attempt) ? PARSEC_QPU_MOCK_REJECT : PARSEC_QPU_MOCK_OK;
+        default: break;
+        }
+        break;
+    default:
+        break;
+    }
+    return PARSEC_QPU_MOCK_OK;
+}
+
+/* Given to the mock, which asks at every submission, also when a job is
+ * asked for again. A reply is lost once per job, except in the mode where
+ * the backend never answers. */
+static parsec_qpu_mock_fault_t fault_fn(uint64_t tag, const parsec_qpu_request_t *request, uint64_t call, void *arg)
+{
+    const int k = qpu_test_key_a(request->key);
+    parsec_qpu_mock_fault_t fault;
+
+    (void)tag; (void)arg;
+    if( MODE_DOWN_LONG == mode ) return PARSEC_QPU_MOCK_UNAVAILABLE;
+    if( MODE_DOWN_TWICE == mode ) {
+        if( 0 == phase ) return PARSEC_QPU_MOCK_UNAVAILABLE;
+        if( 0 == phase_first_call ) phase_first_call = call;
+        return ((call - phase_first_call) < 3) ? PARSEC_QPU_MOCK_UNAVAILABLE : PARSEC_QPU_MOCK_OK;
+    }
+    if( MODE_LOST_DOWN == mode ) return PARSEC_QPU_MOCK_LOST;
+    if( MODE_DOWN_SHORT == mode ) {
+        const int64_t now = parsec_qpu_now_ns();
+        if( 0 == t_first_call ) t_first_call = now;
+        return ((now - t_first_call) < DOWN_SHORT_NS) ? PARSEC_QPU_MOCK_UNAVAILABLE : PARSEC_QPU_MOCK_OK;
+    }
+    if( (MODE_MIXED == mode) && (0 == (call % 7)) ) return PARSEC_QPU_MOCK_UNAVAILABLE;
+    fault = fault_of(k, request->attempt);
+    if( PARSEC_QPU_MOCK_LOST == fault ) {
+        if( (k < 0) || (k >= nb_tasks) || lost_once[k] ) return PARSEC_QPU_MOCK_OK;
+        lost_once[k] = 1;
+    }
+    return fault;
+}
+
+/* What the plan says a run does to task k, and in total. */
+typedef struct {
+    long jobs;           /* jobs the backend takes */
+    long failed;         /* jobs that fail, give no results, or are refused */
+    long timed_out;      /* jobs cancelled for taking too long */
+    long retries;
+    long tasks_failed;   /* tasks that end with a status other than OK */
+    long mock_failures;  /* ends the mock reports as failures */
+    long mock_rejected;
+    long ghosts;         /* ends the mock reports for a job that is gone */
+    long tag_hits;       /* jobs found by their tag */
+} plan_t;
+
+static void plan_of(int k, int *status, int *attempts, plan_t *plan)
+{
+    int last = PARSEC_QPU_STATUS_OK;
+
+    if( (MODE_DOWN_LONG == mode) || (MODE_LOST_DOWN == mode) || (MODE_REJECTED == mode) ||
+        ((MODE_DOWN_TWICE == mode) && (0 == phase)) ) {
+        *status   = (MODE_REJECTED == mode) ? PARSEC_QPU_STATUS_REJECTED : PARSEC_QPU_STATUS_UNAVAILABLE;
+        *attempts = 0;
+        if( NULL != plan ) plan->tasks_failed++;
+        return;
+    }
+    for( int attempt = 1; attempt <= max_attempts; attempt++ ) {
+        const parsec_qpu_mock_fault_t fault = fault_of(k, (uint32_t)attempt);
+        if( (NULL != plan) && (attempt > 1) ) plan->retries++;
+        if( (NULL != plan) && (PARSEC_QPU_MOCK_REJECT != fault) ) plan->jobs++;
+        switch( fault ) {
+        case PARSEC_QPU_MOCK_FAIL:
+            if( NULL != plan ) { plan->failed++; plan->mock_failures++; }
+            last = PARSEC_QPU_STATUS_FAILED;
+            continue;
+        case PARSEC_QPU_MOCK_NORESULT:
+            if( NULL != plan ) plan->failed++;
+            last = PARSEC_QPU_STATUS_FAILED;
+            continue;
+        case PARSEC_QPU_MOCK_REJECT:
+            if( NULL != plan ) { plan->failed++; plan->mock_rejected++; }
+            last = PARSEC_QPU_STATUS_FAILED;
+            continue;
+        case PARSEC_QPU_MOCK_LATE:
+            if( NULL != plan ) plan->ghosts++;
+            /* fall through */
+        case PARSEC_QPU_MOCK_HANG:
+            if( NULL != plan ) plan->timed_out++;
+            last = PARSEC_QPU_STATUS_TIMED_OUT;
+            continue;
+        case PARSEC_QPU_MOCK_DUPLICATE:
+            if( NULL != plan ) plan->ghosts++;
+            break;
+        case PARSEC_QPU_MOCK_LOST:
+            if( NULL != plan ) plan->tag_hits++;
+            break;
+        default:
+            break;
+        }
+        *status   = PARSEC_QPU_STATUS_OK;
+        *attempts = attempt;
+        return;
+    }
+    *status   = last;
+    *attempts = max_attempts;
+    if( NULL != plan ) plan->tasks_failed++;
+}
+
+#define CHECK_THAT(COND, ...)                                               \
+    do {                                                                    \
+        if( !(COND) ) {                                                     \
+            fprintf(stderr, "CHECK(%d): ", k);                              \
+            fprintf(stderr, __VA_ARGS__);                                   \
+            fprintf(stderr, "\n");                                          \
+            errors++;                                                       \
+        }                                                                   \
+    } while(0)
+
+static int check_task(int k, const parsec_qpu_result_t *result, const void *circuit, const void *params, int shots)
+{
+    int status = 0, attempts = 0, errors = 0;
+
+    plan_of(k, &status, &attempts, NULL);
+    CHECK_THAT(PARSEC_QPU_RESULT_VERSION == result->version, "result version is %u: the task was released before its result was written",
+               (unsigned)result->version);
+    if( PARSEC_QPU_RESULT_VERSION != result->version ) return errors;
+    CHECK_THAT(status == result->status, "status %u, expected %d", (unsigned)result->status, status);
+    CHECK_THAT(attempts == result->attempts, "%u job(s), expected %d", (unsigned)result->attempts, attempts);
+    CHECK_THAT((uint32_t)shots == result->shots_requested, "%u shots requested", result->shots_requested);
+    CHECK_THAT(QPU_TEST_NB_QUBITS == result->nb_qubits, "%u qubits", (unsigned)result->nb_qubits);
+    CHECK_THAT((result->t_hook <= result->t_submit) && (result->t_submit <= result->t_retrieve), "the times are out of order");
+
+    if( PARSEC_QPU_STATUS_OK != result->status ) {
+        CHECK_THAT(0 == result->nb_entries, "a task without a result has %u entries", result->nb_entries);
+        CHECK_THAT(0 == result->shots_returned, "a task without a result returned %u shots", result->shots_returned);
+        CHECK_THAT(0 == result->flags, "a task without a result has flags %x", (unsigned)result->flags);
+        return errors;
+    }
+    CHECK_THAT(PARSEC_QPU_RESULT_MOCK == result->flags, "flags are %x", (unsigned)result->flags);
+    CHECK_THAT((uint32_t)shots == result->shots_returned, "%u shots returned", result->shots_returned);
+    /* Of the job that gave the result: asked for, started, ended, read, in
+     * that order, also when it had to be asked for more than once. */
+    CHECK_THAT((result->t_submit <= result->t_start) && (result->t_start <= result->t_end) &&
+               (result->t_end <= result->t_retrieve),
+               "the job started %lld ns after it was asked for, ran %lld ns, and was read %lld ns after its end",
+               (long long)(result->t_start - result->t_submit), (long long)(result->t_end - result->t_start),
+               (long long)(result->t_retrieve - result->t_end));
+    /* The counts of the evaluation, however many jobs it took to get them. */
+    errors += qpu_test_check_counts(result, circuit, params, shots, qpu_test_key(k, 0), "CHECK", k, 0);
+    return errors;
+}
+%}
+
+W            [ type = "parsec_data_collection_t*" ]
+Q            [ type = "parsec_data_collection_t*" ]
+NT           [ type = int ]
+SHOTS        [ type = int ]
+
+PREP(k)
+
+k = 0 .. NT-1
+
+: W(k)
+
+WRITE C  -> C  QEXEC(k)
+         -> C  CHECK(k)
+WRITE TH -> TH QEXEC(k)
+         -> TH CHECK(k)
+
+BODY
+{
+    qpu_test_make_circuit(C, k, 0, 0);
+    qpu_test_make_params(TH, k, 0);
+}
+END
+
+QEXEC(k)
+
+k = 0 .. NT-1
+
+: Q(0)
+
+READ  C   <- C  PREP(k)
+READ  TH  <- TH PREP(k)
+WRITE RES -> RES CHECK(k)
+
+BODY [type=QPU]
+{
+    /* Mark the result, so that a successor released too early shows. */
+    memset(RES, 0xff, QPU_TEST_BLOCK);
+    return PARSEC_QPU_SUBMIT_KEYED(C, TH, RES, SHOTS, qpu_test_key(k, 0));
+}
+END
+
+CHECK(k)
+
+k = 0 .. NT-1
+
+: W(k)
+
+READ C   <- C   PREP(k)
+READ TH  <- TH  PREP(k)
+READ RES <- RES QEXEC(k)
+
+BODY
+{
+    int errors = check_task(k, (const parsec_qpu_result_t*)RES, C, TH, SHOTS);
+    if( errors > 0 ) (void)parsec_atomic_fetch_add_int32(&nb_errors, errors);
+    (void)parsec_atomic_fetch_inc_int32(&executed[k]);
+    if( verbose ) {
+        printf("CHECK(%d) on rank %d: status %u after %u job(s)\n", k, es->virtual_process->parsec_context->my_rank,
+               (unsigned)((const parsec_qpu_result_t*)RES)->status, (unsigned)((const parsec_qpu_result_t*)RES)->attempts);
+    }
+}
+END
+
+extern "C" %{
+
+#define EXPECT_EQ(WHAT, GOT, WANT)                                                          \
+    do {                                                                                    \
+        if( (long long)(GOT) != (long long)(WANT) ) {                                       \
+            fprintf(stderr, "%s: %lld, expected %lld\n", WHAT, (long long)(GOT), (long long)(WANT)); \
+            nb_errors++;                                                                    \
+        }                                                                                   \
+    } while(0)
+
+/* The counters of the service and of the mock against the plan, over the
+ * nb_phases taskpools of the run. */
+static void check_counters(int nt, int nb_phases, int64_t elapsed_ns)
+{
+    parsec_qpu_stats_t stats;
+    parsec_qpu_mock_stats_t mock;
+    plan_t plan;
+    int status, attempts;
+    const int last_phase = phase;
+
+    memset(&plan, 0, sizeof(plan));
+    for( phase = 0; phase < nb_phases; phase++ ) {
+        for( int k = 0; k < nt; k++ ) plan_of(k, &status, &attempts, &plan);
+    }
+    phase = last_phase;
+
+    /* An end reported for a job that is gone comes a moment after the real
+     * one, and the last of them may still be on its way. */
+    for( int i = 0; i < 2000; i++ ) {
+        struct timespec ts = { 0, 1000000 };
+        parsec_qpu_service_stats(&stats);
+        if( (long)stats.stray_events >= plan.ghosts ) break;
+        nanosleep(&ts, NULL);
+    }
+    parsec_qpu_service_stats(&stats);
+    parsec_qpu_mock_stats(&mock);
+
+    nb_errors += qpu_test_check_invariants((long)nt * nb_phases, verbose);
+
+    EXPECT_EQ("jobs the backend took", stats.jobs_submitted, plan.jobs);
+    EXPECT_EQ("jobs that failed", stats.jobs_failed, plan.failed);
+    EXPECT_EQ("jobs that timed out", stats.jobs_timed_out, plan.timed_out);
+    EXPECT_EQ("retries", stats.retries, plan.retries);
+    EXPECT_EQ("tasks without a result", stats.tasks_failed, plan.tasks_failed);
+    EXPECT_EQ("tasks ended as unavailable", stats.tasks_unavailable,
+              ((MODE_DOWN_LONG == mode) || (MODE_LOST_DOWN == mode) || (MODE_DOWN_TWICE == mode)) ? nt : 0);
+    EXPECT_EQ("tasks ended as rejected", stats.tasks_rejected, (MODE_REJECTED == mode) ? nt : 0);
+    EXPECT_EQ("ends reported for a job that was not in flight", stats.stray_events, plan.ghosts);
+    EXPECT_EQ("empty jobs", stats.empty_jobs, 0);
+    /* The backend's side of the same story. */
+    EXPECT_EQ("jobs the mock cancelled", mock.cancels, plan.timed_out);
+    EXPECT_EQ("jobs the mock reported as failed", mock.failures, plan.mock_failures);
+    EXPECT_EQ("submissions the mock refused for good", mock.rejected, plan.mock_rejected);
+    EXPECT_EQ("ends the mock reported for a job that was gone", mock.ghost_events, plan.ghosts);
+    EXPECT_EQ("jobs the mock found by their tag", mock.tag_hits, plan.tag_hits);
+    EXPECT_EQ("submissions the mock deferred, as the service counts them", stats.submit_deferred, mock.deferred);
+    EXPECT_EQ("results the mock gave out", mock.results, (long)nt * nb_phases - plan.tasks_failed);
+
+    switch( mode ) {
+    case MODE_MIXED:
+        if( nt >= 10 ) EXPECT_EQ("some submission was deferred (1 when so)", stats.submit_deferred > 0, 1);
+        break;
+    case MODE_DOWN_SHORT:
+        EXPECT_EQ("some submission was deferred (1 when so)", stats.submit_deferred > 0, 1);
+        EXPECT_EQ("the run lasted as long as the backend was down (1 when so)", elapsed_ns >= DOWN_SHORT_NS, 1);
+        break;
+    case MODE_DOWN_LONG:
+        EXPECT_EQ("jobs the mock created", mock.submits, 0);
+        EXPECT_EQ("the run lasted as long as the time-out (1 when so)",
+                  elapsed_ns >= (int64_t)parsec_qpu_params.unavailable_timeout_ms * 1000000LL, 1);
+        break;
+    case MODE_DOWN_TWICE:
+        EXPECT_EQ("jobs the mock created", mock.submits, nt);
+        EXPECT_EQ("the run lasted as long as the time-out (1 when so)",
+                  elapsed_ns >= (int64_t)parsec_qpu_params.unavailable_timeout_ms * 1000000LL, 1);
+        break;
+    case MODE_LOST_DOWN:
+        /* The backend took a job each time the service started asking, and
+         * each of them was taken back from it. */
+        EXPECT_EQ("the mock created a job (1 when so)", mock.submits > 0, 1);
+        EXPECT_EQ("jobs the mock was told to give up", mock.abandoned, mock.submits);
+        EXPECT_EQ("jobs the mock still holds that nobody knows of", mock.unknown_jobs, 0);
+        EXPECT_EQ("the run lasted as long as the time-out (1 when so)",
+                  elapsed_ns >= (int64_t)parsec_qpu_params.unavailable_timeout_ms * 1000000LL, 1);
+        break;
+    case MODE_REJECTED:
+        EXPECT_EQ("submissions the mock received", mock.submit_calls, 0);
+        break;
+    case MODE_AMBIGUOUS:
+        EXPECT_EQ("jobs the mock created", mock.submits, nt);
+        break;
+    default:
+        break;
+    }
+}
+
+int main(int argc, char *argv[])
+{
+    parsec_context_t *parsec;
+    parsec_qpu_failure_taskpool_t *tp;
+    parsec_data_collection_t *W, *Q;
+    int nt = 40, shots = 100, qrank = 0, nb_phases = 1;
+    int rank = 0, world = 1, rc, test_argc, pargc;
+    char **pargv;
+    long errors, checks = 0;
+    int64_t t0, t1;
+
+    qpu_test_split_args(argc, argv, &test_argc, &pargc, &pargv);
+    for( int i = 1; i < test_argc; i++ ) {
+        if( 0 == strcmp(argv[i], "-v") ) { verbose = 1; continue; }
+        if( i + 1 >= test_argc ) break;
+        if( 0 == strcmp(argv[i], "-n") ) nt = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-s") ) shots = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-q") ) qrank = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-m") ) {
+            const char *name = argv[++i];
+            mode = -1;
+            for( size_t m = 0; m < sizeof(mode_names) / sizeof(mode_names[0]); m++ ) {
+                if( 0 == strcmp(name, mode_names[m]) ) mode = (int)m;
+            }
+            if( mode < 0 ) {
+                fprintf(stderr, "qpu_failure: unknown mode %s\n", name);
+                return 1;
+            }
+        }
+    }
+    if( (nt <= 0) || (shots <= 0) ) {
+        fprintf(stderr, "qpu_failure: -n and -s must be positive\n");
+        return 1;
+    }
+
+    if( MODE_DOWN_TWICE == mode ) nb_phases = 2;
+
+    /* Before any job is submitted, on every rank; only the QPU's rank uses it. */
+    if( MODE_REJECTED != mode ) parsec_qpu_mock_set_fault_fn(fault_fn, NULL);
+
+    rc = parsec_tests_context_init(-1, PARSEC_TEST_THREAD_SERIALIZED, &pargc, &pargv, &parsec, &rank, &world);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_init");
+    if( qrank >= world ) qrank = world - 1;
+    max_attempts = 1 + ((parsec_qpu_params.max_retries > 0) ? parsec_qpu_params.max_retries : 0);
+    if( ((MODE_MIXED == mode) || (MODE_TIMEOUT == mode)) && (parsec_qpu_params.job_timeout_ms <= 0) ) {
+        fprintf(stderr, "qpu_failure: mode %s has jobs that never end; it needs --mca device_qpu_job_timeout\n", mode_names[mode]);
+        parsec_tests_abort(parsec, 1);
+    }
+
+    executed  = (int32_t*)calloc((size_t)nt, sizeof(int32_t));
+    lost_once = (unsigned char*)calloc((size_t)nt, 1);
+    nb_tasks  = nt;
+    W = qpu_test_placement_new(rank, world, -1);
+    Q = qpu_test_placement_new(rank, world, qrank);
+
+    t0 = parsec_qpu_now_ns();
+    for( phase = 0; phase < nb_phases; phase++ ) {
+        memset(executed, 0, (size_t)nt * sizeof(int32_t));
+        tp = parsec_qpu_failure_new(W, Q, nt, shots);
+        qpu_test_block_type_set(&tp->arenas_datatypes[PARSEC_qpu_failure_DEFAULT_ADT_IDX]);
+
+        rc = parsec_context_add_taskpool(parsec, (parsec_taskpool_t*)tp);
+        PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+        rc = parsec_context_start(parsec);
+        PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+        rc = parsec_context_wait(parsec);
+        PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+
+        /* Every CHECK ran once, on the rank that owns it, whatever became of its job. */
+        for( int k = 0; k < nt; k++ ) {
+            int expected = ((int)W->rank_of(W, k) == rank) ? 1 : 0;
+            if( expected != executed[k] ) {
+                fprintf(stderr, "rank %d: CHECK(%d) of taskpool %d ran %d time(s), expected %d\n",
+                        rank, k, phase, executed[k], expected);
+                nb_errors++;
+            }
+            checks += executed[k];
+        }
+        qpu_test_block_type_unset(&tp->arenas_datatypes[PARSEC_qpu_failure_DEFAULT_ADT_IDX]);
+        PARSEC_OBJ_DESTRUCT(&tp->arenas_datatypes[PARSEC_qpu_failure_DEFAULT_ADT_IDX]);
+        parsec_taskpool_free((parsec_taskpool_t*)tp);
+    }
+    phase = nb_phases - 1;
+    t1 = parsec_qpu_now_ns();
+
+    if( rank == qrank ) {
+        check_counters(nt, nb_phases, t1 - t0);
+    } else {
+        nb_errors += qpu_test_check_service(0, 0, 0, 0);
+    }
+
+    errors = qpu_test_sum(parsec, nb_errors);
+    checks = qpu_test_sum(parsec, checks);
+    if( checks != (long)nt * nb_phases ) {
+        if( 0 == rank ) fprintf(stderr, "%ld CHECK tasks ran in total, expected %ld\n", checks, (long)nt * nb_phases);
+        errors++;
+    }
+
+    qpu_test_placement_free(W);
+    qpu_test_placement_free(Q);
+    free(executed);
+
+    rc = parsec_tests_context_fini(&parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
+    parsec_qpu_mock_set_fault_fn(NULL, NULL);
+    free(lost_once);
+
+    if( 0 == rank ) {
+        printf("qpu_failure: mode %s, %d tasks in each of %d taskpool(s) on %d rank(s), %.3f ms: %s\n",
+               mode_names[mode], nt, nb_phases, world, (t1 - t0) * 1e-6, errors ? "FAILED" : "passed");
+    }
+    return errors ? 1 : 0;
+}
+
+%}

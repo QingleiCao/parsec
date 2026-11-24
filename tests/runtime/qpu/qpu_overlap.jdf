@@ -1,0 +1,245 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+/**
+ * Classical work while a quantum job is outstanding.
+ *
+ * One quantum task submits a long job. A chain of classical tasks, each
+ * burning a few milliseconds of CPU, starts once the job is submitted. The
+ * test passes if the whole chain ran while the job was outstanding, which
+ * needs the worker that submitted the job to be free again at once.
+ *
+ * Run with a single worker thread (-t 1) this is the sharpest form of the
+ * test: a QPU layer that kept the worker until the job was over would
+ * finish the job first and the classical chain after it.
+ *
+ * The test also looks at the progress thread: while it waits for the job it
+ * must sleep, not spin.
+ *
+ * Options, before "--":
+ *   -t CORES  worker threads (default: all)
+ *   -m M      classical tasks in the chain (default 20)
+ *   -w US     CPU time each of them burns, in microseconds (default 5000)
+ *   -d US     what device_qpu_mock_delay makes the job last (default 400000);
+ *             it must be well above M times the work
+ *   -v        verbose
+ */
+
+#include "qpu_test_common.h"
+#include "parsec/sys/atomic.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int verbose = 0;
+static int32_t job_submitted = 0;
+static int64_t t_before_submit = 0;
+static int64_t work_ns = 5000000;
+static int64_t *work_start = NULL, *work_end = NULL, *work_load = NULL;
+%}
+
+W        [ type = "parsec_data_collection_t*" ]
+R        [ type = "parsec_data_collection_t*" ]
+M        [ type = int ]
+
+PREP(z)
+
+z = 0 .. 0
+
+: W(0)
+
+WRITE C  -> C  QEXEC(0)
+WRITE TH -> TH QEXEC(0)
+
+BODY
+{
+    qpu_test_make_circuit(C, 0, 0, 0);
+    qpu_test_make_params(TH, 0, 0);
+}
+END
+
+QEXEC(z)
+
+z = 0 .. 0
+
+: R(0)
+
+READ C   <- C  PREP(0)
+READ TH  <- TH PREP(0)
+RW   RES <- R(0)
+         -> R(0)
+
+BODY [type=QPU]
+{
+    memset(RES, 0xff, QPU_TEST_BLOCK);
+    t_before_submit = parsec_qpu_now_ns();
+    (void)parsec_atomic_fetch_inc_int32(&job_submitted);
+    return PARSEC_QPU_SUBMIT(C, TH, RES, 100);
+}
+END
+
+WORK(i)
+
+i = 0 .. M-1
+
+: W(0)
+
+CTL X <- (i > 0)   ? X WORK(i-1)
+      -> (i < M-1) ? X WORK(i+1)
+
+BODY
+{
+    int64_t now;
+
+    /* The chain is to run during the job, so not before it is submitted.
+     * With one worker this gives the quantum task its turn. */
+    if( (0 == i) && (0 == parsec_atomic_fetch_add_int32(&job_submitted, 0)) ) {
+        return PARSEC_HOOK_RETURN_AGAIN;
+    }
+    work_start[i] = parsec_qpu_now_ns();
+    do {
+        now = parsec_qpu_now_ns();
+    } while( now - work_start[i] < work_ns );
+    work_end[i] = now;
+    {
+        /* What the device holds while the job is outstanding. */
+        parsec_qpu_device_info_t info;
+        if( PARSEC_SUCCESS == parsec_qpu_device_info(0, &info) ) work_load[i] = info.load_ns;
+    }
+}
+END
+
+extern "C" %{
+
+int main(int argc, char *argv[])
+{
+    parsec_context_t *parsec;
+    parsec_qpu_overlap_taskpool_t *tp;
+    parsec_data_collection_t *W, *R;
+    const parsec_qpu_result_t *result;
+    parsec_qpu_stats_t stats;
+    unsigned char circuit[QPU_TEST_BLOCK], params[QPU_TEST_BLOCK];
+    int cores = -1, m = 20;
+    long delay_us = 400000;
+    int rank, world, rc, test_argc, pargc, errors = 0;
+    int64_t t0, t1;
+    char **pargv;
+
+    qpu_test_split_args(argc, argv, &test_argc, &pargc, &pargv);
+    for( int i = 1; i < test_argc; i++ ) {
+        if( 0 == strcmp(argv[i], "-v") ) { verbose = 1; continue; }
+        if( i + 1 >= test_argc ) break;
+        if( 0 == strcmp(argv[i], "-t") ) cores = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-m") ) m = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-w") ) work_ns = atol(argv[++i]) * 1000;
+        else if( 0 == strcmp(argv[i], "-d") ) delay_us = atol(argv[++i]);
+    }
+
+    rc = parsec_tests_context_init(cores, PARSEC_TEST_THREAD_SERIALIZED, &pargc, &pargv, &parsec, &rank, &world);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_init");
+    if( 1 != world ) {
+        fprintf(stderr, "qpu_overlap runs on one rank\n");
+        parsec_tests_abort(parsec, 1);
+    }
+
+    work_start = (int64_t*)calloc(m, sizeof(int64_t));
+    work_end   = (int64_t*)calloc(m, sizeof(int64_t));
+    work_load  = (int64_t*)calloc(m, sizeof(int64_t));
+    W = qpu_test_placement_new(rank, world, -1);
+    R = qpu_test_tiles_new(rank, world, 0, 1);
+
+    tp = parsec_qpu_overlap_new(W, R, m);
+    qpu_test_block_type_set(&tp->arenas_datatypes[PARSEC_qpu_overlap_DEFAULT_ADT_IDX]);
+    rc = parsec_context_add_taskpool(parsec, (parsec_taskpool_t*)tp);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+
+    t0 = parsec_qpu_now_ns();
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+    rc = parsec_context_wait(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+    t1 = parsec_qpu_now_ns();
+
+    result = (const parsec_qpu_result_t*)qpu_test_tiles_ptr(R, 0);
+    qpu_test_make_circuit(circuit, 0, 0, 0);
+    qpu_test_make_params(params, 0, 0);
+    /* This test leaves the key of the evaluation to the runtime, so the
+     * counts can only be checked for being a well-formed answer. */
+    errors += qpu_test_check_result(result, circuit, params, 100, PARSEC_QPU_KEY_AUTO, "tile", 0, 0);
+
+    /* The whole chain ran between the submission and the end of the job. */
+    for( int i = 0; i < m; i++ ) {
+        if( work_start[i] < t_before_submit ) {
+            fprintf(stderr, "WORK(%d) started %.3f ms before the job was submitted\n",
+                    i, (t_before_submit - work_start[i]) * 1e-6);
+            errors++;
+        }
+        if( work_end[i] > result->t_end ) {
+            fprintf(stderr, "WORK(%d) ended %.3f ms after the job did: the classical chain did not run while "
+                    "the job was outstanding\n", i, (work_end[i] - result->t_end) * 1e-6);
+            errors++;
+        }
+    }
+    /* All that time the device held the quantum task: its load was what one
+     * task counts for. */
+    for( int i = 0; i < m; i++ ) {
+        if( PARSEC_QPU_TASK_TIME_NS != work_load[i] ) {
+            fprintf(stderr, "WORK(%d) saw a load of %lld ns on the QPU device while its one job was outstanding, "
+                    "expected %lld ns\n", i, (long long)work_load[i], (long long)PARSEC_QPU_TASK_TIME_NS);
+            errors++;
+        }
+    }
+
+    /* So the run is as long as the job, not as the job plus the chain. */
+    if( (t1 - t0) < delay_us * 1000 ) {
+        fprintf(stderr, "the run took %.3f ms, the job alone lasts %.3f ms\n", (t1 - t0) * 1e-6, delay_us * 1e-3);
+        errors++;
+    }
+    if( (t1 - t0) >= delay_us * 1000 + (int64_t)m * work_ns ) {
+        fprintf(stderr, "the run took %.3f ms: as long as the job (%.3f ms) and the classical chain (%.3f ms) "
+                "one after the other\n", (t1 - t0) * 1e-6, delay_us * 1e-3, m * work_ns * 1e-6);
+        errors++;
+    }
+
+    /* The progress thread slept through the job. */
+    parsec_qpu_service_stats(&stats);
+    if( !stats.running ) {
+        fprintf(stderr, "no progress thread\n");
+        errors++;
+    } else if( stats.progress_cpu_ns * 100 > stats.progress_wall_ns ) {
+        fprintf(stderr, "the progress thread used %.3f ms of CPU in %.3f ms: it does not sleep while it waits\n",
+                stats.progress_cpu_ns * 1e-6, stats.progress_wall_ns * 1e-6);
+        errors++;
+    }
+    errors += qpu_test_check_service(1, 1, 0, verbose);
+    if( verbose ) {
+        printf("job: submitted at +%.3f ms, ended at +%.3f ms; classical chain from +%.3f to +%.3f ms; "
+               "run %.3f ms; progress thread %.3f ms of CPU\n",
+               (t_before_submit - t0) * 1e-6, (result->t_end - t0) * 1e-6,
+               (work_start[0] - t0) * 1e-6, (work_end[m - 1] - t0) * 1e-6,
+               (t1 - t0) * 1e-6, stats.progress_cpu_ns * 1e-6);
+    }
+
+    qpu_test_block_type_unset(&tp->arenas_datatypes[PARSEC_qpu_overlap_DEFAULT_ADT_IDX]);
+    PARSEC_OBJ_DESTRUCT(&tp->arenas_datatypes[PARSEC_qpu_overlap_DEFAULT_ADT_IDX]);
+    parsec_taskpool_free((parsec_taskpool_t*)tp);
+    qpu_test_tiles_free(R);
+    qpu_test_placement_free(W);
+    free(work_start);
+    free(work_end);
+    free(work_load);
+
+    rc = parsec_tests_context_fini(&parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
+
+    printf("qpu_overlap: %d classical tasks during one job, worker threads requested: %d: %s\n",
+           m, cores, errors ? "FAILED" : "passed");
+    return errors ? 1 : 0;
+}
+
+%}

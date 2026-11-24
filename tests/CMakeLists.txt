@@ -91,8 +91,13 @@ function(parsec_addtest_cmd target)
   # prohibition: explicit MCA parameters on a device test intentionally replace
   # them before the runtime queries the device components.
   #
+  # The QPU layer follows the same policy, with one more guard: no test may
+  # reach a physical quantum device. A backend that drives one opens only
+  # when device_qpu_allow_hardware is set, and no test sets it (the test
+  # runtime/qpu/no_hardware_in_tests checks the definitions).
+  #
   set_tests_properties(${target} PROPERTIES ENVIRONMENT
-    "PARSEC_MCA_device_cuda_enabled=0;PARSEC_MCA_device_hip_enabled=0;PARSEC_MCA_device_level_zero_enabled=0;PARSEC_MCA_device_cuda_memory_use=10;PARSEC_MCA_device_hip_memory_use=10;PARSEC_MCA_device_level_zero_memory_use=10")
+    "PARSEC_MCA_device_cuda_enabled=0;PARSEC_MCA_device_hip_enabled=0;PARSEC_MCA_device_level_zero_enabled=0;PARSEC_MCA_device_cuda_memory_use=10;PARSEC_MCA_device_hip_memory_use=10;PARSEC_MCA_device_level_zero_memory_use=10;PARSEC_MCA_device_qpu_enabled=0;PARSEC_MCA_device_qpu_allow_hardware=0")
   # skip tests that fail because the device is not available */
   set_tests_properties(${target} PROPERTIES SKIP_RETURN_CODE 10) # 10 is -PARSEC_ERR_DEVICE, positive 7bit return codes are more portable
 endfunction(parsec_addtest_cmd)
