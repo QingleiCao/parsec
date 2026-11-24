@@ -275,10 +275,9 @@ sched_lfq_select(parsec_execution_stream_t *es,
 {
     sched_lfq_object_t *lfq = SCHED_LFQ_OBJECT(es);
     parsec_mca_sched_local_queues_scheduler_object_t *sched_obj = &lfq->super;
-    const int refill = parsec_sched_lfq_overflow_refill;
     parsec_list_item_t *ring;
     parsec_task_t *task = NULL;
-    int max, nb;
+    int nb;
 
     task = (parsec_task_t*)parsec_hbbuffer_pop_best(sched_obj->task_queue,
                                                     parsec_execution_context_priority_comparator);
@@ -286,12 +285,11 @@ sched_lfq_select(parsec_execution_stream_t *es,
         *distance = 0;
         return task;
     }
-    if( PARSEC_SCHED_LFQ_REFILL_BEFORE_STEAL == refill ) {
-        task = sched_lfq_pop_refill(sched_obj, lfq->refill, 1);
-        if( NULL != task ) {
-            *distance = 1 + sched_obj->nb_hierarch_queues;
-            return task;
-        }
+    /* The rest of the last batch of this thread, before the work of the others */
+    task = sched_lfq_pop_refill(sched_obj, lfq->refill, 1);
+    if( NULL != task ) {
+        *distance = 1 + sched_obj->nb_hierarch_queues;
+        return task;
     }
     for(int i = 0; i < sched_obj->nb_hierarch_queues; i++ ) {
         task = (parsec_task_t*)parsec_hbbuffer_pop_best(sched_obj->hierarch_queues[i],
@@ -303,57 +301,31 @@ sched_lfq_select(parsec_execution_stream_t *es,
             return task;
         }
     }
-    if( PARSEC_SCHED_LFQ_REFILL_AFTER_STEAL == refill ) {
-        task = sched_lfq_pop_refill(sched_obj, lfq->refill, 1);
-        if( NULL != task ) {
-            *distance = 1 + sched_obj->nb_hierarch_queues;
-            return task;
-        }
-    }
 
     /* The tasks that a stalled thread holds in its list left the system queue
      * before the ones that are in it now */
-    if( (PARSEC_SCHED_LFQ_REFILL_NONE != refill) && parsec_sched_lfq_overflow_takeover ) {
-        ring = sched_lfq_take_stalled_refill(lfq);
-        if( NULL != ring ) {
-            task = sched_lfq_keep_ring(lfq, ring);
+    ring = sched_lfq_take_stalled_refill(lfq);
+    if( NULL != ring ) {
+        task = sched_lfq_keep_ring(lfq, ring);
 #if defined(PARSEC_PAPI_SDE)
-            sched_obj->local_system_queue_balance--;
+        sched_obj->local_system_queue_balance--;
 #endif
-            PARSEC_DEBUG_VERBOSE(20, parsec_debug_output, "LQ\t: %d:%d found task %p in a refill list that stalled",
-                    es->virtual_process->vp_id, es->th_id, task);
-            *distance = 2 + sched_obj->nb_hierarch_queues;
-            return task;
-        }
+        PARSEC_DEBUG_VERBOSE(20, parsec_debug_output, "LQ\t: %d:%d found task %p in a refill list that stalled",
+                es->virtual_process->vp_id, es->th_id, task);
+        *distance = 2 + sched_obj->nb_hierarch_queues;
+        return task;
     }
 
     /* Nothing in the bounded buffers: go to the system queue, and bring back
      * several tasks at once. Every thread that is out of tasks comes to this
      * queue, so the fewer the visits the better. */
-    max = parsec_sched_lfq_overflow_batch;
-    if( PARSEC_SCHED_LFQ_REFILL_NONE == refill ) {
-        /* The tasks beyond the first go to the local buffer, which is empty or
-         * close to it at this point; keep half of it for the tasks that the
-         * first one will make ready. */
-        int room = 1 + (int)(sched_obj->task_queue->size / 2);
-        if( max > room )
-            max = room;
-    }
-    ring = parsec_mca_sched_pop_chain_from_system_queue_wrapper(sched_obj, max,
+    ring = parsec_mca_sched_pop_chain_from_system_queue_wrapper(sched_obj, parsec_sched_lfq_overflow_batch,
                                                                 parsec_sched_lfq_overflow_spins, &nb);
     if( NULL != ring ) {
-        if( PARSEC_SCHED_LFQ_REFILL_NONE == refill ) {
-            parsec_list_item_t *others = parsec_list_item_ring_chop(ring);
-            PARSEC_LIST_ITEM_SINGLETON(ring);
-            task = (parsec_task_t*)ring;
-            if( NULL != others )
-                parsec_hbbuffer_push_all(sched_obj->task_queue, others, 0);
-        } else {
-            task = sched_lfq_keep_ring(lfq, ring);
+        task = sched_lfq_keep_ring(lfq, ring);
 #if defined(PARSEC_PAPI_SDE)
-            sched_obj->local_system_queue_balance += nb - 1;
+        sched_obj->local_system_queue_balance += nb - 1;
 #endif
-        }
         PARSEC_DEBUG_VERBOSE(20, parsec_debug_output, "LQ\t: %d:%d found task %p and %d others in its system queue %p",
                 es->virtual_process->vp_id, es->th_id, task, nb - 1, sched_obj->system_queue);
         *distance = 1 + sched_obj->nb_hierarch_queues;
@@ -364,8 +336,7 @@ sched_lfq_select(parsec_execution_stream_t *es,
      * it from there one task at a time. While the system queue holds tasks the
      * lists of the others are left alone (unless they stalled, see above), even
      * if the lock of the queue stayed busy: the thread comes back to the queue. */
-    if( (PARSEC_SCHED_LFQ_REFILL_NONE != refill) &&
-        parsec_list_nolock_is_empty((parsec_list_t*)sched_obj->system_queue) ) {
+    if( parsec_list_nolock_is_empty((parsec_list_t*)sched_obj->system_queue) ) {
         for(int i = 1; i < sched_obj->nb_hierarch_queues; i++ ) {
             task = sched_lfq_pop_refill(sched_obj, lfq->hierarch_refills[i], 0);
             if( NULL != task ) {
