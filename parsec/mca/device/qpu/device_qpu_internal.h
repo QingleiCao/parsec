@@ -44,6 +44,7 @@ typedef struct parsec_qpu_params_s {
     int   unavailable_timeout_ms; /**< device_qpu_unavailable_timeout */
     int   retry_backoff_ms;       /**< device_qpu_retry_backoff */
     int   mock_seed;              /**< device_qpu_mock_seed */
+    int   mock_delay_seed;        /**< device_qpu_mock_delay_seed */
     int   mock_slots;             /**< device_qpu_mock_slots */
     char *mock_delay;             /**< device_qpu_mock_delay */
     char *mock_queue_delay;       /**< device_qpu_mock_queue_delay */
@@ -232,6 +233,23 @@ PARSEC_DECLSPEC void parsec_qpu_delay_fini(parsec_qpu_delay_t *delay);
 /** One delay in nanoseconds, from 64 random bits. The same bits give the
  *  same delay. */
 PARSEC_DECLSPEC int64_t parsec_qpu_delay_draw(const parsec_qpu_delay_t *delay, uint64_t bits);
+
+/** The three times the mock draws: for each circuit of a job
+ *  (device_qpu_mock_delay), and for the job as a whole from its first
+ *  circuit: the time it waits in its slot (device_qpu_mock_queue_delay) and
+ *  the part it pays whatever it carries (device_qpu_mock_job_delay). */
+typedef enum parsec_qpu_mock_time_e {
+    PARSEC_QPU_MOCK_TIME_CIRCUIT = 1,
+    PARSEC_QPU_MOCK_TIME_QUEUE   = 2,
+    PARSEC_QPU_MOCK_TIME_JOB     = 3
+} parsec_qpu_mock_time_t;
+
+/** One of those times for the evaluation `key` at attempt `attempt`, drawn
+ *  from `delay` with the seed of the mock's times (device_qpu_mock_delay_seed,
+ *  or device_qpu_mock_seed when that is 0), as the mock draws it. For models
+ *  that have to see the times a run saw. */
+PARSEC_DECLSPEC int64_t parsec_qpu_mock_time(const parsec_qpu_delay_t *delay, uint64_t delay_seed,
+                                             uint64_t key, uint32_t attempt, parsec_qpu_mock_time_t what);
 
 /** Time one circuit of a job runs, in nanoseconds, replacing
  *  device_qpu_mock_delay; a job with several circuits is asked once for

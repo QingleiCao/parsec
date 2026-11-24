@@ -19,6 +19,8 @@
  *     one evaluation at once, inputs that change under a job.
  *   - cancel() in every state of a job, a job being sampled included, and
  *     abandon() of a submission whose reply was lost.
+ *   - A seed for the times apart from the samples: other times, the same
+ *     counts, and the time of a circuit known outside the mock.
  *   - Jobs of several circuits: one result per circuit, the same as when
  *     the circuit runs alone; a time that is a part per job plus a part per
  *     circuit; one fate for the whole job.
@@ -131,7 +133,7 @@ static parsec_qpu_backend_t *mock_open(int slots, const char *delay, const char 
     parsec_qpu_backend_t *backend = NULL;
     int rc;
 
-    parsec_qpu_params.mock_seed        = SEED;
+    parsec_qpu_params.mock_seed        = SEED;   /* the seed of the times stays as the caller set it, 0 by default */
     parsec_qpu_params.mock_slots       = slots;
     parsec_qpu_params.mock_delay       = (char*)delay;
     parsec_qpu_params.mock_queue_delay = (char*)queue_delay;
@@ -1200,6 +1202,95 @@ static void test_batches(void)
     for( int i = 0; i < N; i++ ) data_free(&d[i]);
 }
 
+/* ------------------------------------------------------------------------
+ * The seed of the times
+ * --------------------------------------------------------------------- */
+
+static void test_delay_seed(void)
+{
+    enum { N = 4 };
+    const char *spec = "uniform:2000:12000", *job_spec = "uniform:1000:5000", *queue_spec = "uniform:500:3000";
+    parsec_qpu_delay_t delay, job_delay, queue_delay;
+    int64_t ran[3][N];
+    uint64_t counts[3][N];
+    int differ = 0;
+
+    EXPECT(PARSEC_SUCCESS == parsec_qpu_delay_parse(&delay, spec), "parse");
+    EXPECT(PARSEC_SUCCESS == parsec_qpu_delay_parse(&job_delay, job_spec), "parse");
+    EXPECT(PARSEC_SUCCESS == parsec_qpu_delay_parse(&queue_delay, queue_spec), "parse");
+    /* Three runs of the same four jobs: the seed of the times not set (it is
+     * the seed of the samples), set to 5, set to 6. Each job has a part of its
+     * own and waits in its slot before it runs. */
+    for( int run = 0; run < 3; run++ ) {
+        const int64_t delay_seed = (0 == run) ? 0 : 4 + run;
+        const uint64_t seed = (0 == delay_seed) ? SEED : (uint64_t)delay_seed;
+        parsec_qpu_backend_t *backend;
+        parsec_qpu_event_t event;
+        parsec_qpu_job_id_t id[N];
+        int64_t before[N], after[N];
+        job_data_t d[N];
+        int done = 0;
+
+        parsec_qpu_params.mock_delay_seed = (int)delay_seed;
+        parsec_qpu_params.mock_job_delay  = (char*)job_spec;
+        backend = mock_open(N, spec, queue_spec, "none");
+        for( int i = 0; i < N; i++ ) {
+            parsec_qpu_request_t r;
+            d[i] = data_new(4, 30 + i, 2);
+            r = request_of(&d[i], 200, 900 + (uint64_t)i, 1);
+            before[i] = parsec_qpu_now_ns();
+            EXPECT(PARSEC_SUCCESS == ops->submit(backend, &r, 1, 7000 + (uint64_t)i, &id[i]), "submit");
+            after[i] = parsec_qpu_now_ns();
+        }
+        while( (done < N) && next_event(backend, 10000, &event) ) {
+            for( int i = 0; i < N; i++ ) {
+                if( event.id != id[i] ) continue;
+                EXPECT(PARSEC_SUCCESS == ops->results(backend, id[i], &d[i].result, 1), "results");
+                ran[run][i]    = d[i].result->t_end - d[i].result->t_start;
+                counts[run][i] = parsec_qpu_mix64(d[i].result->nb_entries ^ ((uint64_t)d[i].result->shots_returned << 32));
+                for( uint32_t e = 0; e < d[i].result->nb_entries; e++ ) {
+                    uint64_t bits; uint32_t count;
+                    parsec_qpu_result_get_entry(d[i].result, e, &bits, &count);
+                    counts[run][i] = parsec_qpu_mix64(counts[run][i] ^ bits ^ ((uint64_t)count << 40));
+                }
+                /* It waited in its slot for its queue delay, from the moment it arrived. */
+                {
+                    const int64_t queue = parsec_qpu_mock_time(&queue_delay, seed, 900 + (uint64_t)i, 1, PARSEC_QPU_MOCK_TIME_QUEUE);
+                    EXPECT((d[i].result->t_start - queue >= before[i]) && (d[i].result->t_start - queue <= after[i]),
+                           "run %d, job %d started %lld ns after its submission, and its queue delay is %lld ns", run, i,
+                           (long long)(d[i].result->t_start - before[i]), (long long)queue);
+                }
+                done++;
+            }
+        }
+        EXPECT(N == done, "%d of %d jobs ended", done, N);
+        {
+            parsec_qpu_mock_stats_t stats;
+            parsec_qpu_mock_stats(&stats);
+            for( int i = 0; i < N; i++ ) {
+                /* What it ran for is what a model is told: its part, and its circuit's. */
+                const int64_t told = parsec_qpu_mock_time(&delay, seed, 900 + (uint64_t)i, 1, PARSEC_QPU_MOCK_TIME_CIRCUIT)
+                                   + parsec_qpu_mock_time(&job_delay, seed, 900 + (uint64_t)i, 1, PARSEC_QPU_MOCK_TIME_JOB);
+                EXPECT((ran[run][i] == told) || ((stats.late > 0) && (ran[run][i] > told)),
+                       "run %d, job %d ran for %lld ns, and its part and its circuit's are %lld ns", run, i,
+                       (long long)ran[run][i], (long long)told);
+            }
+        }
+        for( int i = 0; i < N; i++ ) data_free(&d[i]);
+        EXPECT(PARSEC_SUCCESS == ops->close(backend), "close");
+    }
+    parsec_qpu_params.mock_delay_seed = 0;
+    parsec_qpu_params.mock_job_delay  = (char*)"const:0";
+    parsec_qpu_delay_fini(&delay);
+    parsec_qpu_delay_fini(&job_delay);
+    parsec_qpu_delay_fini(&queue_delay);
+    for( int i = 0; i < N; i++ ) {
+        EXPECT((counts[0][i] == counts[1][i]) && (counts[1][i] == counts[2][i]), "job %d has other counts with other times", i);
+        differ += (ran[1][i] != ran[2][i]);
+    }
+    EXPECT(differ >= N - 1, "two seeds of the times gave the same times to %d of %d jobs", N - differ, N);
+}
+
 int main(void)
 {
     test_delays();
@@ -1212,6 +1303,7 @@ int main(void)
     test_watchdogs();
     test_cancel();
     test_batches();
+    test_delay_seed();
 
     printf("qpu_mock_test: %s\n", nb_errors ? "FAILED" : "passed");
     return nb_errors ? 1 : 0;

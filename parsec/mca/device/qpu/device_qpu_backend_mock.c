@@ -44,7 +44,9 @@
  * Reproducibility. Whatever is drawn for a circuit (the time it runs, its
  * fate when faults are injected by probability, its samples) comes from the
  * seed, the key of the evaluation and the attempt number, never from a
- * generator shared between jobs; what is drawn for a job (its queue delay
+ * generator shared between jobs. Times are drawn from a seed of their own
+ * when device_qpu_mock_delay_seed is set, so that a run can be repeated with
+ * other times and the same samples; what is drawn for a job (its queue delay
  * and its fixed part) comes from those of its first circuit. The samples do
  * not depend on the attempt number, nor on what else the job carries: a
  * circuit that is run again, alone or with others, gives the counts it
@@ -132,6 +134,7 @@ typedef struct mock_backend_s {
     int32_t               sleeping;   /* the progress thread is in, or entering, the condition wait */
 
     uint64_t              seed;
+    uint64_t              delay_seed; /* of the times; the seed unless set apart */
     uint32_t              slots;
     uint32_t              max_qubits;
     uint32_t              max_circuits; /* per job */
@@ -317,13 +320,30 @@ int64_t parsec_qpu_delay_draw(const parsec_qpu_delay_t *delay, uint64_t bits)
     return (int64_t)ns;
 }
 
-/* What is drawn for a job comes from the seed, the key of its evaluation,
- * the attempt, and what the draw is for. */
-static inline uint64_t mock_bits(const mock_backend_t *mock, uint64_t key, uint32_t attempt, uint64_t purpose)
+/* What is drawn for a job comes from a seed, the key of its evaluation, the
+ * attempt, and what the draw is for. */
+static inline uint64_t mock_bits_of(uint64_t seed, uint64_t key, uint32_t attempt, uint64_t purpose)
 {
-    return parsec_qpu_mix64(parsec_qpu_mix64(parsec_qpu_mix64(mock->seed) ^ key)
+    return parsec_qpu_mix64(parsec_qpu_mix64(parsec_qpu_mix64(seed) ^ key)
                             + (uint64_t)attempt * 0x9e3779b97f4a7c15ULL
                             + purpose * 0xbf58476d1ce4e5b9ULL);
+}
+
+static inline uint64_t mock_bits(const mock_backend_t *mock, uint64_t key, uint32_t attempt, uint64_t purpose)
+{
+    return mock_bits_of(mock->seed, key, attempt, purpose);
+}
+
+/* The same for a time: from the seed of the times. */
+static inline uint64_t mock_time_bits(const mock_backend_t *mock, uint64_t key, uint32_t attempt, uint64_t purpose)
+{
+    return mock_bits_of(mock->delay_seed, key, attempt, purpose);
+}
+
+int64_t parsec_qpu_mock_time(const parsec_qpu_delay_t *delay, uint64_t delay_seed, uint64_t key, uint32_t attempt,
+                             parsec_qpu_mock_time_t what)
+{
+    return parsec_qpu_delay_draw(delay, mock_bits_of(delay_seed, key, attempt, (uint64_t)what));
 }
 
 /* ------------------------------------------------------------------------
@@ -823,6 +843,7 @@ static int mock_open(parsec_qpu_backend_t **backend, int device_index)
     (void)device_index;
     mock->super.ops  = &parsec_qpu_backend_mock_ops;
     mock->seed       = (uint64_t)parsec_qpu_params.mock_seed;
+    mock->delay_seed = (0 != parsec_qpu_params.mock_delay_seed) ? (uint64_t)parsec_qpu_params.mock_delay_seed : mock->seed;
     mock->slots      = (uint32_t)(parsec_qpu_params.mock_slots > 0 ? parsec_qpu_params.mock_slots : 1);
     mock->max_qubits = (uint32_t)(parsec_qpu_params.mock_max_qubits > 0 ? parsec_qpu_params.mock_max_qubits : 1);
     if( mock->max_qubits > PARSEC_QPU_SAMPLER_MAX_QUBITS ) mock->max_qubits = PARSEC_QPU_SAMPLER_MAX_QUBITS;
@@ -996,8 +1017,10 @@ static int mock_submit(parsec_qpu_backend_t *backend, const parsec_qpu_request_t
     job->fault       = fault;
     job->t_arrival   = now;
     /* What is drawn for the job as a whole comes from its first circuit. */
-    job->queue_delay = parsec_qpu_delay_draw(&mock->queue_delay, mock_bits(mock, requests[0].key, requests[0].attempt, 2));
-    job->duration    = parsec_qpu_delay_draw(&mock->job_delay, mock_bits(mock, requests[0].key, requests[0].attempt, 3));
+    job->queue_delay = parsec_qpu_delay_draw(&mock->queue_delay, mock_time_bits(mock, requests[0].key, requests[0].attempt,
+                                                                                 PARSEC_QPU_MOCK_TIME_QUEUE));
+    job->duration    = parsec_qpu_delay_draw(&mock->job_delay, mock_time_bits(mock, requests[0].key, requests[0].attempt,
+                                                                               PARSEC_QPU_MOCK_TIME_JOB));
     for( int i = 0; i < nb; i++ ) {
         const parsec_qpu_request_t *request = &requests[i];
         int64_t runs = 0;
@@ -1011,7 +1034,7 @@ static int mock_submit(parsec_qpu_backend_t *backend, const parsec_qpu_request_t
             runs = mock_delay_fn(tag, request, mock_delay_arg);
             if( runs < 0 ) runs = 0;
         } else {
-            runs = parsec_qpu_delay_draw(&mock->delay, mock_bits(mock, request->key, request->attempt, 1));
+            runs = parsec_qpu_delay_draw(&mock->delay, mock_time_bits(mock, request->key, request->attempt, PARSEC_QPU_MOCK_TIME_CIRCUIT));
         }
         job->duration += runs;
 

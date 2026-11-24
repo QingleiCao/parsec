@@ -51,6 +51,7 @@ parsec_qpu_params_t parsec_qpu_params = {
     .unavailable_timeout_ms = 60000,
     .retry_backoff_ms       = 100,
     .mock_seed              = 1,
+    .mock_delay_seed        = 0,
     .mock_slots             = 4,
     .mock_delay             = NULL,
     .mock_queue_delay       = NULL,
@@ -154,6 +155,11 @@ void parsec_qpu_register_params(void)
     (void)parsec_mca_param_reg_int_name("device_qpu", "mock_seed",
                                         "Seed of everything the mock backend draws",
                                         false, false, 1, &parsec_qpu_params.mock_seed);
+    (void)parsec_mca_param_reg_int_name("device_qpu", "mock_delay_seed",
+                                        "Seed of the times the mock backend draws, apart from its samples, so "
+                                        "that a run can be repeated with other times and the same answers "
+                                        "(0: device_qpu_mock_seed)",
+                                        false, false, 0, &parsec_qpu_params.mock_delay_seed);
     (void)parsec_mca_param_reg_int_name("device_qpu", "mock_slots",
                                         "Jobs the mock backend runs at the same time; further ones queue "
                                         "inside it, as they would at a provider",
