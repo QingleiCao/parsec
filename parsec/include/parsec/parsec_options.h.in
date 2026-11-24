@@ -151,6 +151,9 @@
 #cmakedefine PARSEC_HAVE_DEV_HIP_SUPPORT
 #cmakedefine PARSEC_HAVE_DEV_LEVEL_ZERO_SUPPORT
 #cmakedefine PARSEC_HAVE_DEV_OPENCL_SUPPORT
+/* The device/qpu component is built, and bodies of type QPU are compiled in. */
+#cmakedefine PARSEC_HAVE_QPU
+#cmakedefine PARSEC_HAVE_DEV_QPU_SUPPORT
 
 #define PARSEC_INSTALL_PREFIX "@CMAKE_INSTALL_PREFIX@"
 /* Default PATH to look for the CUDA .so files */

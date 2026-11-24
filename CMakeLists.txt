@@ -205,6 +205,21 @@ if(PARSEC_GPU_WITH_OPENCL)
   message(WARNING "Open CL is not supported yet, ignored.")
 endif()
 
+### QPU engine parameters
+option(PARSEC_DEVICE_WITH_QPU
+  "Enable support for quantum processing units (experimental). Builds the
+  device/qpu component and its mock backend; no provider SDK is required." OFF)
+# PARSEC_HAVE_QPU says the component is built. PARSEC_HAVE_DEV_QPU_SUPPORT is
+# the name the PTG compiler expects for a body of type QPU to be compiled in.
+# Both follow the option and nothing else, so they are not cached.
+if(PARSEC_DEVICE_WITH_QPU)
+  set(PARSEC_HAVE_QPU ON)
+  set(PARSEC_HAVE_DEV_QPU_SUPPORT ON)
+else()
+  set(PARSEC_HAVE_QPU OFF)
+  set(PARSEC_HAVE_DEV_QPU_SUPPORT OFF)
+endif()
+
 ### Debug options
 if( "Debug" STREQUAL CMAKE_BUILD_TYPE )
   set(PARSEC_DEBUG ON)
