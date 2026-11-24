@@ -1,0 +1,317 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+/**
+ * What a quantum task costs the runtime (experiment E1), and what it costs
+ * to hold a worker during a quantum job (experiment E2). Not QAOA: chains of
+ * classical work and quantum jobs.
+ *
+ *   WORK(k, l)   classical work of -w microseconds, then a circuit and its
+ *                angles; it reads the result of the job before it. WORK(k,
+ *                LEN) only reads the last one
+ *   QEXEC(k, l)  the quantum job of link l of chain k
+ *
+ * NC chains of LEN links, on one rank (Q places every chain there). QEXEC has two bodies, and which one
+ * runs is the context's to say:
+ *   - with a QPU device (device_qpu_enabled 1) the QPU body: the job goes to
+ *     the device and the worker is free at once (system C);
+ *   - without one, the CPU body. With -b 0 it does nothing but write a
+ *     result: the same graph with CPU tasks, against which E1 measures what
+ *     the QPU path adds. With -b US it holds its worker for that long and
+ *     then samples the circuit itself: a blocking quantum call inside a CPU
+ *     task (system C-block).
+ * And with -A the same work without the runtime, one link after the other:
+ * the work, then a blocking call of -b microseconds (system A).
+ *
+ * Every link checks that it read the result of its own job, and a run that
+ * took less time than its work and its jobs must take fails: a run that
+ * passes did the work.
+ *
+ * Options, before "--":
+ *   -n NC       chains (default 8)
+ *   -l LEN      links per chain (default 100)
+ *   -w US       classical work per link, microseconds of computation (default 0)
+ *   -b US       what the CPU body of QEXEC holds its worker for, and what a
+ *               blocking call takes with -A (default 0)
+ *   -s SHOTS    shots per job (default 1)
+ *   -A          sequential, without the runtime
+ *   -M          print one line that a script can read
+ *   -v          verbose
+ * The time of a job on the QPU device is the mock's (device_qpu_mock_delay),
+ * and the number of workers the runtime's (runtime_num_cores).
+ */
+
+#include "qpu_test_common.h"
+#include "parsec/sys/atomic.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+static int64_t work_ns = 0, block_ns = 0;
+static int32_t nb_errors = 0;
+static int32_t qpu_bodies = 0, cpu_bodies = 0;
+static __thread parsec_qpu_sampler_t *bench_sampler = NULL;
+static parsec_qpu_sampler_t *samplers[1024];
+static int32_t nb_samplers = 0;
+
+/* Computation, not sleep: the worker is busy for that long. */
+static double burn(int64_t ns)
+{
+    const int64_t until = parsec_qpu_now_ns() + ns;
+    double acc = 0.0;
+    int64_t i = 0;
+    if( ns <= 0 ) return 0.0;
+    do {
+        for( int j = 0; j < 64; j++, i++ ) acc += 1.0 / (double)(i + 1);
+    } while( parsec_qpu_now_ns() < until );
+    return acc;
+}
+
+static void hold(int64_t ns)
+{
+    struct timespec ts = { ns / 1000000000LL, ns % 1000000000LL };
+    if( ns > 0 ) nanosleep(&ts, NULL);
+}
+
+/* A blocking quantum call: wait for the job, then its answer. */
+static void blocking_call(const void *circuit, const void *params, int shots, uint64_t key, void *result)
+{
+    hold(block_ns);
+    if( NULL == bench_sampler ) {
+        bench_sampler = parsec_qpu_sampler_new();
+        samplers[parsec_atomic_fetch_inc_int32(&nb_samplers) % 1024] = bench_sampler;
+    }
+    memset(result, 0, sizeof(parsec_qpu_result_t));
+    if( PARSEC_SUCCESS != parsec_qpu_sampler_run(bench_sampler, (const parsec_qpu_circuit_t*)circuit, (const double*)params,
+                                                 (uint32_t)shots, 1, key, (parsec_qpu_result_t*)result,
+                                                 QPU_TEST_MAX_ENTRIES, NULL) ) {
+        ((parsec_qpu_result_t*)result)->status = PARSEC_QPU_STATUS_FAILED;
+    }
+    ((parsec_qpu_result_t*)result)->version = PARSEC_QPU_RESULT_VERSION;
+}
+
+/* What WORK finds in the result of the link before it. */
+static void check_result(const void *res, int k, int l, int shots)
+{
+    const parsec_qpu_result_t *r = (const parsec_qpu_result_t*)res;
+    if( (PARSEC_QPU_RESULT_VERSION != r->version) || (PARSEC_QPU_STATUS_OK != r->status) ||
+        ((uint32_t)shots != r->shots_returned) ) {
+        if( 0 == parsec_atomic_fetch_inc_int32(&nb_errors) ) {
+            fprintf(stderr, "WORK(%d, %d): the result of the job before is not one (version %u, status %u, %u shots)\n",
+                    k, l, (unsigned)r->version, (unsigned)r->status, r->shots_returned);
+        }
+    }
+}
+%}
+
+Q            [ type = "parsec_data_collection_t*" ]
+Z            [ type = "parsec_data_collection_t*" aligned = Q ]
+NC           [ type = int ]
+LEN          [ type = int ]
+SHOTS        [ type = int ]
+
+WORK(k, l)
+
+k = 0 .. NC-1
+l = 0 .. LEN
+
+: Q(k)
+
+READ  R  <- (l > 0) ? RES QEXEC(k, l-1) : Z(k)
+WRITE C  -> (l < LEN) ? C  QEXEC(k, l)
+WRITE TH -> (l < LEN) ? TH QEXEC(k, l)
+
+BODY
+{
+    if( l > 0 ) check_result(R, k, l, SHOTS);
+    if( l < LEN ) {
+        (void)burn(work_ns);
+        qpu_test_make_circuit(C, k, l, 0);
+        qpu_test_make_params(TH, k, l);
+    }
+}
+END
+
+QEXEC(k, l)
+
+k = 0 .. NC-1
+l = 0 .. LEN-1
+
+: Q(k)
+
+READ  C   <- C  WORK(k, l)
+READ  TH  <- TH WORK(k, l)
+WRITE RES <- NEW
+          -> R WORK(k, l+1)
+
+BODY [type=QPU]
+{
+    (void)parsec_atomic_fetch_inc_int32(&qpu_bodies);
+    return PARSEC_QPU_SUBMIT_KEYED(C, TH, RES, SHOTS, qpu_test_key(k, l));
+}
+END
+
+BODY
+{
+    (void)parsec_atomic_fetch_inc_int32(&cpu_bodies);
+    if( block_ns > 0 ) {
+        blocking_call(C, TH, SHOTS, qpu_test_key(k, l), RES);
+    } else {
+        /* The same graph with CPU tasks: a result, and nothing else. */
+        memset(RES, 0, sizeof(parsec_qpu_result_t));
+        ((parsec_qpu_result_t*)RES)->version = PARSEC_QPU_RESULT_VERSION;
+        ((parsec_qpu_result_t*)RES)->shots_returned = (uint32_t)SHOTS;
+    }
+}
+END
+
+extern "C" %{
+
+int main(int argc, char *argv[])
+{
+    parsec_context_t *parsec;
+    parsec_qpu_bench_taskpool_t *tp;
+    parsec_data_collection_t *Q, *Z;
+    int nc = 8, len = 100, shots = 1, sequential = 0, machine = 0, verbose = 0;
+    int rank = 0, world = 1, rc, test_argc, pargc, workers = 1, device = 0;
+    char **pargv;
+    int64_t t0, t1;
+    const char *system;
+
+    qpu_test_split_args(argc, argv, &test_argc, &pargc, &pargv);
+    for( int i = 1; i < test_argc; i++ ) {
+        if( 0 == strcmp(argv[i], "-A") ) { sequential = 1; continue; }
+        if( 0 == strcmp(argv[i], "-M") ) { machine = 1; continue; }
+        if( 0 == strcmp(argv[i], "-v") ) { verbose = 1; continue; }
+        if( i + 1 >= test_argc ) {
+            fprintf(stderr, "qpu_bench: %s needs a value\n", argv[i]);
+            return 1;
+        }
+        if(      0 == strcmp(argv[i], "-n") ) nc = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-l") ) len = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-w") ) work_ns = (int64_t)(atof(argv[++i]) * 1000.0);
+        else if( 0 == strcmp(argv[i], "-b") ) block_ns = (int64_t)(atof(argv[++i]) * 1000.0);
+        else if( 0 == strcmp(argv[i], "-s") ) shots = atoi(argv[++i]);
+        else {
+            fprintf(stderr, "qpu_bench: unknown option %s\n", argv[i]);
+            return 1;
+        }
+    }
+    if( (nc <= 0) || (len <= 0) || (shots <= 0) || (work_ns < 0) || (block_ns < 0) ) {
+        fprintf(stderr, "qpu_bench: -n, -l and -s must be positive, -w and -b not negative\n");
+        return 1;
+    }
+
+    if( sequential ) {
+        /* System A: one link after the other, without the runtime. */
+        unsigned char *circuit = (unsigned char*)calloc(1, QPU_TEST_BLOCK), *params = (unsigned char*)calloc(1, QPU_TEST_BLOCK);
+        unsigned char *result = (unsigned char*)calloc(1, QPU_TEST_BLOCK);
+        t0 = parsec_qpu_now_ns();
+        for( int k = 0; k < nc; k++ ) {
+            for( int l = 0; l < len; l++ ) {
+                if( l > 0 ) check_result(result, k, l, shots);
+                (void)burn(work_ns);
+                qpu_test_make_circuit(circuit, k, l, 0);
+                qpu_test_make_params(params, k, l);
+                blocking_call(circuit, params, shots, qpu_test_key(k, l), result);
+            }
+        }
+        t1 = parsec_qpu_now_ns();
+        system = "A";
+        free(circuit); free(params); free(result);
+    } else {
+        parsec_qpu_device_info_t info;
+
+        rc = parsec_tests_context_init(-1, PARSEC_TEST_THREAD_SERIALIZED, &pargc, &pargv, &parsec, &rank, &world);
+        PARSEC_CHECK_ERROR(rc, "parsec_tests_context_init");
+        if( 1 != world ) {
+            if( 0 == rank ) fprintf(stderr, "qpu_bench: one rank\n");
+            parsec_tests_abort(parsec, 1);
+        }
+        workers = 0;
+        for( int p = 0; p < parsec->nb_vp; p++ ) workers += parsec->virtual_processes[p]->nb_cores;
+        device = (PARSEC_SUCCESS == parsec_qpu_device_info(0, &info));
+        Q  = qpu_test_placement_new(rank, world, 0);
+        Z  = qpu_test_tiles_new(rank, world, 0, nc);    /* what the first link of each chain reads: zeroes */
+        tp = parsec_qpu_bench_new(Q, Z, nc, len, shots);
+        qpu_test_block_type_set(&tp->arenas_datatypes[PARSEC_qpu_bench_DEFAULT_ADT_IDX]);
+
+        t0 = parsec_qpu_now_ns();
+        rc = parsec_context_add_taskpool(parsec, (parsec_taskpool_t*)tp);
+        PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+        rc = parsec_context_start(parsec);
+        PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+        rc = parsec_context_wait(parsec);
+        PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+        t1 = parsec_qpu_now_ns();
+
+        system = device ? "C" : ((block_ns > 0) ? "C-block" : "C-cpu");
+        if( (device ? qpu_bodies : cpu_bodies) != nc * len ) {
+            fprintf(stderr, "qpu_bench: %d QPU bodies and %d CPU bodies ran, expected %d of the %s kind\n",
+                    qpu_bodies, cpu_bodies, nc * len, device ? "QPU" : "CPU");
+            nb_errors++;
+        }
+        if( device ) nb_errors += qpu_test_check_service(1, (long)nc * len, 0, verbose);
+
+        qpu_test_block_type_unset(&tp->arenas_datatypes[PARSEC_qpu_bench_DEFAULT_ADT_IDX]);
+        PARSEC_OBJ_DESTRUCT(&tp->arenas_datatypes[PARSEC_qpu_bench_DEFAULT_ADT_IDX]);
+        parsec_taskpool_free((parsec_taskpool_t*)tp);
+        qpu_test_placement_free(Q);
+        qpu_test_tiles_free(Z);
+        rc = parsec_tests_context_fini(&parsec);
+        PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
+    }
+    for( int i = 0; (i < nb_samplers) && (i < 1024); i++ ) parsec_qpu_sampler_free(samplers[i]);
+
+    /* What the run cannot have taken less than: the work and the jobs of one
+     * chain one after the other, and the work (and, holding workers, the
+     * jobs) of all the chains spread over the workers. The time of a job on
+     * the device is the least the mock can draw, which is 0 but for const and
+     * uniform. */
+    {
+        const double links = (double)nc * len;
+        double job_ns = 0.0, lower = 0.0;
+        if( device ) {
+            const char *specs[2] = { parsec_qpu_params.mock_delay, parsec_qpu_params.mock_job_delay };
+            for( int i = 0; i < 2; i++ ) {
+                parsec_qpu_delay_t d;
+                if( (NULL != specs[i]) && ((0 == strncmp(specs[i], "const:", 6)) || (0 == strncmp(specs[i], "uniform:", 8))) &&
+                    (PARSEC_SUCCESS == parsec_qpu_delay_parse(&d, specs[i])) ) {
+                    job_ns += (double)parsec_qpu_delay_draw(&d, 0);    /* the least it draws */
+                    parsec_qpu_delay_fini(&d);
+                }
+            }
+        }
+        if( sequential ) {
+            lower = links * (double)(work_ns + block_ns);
+        } else if( device ) {
+            lower = (double)len * ((double)work_ns + job_ns);
+            if( links * (double)work_ns / workers > lower ) lower = links * (double)work_ns / workers;
+        } else {
+            lower = (double)len * (double)(work_ns + block_ns);
+            if( links * (double)(work_ns + block_ns) / workers > lower ) lower = links * (double)(work_ns + block_ns) / workers;
+        }
+        if( (double)(t1 - t0) < lower ) {
+            fprintf(stderr, "qpu_bench: the run took %.3f ms, and its work and jobs cannot take less than %.3f ms\n",
+                    (t1 - t0) * 1e-6, lower * 1e-6);
+            nb_errors++;
+        }
+    }
+
+    if( machine ) {
+        printf("qpu_bench system=%s chains=%d length=%d work_us=%.3f block_us=%.3f shots=%d workers=%d time_ms=%.6f "
+               "per_task_us=%.3f\n", system, nc, len, work_ns * 1e-3, block_ns * 1e-3, shots, workers,
+               (t1 - t0) * 1e-6, (double)(t1 - t0) * 1e-3 / ((double)nc * len));
+    }
+    printf("qpu_bench: %s, %d chains of %d links in %.3f ms on %d worker(s): %s\n", system, nc, len, (t1 - t0) * 1e-6, workers,
+           nb_errors ? "FAILED" : "passed");
+    return nb_errors ? 1 : 0;
+}
+
+%}

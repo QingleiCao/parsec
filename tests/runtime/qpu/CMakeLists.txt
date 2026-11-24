@@ -82,6 +82,11 @@ if(PARSEC_HAVE_QPU)
   qpu_addtest_executable(qpu_coalesce)
   target_ptg_sources(qpu_coalesce PRIVATE "qpu_coalesce.jdf")
 
+  # Experiments E1 and E2: what a quantum task costs, with and without a
+  # worker held during its job.
+  qpu_addtest_executable(qpu_bench)
+  target_ptg_sources(qpu_bench PRIVATE "qpu_bench.jdf")
+
   qpu_addtest_executable(qpu_guard)
   target_ptg_sources(qpu_guard PRIVATE "qpu_guard.jdf")
 

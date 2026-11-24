@@ -248,6 +248,22 @@ if(PARSEC_HAVE_QPU)
               ${_qpu} --mca device_qpu_mock_delay const:500 --mca device_qpu_max_outstanding 1 --mca device_qpu_mock_slots 1
               --mca device_qpu_max_batch 4)
 
+  # The benchmark of experiments E1 and E2, small: the QPU body with jobs of
+  # no time and of 2 ms; the same graph with an empty CPU body; a CPU body
+  # that holds its worker for 2 ms; and the same work without the runtime.
+  qpu_addtest(runtime/qpu/bench ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_bench -n 8 -l 50 -w 20
+              ${_qpu} --mca device_qpu_mock_delay const:0)
+  qpu_addtest(runtime/qpu/bench:latency ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_bench -n 16 -l 10
+              ${_qpu} --mca device_qpu_mock_delay const:2000 --mca device_qpu_max_outstanding 16 --mca device_qpu_mock_slots 16
+              --mca runtime_num_cores 2)
+  qpu_addtest(runtime/qpu/bench:cpu ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_bench -n 8 -l 50 -w 20)
+  qpu_addtest(runtime/qpu/bench:block ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_bench -n 16 -l 10 -b 2000 -- --mca runtime_num_cores 2)
+  qpu_addtest(runtime/qpu/bench:sequential ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_bench -n 4 -l 10 -b 2000 -A)
+  # Work of 2 ms per link, longer than anything else in the run: a run that
+  # does not do it ends before the least time its work can take.
+  qpu_addtest(runtime/qpu/bench:work ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_bench -n 4 -l 10 -w 2000
+              ${_qpu} --mca device_qpu_mock_delay const:0)
+
   # The QPU service started and stopped many times in one process.
   qpu_addtest(runtime/qpu/restart ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_chain -I 30 -n 8 -l 2
               ${_qpu} --mca device_qpu_mock_delay uniform:0:500)
