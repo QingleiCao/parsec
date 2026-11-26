@@ -1,8 +1,8 @@
 # PaRSEC-Q: QPU support and distributed QAOA
 
-Design plan and implementation log. The plan was written on 2026-11-21 in three stages: stage 1 (source audit and integration decision, section 1), stage 2 (architecture and application design, sections 2 and 3), and stage 3 (tests, novelty, evaluation, milestones and recommendation, sections 4 to 8). Stage 3 corrected a few statements of the earlier sections; each correction is marked where it applies. Section 9 records what was built, milestone by milestone, and where it departs from the plan.
+Design plan and implementation log. The plan was written on 2026-11-21 in three stages: stage 1 (source audit and integration decision, section 1), stage 2 (architecture and application design, sections 2 and 3), and stage 3 (tests, novelty, evaluation, milestones and recommendation, sections 4 to 8). Stage 3 corrected a few statements of the earlier sections; each correction is marked where it applies. Section 9 records what was built, milestone by milestone, and where it departs from the plan. Section 10 revises the design after M8 (several QPUs per context, QPUs coupled through NVIDIA NVQLink, Qiskit). Of it, several QPUs per context are built (M9, section 9.8); the rest is not.
 
-All file and line references are pinned to commit `09c721868` on branch `qinglei/hybrid_HPC_QC`. Nothing in PaRSEC was built or run for sections 1 to 8; there, every "verified" statement about the source means the code was read at the cited lines. Section 9 reports builds and runs.
+All file and line references are pinned to commit `09c721868` on branch `qinglei/hybrid_HPC_QC`, except in section 10, whose references are to the branch head `80d6aa45d`. Nothing in PaRSEC was built or run for sections 1 to 8; there, every "verified" statement about the source means the code was read at the cited lines. Section 9 reports builds and runs.
 
 ## Project facts
 
@@ -10,8 +10,8 @@ All file and line references are pinned to commit `09c721868` on branch `qinglei
 - Base commit: `09c721868`.
 - Build and test machines: methane, leconte and guyot (GPU nodes, CUDA-aware Open MPI).
 - QPU access: UNKNOWN (provider, plan, and allocation in QPU seconds or jobs per month).
-- Network: UNKNOWN (whether compute nodes can reach the provider's endpoint, or only login nodes).
-- ISC submission deadline: UNKNOWN as a project fact. The ISC 2027 website gives abstract December 14 and full paper December 21, 2026 (section 7.1); to be confirmed.
+- Network: UNKNOWN (whether compute nodes can reach the provider's endpoint, or only login nodes). For a QPU coupled to the cluster through NVQLink, the QPU is on the cluster's own network (section 10.2).
+- ISC submission deadline: UNKNOWN as a project fact. The ISC 2027 website gives abstract December 14 and full paper December 21, 2026 (section 7.1); to be confirmed. (2026-11-26: set aside. Section 10 is not scoped by it.)
 - Destination: UNKNOWN (a pull request to ICLDisco/parsec, or a research branch on the fork).
 - This project is separate from the earlier state-vector simulator work and does not reuse or depend on that code.
 
@@ -95,7 +95,7 @@ Technical questions the audit raised and could not settle from the source:
 
 Three related checks inside the device layer matter as well:
 
-- `device.c:299`: once a first device is picked, a non-GPU device is skipped unless CPU load balancing is allowed. With two QPUs, only the one with the higher index would ever be chosen. Needs to change for more than one QPU.
+- `device.c:299`: once a first device is picked, a non-GPU device is skipped unless CPU load balancing is allowed. With two QPUs, only the one with the higher index would ever be chosen. Needs to change for more than one QPU. (Section 10.3 avoids the change: the QPU component binds a task to a QPU itself, when that QPU has a free place.)
 - `device.c:231` and `:255`: data-ownership affinity, for GPU types only. Does not apply.
 - `device.c:363`: batched chores are limited to GPU types. Relevant if stage 2 picks submission batching as the optimization.
 
@@ -237,7 +237,7 @@ This section follows the approach approved in stage 1: a thin device component w
                                                               provider) --> QPU
 ```
 
-Only the rank that owns a QPU opens its backend (section 2.7).
+Only the rank that owns a QPU opens its backend (section 2.7). (Revised in section 10.3: a context may have several QPUs, each with its own owner rank and its own service.)
 
 ## 2.2 Device, submission and progress
 
@@ -268,7 +268,7 @@ It reads `task->selected_device`, which `parsec_select_best_device` has already 
 
 The progress thread sleeps in one call, `backend->wait(timeout)`, which returns when a job may have changed state or when a submission arrives. The mock implements it with a timer heap, so wake-ups are exact. A provider that offers no notification implements it as a poll whose interval backs off from a minimum to a maximum (both MCA parameters) and resets when a job changes state. The thread never spins.
 
-One progress thread serves all QPU modules of a process. It owns a minimal execution stream registered in thread-local storage, as the communication thread does (section 1.5).
+One progress thread serves all QPU modules of a process. It owns a minimal execution stream registered in thread-local storage, as the communication thread does (section 1.5). (Revised in section 10.3: one progress thread per QPU, since a thread cannot sleep in the `wait` of two backends and one slow provider would delay the others. The QPUs of a rank share their waiting tasks.)
 
 **Admission.** A module holds at most `max_outstanding` jobs at its backend, the smaller of the backend's limit and an MCA parameter, and spaces submissions by a minimum interval where the provider limits the submission rate (section 2.6). The rest wait in the module's heap, ordered by task priority and then arrival. This is where the runtime, not the application, bounds submissions (property 3).
 
@@ -383,7 +383,7 @@ The facts below come from the providers' documentation, read on 2026-11-21 by a 
 - Job creation over REST is limited to 5 per minute per user [5].
 - Usage is the time the QPU is held for the job. The documented quick estimate is 2 s plus 0.00035 s per execution [8]. Failed jobs caused by user error and cancelled jobs are charged [8].
 - The server-side Sampler program is deprecated as of qiskit-ibm-runtime 0.50.0, in favour of a client-side Sampler that submits to an "executor" program [9]. How long the old program remains, and the executor's payload, were not confirmed.
-- Qiskit has a C API that covers circuits and the transpiler without Python, described as experimental; it does not submit jobs [10].
+- Qiskit has a C API that covers circuits and the transpiler without Python, described as experimental; it does not submit jobs [10]. (Section 10.4: since Qiskit 2.2 it has a standalone transpiler, `qk_transpile`, and since 2.6 it reads and writes QPY.)
 - QRMI is a vendor-neutral library for HPC systems with a C API to start a task, check it, fetch its result and stop it, for IBM, IQM, Pasqal and others. It takes an already prepared job input, so transpilation stays outside it [11].
 
 **IonQ**
@@ -393,7 +393,7 @@ The facts below come from the providers' documentation, read on 2026-11-21 by a 
 
 **Others, briefly.** IQM Resonance and Quantinuum document Python clients; a public REST specification was not confirmed for either. AWS Braket has a REST API usable from C, with request signing and results in object storage. OLCF's quantum user program gives merit-reviewed access to IBM, Quantinuum, IonQ and IQM, with a default of 400 IBM minutes per 28 days per project [15].
 
-**Recommendation.** Target IBM Quantum, through a persistent adapter process written in Python on the official SDK.
+**Recommendation.** Target IBM Quantum, through a persistent adapter process written in Python on the official SDK. (Revised in section 10.4: the adapter gets a Qiskit Aer mode first, and a backend in C on the Qiskit C API and QRMI is a second route, M10. The C API now transpiles and writes QPY, which removes the first of the two reasons below.)
 
 - IBM is the only provider with confirmed free time on physical hardware, and the HPC-centre programmes sit on the same platform.
 - The adapter is recommended over calling the REST API from C for two reasons. Circuits must be transpiled to the device before submission, and the supported transpiler is Qiskit. And the program a job is submitted to is changing, which the SDK absorbs. A C client today would bind PaRSEC to a deprecated program and an experimental library.
@@ -468,7 +468,7 @@ Details of the chosen option:
 - `device_qpu_owner_rank` (default 0; `-1` for the last rank, since M3) names the owner. Every rank attaches a QPU module so that QPU incarnations are not dropped at taskpool startup (open question 3 of section 1.1), but only the owner opens a backend. On other ranks the module has zero capacity and refuses work; it is never selected, because no QPU task is placed there.
 - Placement uses what exists: in PTG, the task's affinity names a tile of a one-element collection living on the owner rank; in DTD, the `PARSEC_AFFINITY` flag on a tile of that rank (`parsec/interfaces/dtd/insert_function.h:45`).
 - Results reach the ranks that need them the way any flow does.
-- Several QPUs are several modules on the owner rank. Selection among them is `parsec_select_best_device` with the changes of section 1.4, fed by each module's load and latency estimate. Placing QPUs on different ranks would need cross-rank load balancing, which PaRSEC does not do for any device.
+- Several QPUs are several modules on the owner rank. Selection among them is `parsec_select_best_device` with the changes of section 1.4, fed by each module's load and latency estimate. Placing QPUs on different ranks would need cross-rank load balancing, which PaRSEC does not do for any device. (Revised in section 10.3: QPUs may sit on several ranks, and the application places its quantum tasks on those ranks, so nothing is balanced across ranks. Within a rank, a task is bound to a QPU when that QPU has a free place for it, unless the task names its QPU. `parsec_select_best_device` does not change.)
 - If the backend becomes unavailable, submissions are retried with back-off while pending tasks wait. After `unavailable_timeout` every pending task is completed with an "unavailable" status.
 
 ## 2.8 Scheduling
@@ -1189,7 +1189,7 @@ What it is not for: comparing A, B, C and D on hardware. Four runs would use the
 
 - The mock's latency model is a model. The replayed trace from E7 is the only link to real behaviour, and it is one day on one device.
 - The mock samples exactly. Hardware noise changes the optimizer's path and the final cut, not the runtime's behaviour; E7 reports the difference in cut without interpreting it.
-- One QPU. Nothing here supports claims about several.
+- One QPU. Nothing here supports claims about several. (Several QPUs per context are built, section 9.8, and no experiment has run on them: this stays true.)
 - Blocks of at most about 20 qubits on the mock. Larger blocks change the classical side (section 3.4) and are not evaluated.
 - The model of section 6.1 ignores classical time and runtime overhead. If measurements depart from it, the departure is itself a result to explain.
 - The mock computes its answers on the machine under test: 7 to 12 ms per job at 16 qubits (section 9.2). A job whose sampling outlasts its modelled time ends late, and the latency measured is then not the one modelled. The mock counts such jobs; a run is reported only when the count is zero, with as many helper threads as slots and cores for them that the workers do not use. (In M8 the helper threads shared the cores of rank 0, and the 11 runs of E3 that had a late job were run once more; section 9.7.)
@@ -1326,6 +1326,8 @@ For the reduced plan, the must-have part of M3 is the type, the module, selectio
 | Tests | `runtime/qpu/adapter_loopback`, `runtime/qpu/qasm`. Then, by hand and with your explicit go-ahead for each submission: one two-qubit circuit, then E7. |
 | Acceptance criteria | The loopback tests pass. The two-qubit circuit returns counts from a physical device. E7 completes. A search of all logs at full verbosity finds no credential. |
 
+(Revised in section 10.4, on 2026-11-26: M4 is split into M4a, the adapter with Qiskit Aer and the OpenQASM 3 reader, and M4b, IBM hardware. Section 10.5 adds M9, several QPUs per context; M10, a backend in C on QRMI and the Qiskit C API; and M11, a CUDA-Q backend.)
+
 ### M5: sequential QAOA reference
 
 Done on 2026-11-22; section 9.3 has the result and the departures from this table.
@@ -1387,7 +1389,7 @@ Done on 2026-11-23; section 9.6 has the result and the departures from this tabl
 | **Must have** | M1, M2, M5, M6. The must-have part of M3, so that the paper is about a device and not a library. Baselines A, B and C-sync. Experiments E1, E3 and E4 with their null results. The correctness evidence of sections 4.5 and 4.6. |
 | **The optimization that matters** | M7 with E5. By the model it is the only runtime-side effect larger than tens of percent, and it is the one that needs the device. I would treat it as must-have for a research paper and cut something else first. |
 | **Important** | One hardware run (M4, E7). A reviewer in the quantum track will look for it; without it the paper has to say plainly that all results come from a mock. E2. The DTD path for QPU chores. The CPU, GPU and QPU coexistence test. Trace-based figures. |
-| **Future work** | Several QPUs and latency-informed selection. Critical-path ordering. Optimistic or versioned block updates. A C-only provider backend. B-async. Direct completion. Registers wider than 64 qubits. SQD, VQE and other applications. |
+| **Future work** | Several QPUs and latency-informed selection (designed in section 10.3 as M9). Critical-path ordering. Optimistic or versioned block updates. A C-only provider backend. B-async. Direct completion. Registers wider than 64 qubits. SQD, VQE and other applications. |
 
 ## 7.5 Rules every milestone has to pass
 
@@ -2756,3 +2758,535 @@ An independent reviewer read the new code and the harness while the first campai
 11. **The model** has three ways for released tasks to reach the device (one at a time, a step's two evaluations together, all at once); D's prediction is drawn as the range of the first two, which bracket the measurement with one place and not with three (E5).
 12. **Runs with a late job were run once more.** Section 6.7 only says such a run is not reported. The 11 of E3 were run again with the same command and replaced by the second run, so that every setting keeps its seeds; the first runs stay in the CSV, marked.
 13. **The places at which dataflow gains most.** Section 6.4 expected the gain of E3 at places "at or above twice the blocks per colour"; on the grid and the ring at CV 1 and 2 it is largest at one place per block of a colour, in the model as in the measurement.
+
+## 9.8 M9: several QPUs per context (2026-11-26)
+
+Approved with "Approve, start M9" after the design revision of section 10. Built on `80d6aa45d`, and verified before it was committed.
+
+### What exists now
+
+- **`parsec/mca/device/qpu/device_qpu_list.c`** (new): the list of the QPUs of a run, `device_qpu_devices`.
+- **`device_qpu_component.c`, `device_qpu_module.c`**: one module per QPU of the list. A rank attaches the modules of the QPUs it owns, each with its backend; a rank that owns none attaches the first one as a placeholder.
+- **`device_qpu_progress.c`** (rewritten around two structures): a service per QPU (backend, progress thread, jobs in flight, limits, counters) and a pool per rank (the submission stack and the tasks that wait, under one lock).
+- **`device_qpu.h`**:
+  - `parsec_qpu_submit_on()`, `parsec_qpu_submit_dtd_on()` and `PARSEC_QPU_SUBMIT_ON()` name a QPU, and `PARSEC_QPU_ANY` names none;
+  - `parsec_qpu_count()` and `parsec_qpu_rank_of()`;
+  - the result header says which QPU ran the job (`qpu`), and its version is 2.
+- **`device_qpu_backend_mock.c`**: each mock reads its own options from its entry, and its counters can be read per QPU. A new option, `submit_delay` (`device_qpu_mock_submit_delay`), holds the thread that submits for a given time, as a provider's round trip does.
+- **Tests**: `tests/runtime/qpu/qpu_multi.jdf` (new), run by 27 of the 28 tests named `runtime/qpu/multi*`; two more tests of the hardware guard; ten of the QAOA application; `repeat_test.cmake`, which runs a test several times; and the guard script reads the lists of the test definitions.
+- **`tests/apps/qaoa`**: the quantum tasks of block `b` run on the rank `Q(b mod NQ)`, and `-Q` makes every block name a QPU.
+- **Nothing outside the component and its tests changed.** `parsec/mca/device/device.c` and `parsec/scheduling.c` are as M3 left them.
+
+### How a task gets its QPU, as built
+
+Section 10.3 is what was built, with these additions.
+
+- **The load.** `parsec_qpu_submit_on()` takes the task's load off the QPU the device layer selected and sets `task->load` to 0. The QPU that takes the task (`qpu_bind`) makes itself `task->selected_device`, sets the load and adds it. A task that goes back to wait gives it back (`qpu_unbind`). This is done only for a task whose body is of the QPU type. A quantum task with a CPU body (option C of section 1.9) keeps the CPU device and no load, as before.
+- **A job that failed is tried again on another QPU**, when one that is up can run the task. Without that rule a QPU whose jobs fail at once is free first every time, and takes the same task again until its attempts are used up. The task remembers the QPU it failed on (`avoid`), and that QPU takes it again only when nobody else can.
+- **A QPU that is given up on is tried again.** It is left alone for its `unavailable_timeout`, then takes tasks again, and its first job tells whether it is back. If that job is not taken either, its tasks go back to the pool at once and the QPU is left alone for twice as long, up to eight times the time-out. With one QPU none of this shows: the one QPU takes every task, as before.
+- **The tasks of a submission that is given up on** go to another QPU when one that is up can run them. Section 10.3 had them complete as unavailable, which contradicted its own test ("every unpinned task still completes with a result").
+- **The tag of a job** counts the jobs that were put together for its first task, whether a backend took them or not. Section 2.5 counted the attempts a backend took. With one QPU the two are the same number. With several, a task whose submission is given up on is asked for again without an attempt having been counted, and would have had the same tag twice (the review found it, below).
+- **The time a job is asked for** (`t_submit`) is read after its tasks are taken from the pool. Read before, as with one QPU, it could be earlier than the moment the body submitted the task, when another QPU's thread had put the task into the pool in between. The new test found it under the thread sanitizer.
+
+### The wake-up rule, and what two versions of it got wrong
+
+A thread sleeps in its backend, and somebody has to wake it when there is a task for its QPU. Section 10.3 gave a rule in two sentences. It took three versions to get a rule that holds.
+
+**First version: the others are woken at the end of a thread's pass,** after it has taken tasks from the pool and submitted its own jobs.
+
+- **What happened.** `runtime/qpu/multi:noidle` failed in 3 or 4 runs of 20 to 30. For about 8 ms at the start of a run one QPU held a single job and another none, while 45 tasks waited.
+- **Why.** A thread had put 48 tasks into the pool and was then held up for 7 to 14 ms inside its first call to its backend (measured with a probe around the call, in 3 of 25 runs). The other threads had looked at the pool just before the tasks were there, and slept. Nobody woke them until that call returned.
+- **What a real backend would make of it.** That call is a round trip to a provider, so the same wait would be the rule, not the exception.
+
+**Second version: whoever puts tasks into the pool wakes the others before it calls its backend again.** 0 of 60 runs of `multi:noidle` then showed a free place. The review found what was still wrong (finding 2 below): a QPU showed its places before it looked for work, and its places could rise later in the same pass, when a submission that was being asked again was taken, or a job was cancelled for taking too long. A body that had read "no place" a moment earlier woke nobody, and the thread went to sleep beside a free place with that body's task still on the stack. With one QPU, M8 had not had this, because there every body woke the thread.
+
+**The rule as built.**
+
+- **A QPU shows its places only while its thread sleeps or is about to.** A thread at work may be inside a call to its backend, so a task that comes then is for a QPU whose thread sleeps.
+- **A body** pushes its task, then reads the places the QPUs show, and wakes one that shows a place; none if none does.
+- **A thread that puts tasks into the pool** wakes the others that show a place, before it calls its backend again. It does so when it drained the stack and holds more tasks than it has places, when a task goes back to wait, and before each submission.
+- **A thread that is done** shows its places first, and then looks once more at the stack and at the pool before it sleeps.
+- **Why nothing is left behind.** Whoever comes with a task either sees the places and wakes the thread, or came before they were shown and is found by that last look.
+- **Why threads do not keep each other awake.** Nobody is woken for a task it cannot take, and the last look goes around again only when there is a task the QPU can submit at once.
+
+**What tests it.**
+
+- **`multi:noidle`** sees the first defect only when a thread happens to be held up, about one run in eight.
+- **`multi:fail:prompt`** is for the wake-up by a thread that puts a task back: a QPU whose jobs all fail, two chains, and threads that sleep for 30 s when nobody wakes them. A task whose job failed has to go to the other QPU at once, and the run has to be done in 5 s; it takes a fraction of one. It is run 10 times, because whether the last task goes to the failing QPU first is a matter of turns.
+- **`multi:wake:reask`** is the reviewer's case, steered through the mock: the mock does not take the first job, and while it is asked again it holds the thread until a second task has been submitted. That task found no place shown and woke nobody. Its job is asked for 0.2 ms later; with neither look after the backend call, it waits the two seconds that the first job takes. The test allows half the time of the first job. It had allowed 300 ms, and failed once, in the clean run of a planted-bug pass with other work on the machine; the output of that run was not kept. It then passed 88 runs alone or eight at a time and six runs of the whole set, and was given the wider margin.
+- **Two stricter tests were tried and dropped.** With a mock that takes 20 ms to answer a submission, QPUs of one place and not one moment allowed to show a free place, a burst and chains were run 20 and 10 times each. They passed 5 of 5 times alone (150 runs) and the first failed once in the full suite, with another build going on on the machine. Neither caught a planted bug that the tests above do not. The mock's new option and the strict mode of the test (`-S`) stay.
+
+
+Why the mock's call takes 7 to 14 ms now and then, without the new option, was not found. The mock holds its lock only for short sections, so the likely cause is the thread waiting for a core. It is not M9: a single QPU has the same wait, where it only delays that QPU's own job.
+
+### Verification
+
+Debug build with `PARSEC_DEBUG_PARANOID` and MPI (`/tmp/qcao3_qpu/build_qpu`, gcc 11.5, Open MPI 5.0.5), on methane.
+
+- **Build.** No new warning in the component or in the tests.
+- **The whole suite: 339 of 339 pass** (`ctest -j 6`, 80 s), twice. 172 of them are the QPU and QAOA tests: the 132 there were, and 40 new ones.
+- **Every test there was passes with the list left out**, so one QPU behaves as before. One of them had to change, `runtime/qpu/overlap` (below).
+- **Not run:**
+  - a Release build, a build with profiling, and a build without the component;
+  - more than one node;
+  - CUDA. The job that builds with CUDA on leconte and runs the GPU tests, the others, and the application with three QPUs and the GPUs in one context is queued (Slurm job 68014): the node was taken. M9 changed no file outside the component, so what could differ is a context with several QPU devices and GPU devices together.
+
+### The tests
+
+| Test | What it checks |
+|---|---|
+| `runtime/qpu/multi`, `:three`, `:enabled` | Two and three QPUs of one rank, from a list and from `device_qpu_enabled 3`. Every answer is the sampler's for its inputs and key, whichever QPU gave it. No QPU goes over its own limit, nor its mock over its slots. At the end nothing waits, no QPU carries a load, each task was counted by one QPU device, and each QPU's answers are as many as its device counted |
+| `:named`, `:named:half`, `:named:one` | Tasks that name their QPU, all of them, every other chain, and all the same one: each answer is from the QPU its task named |
+| `:batch` | Jobs that carry several tasks, on two QPUs of one place |
+| `:limits` | One QPU of one place and one of three: each has the limit of its entry, and reaches it |
+| `:noidle` | No place stays free while a task waits: 48 tasks at once on three QPUs of two places, job times drawn from an exponential law. Read from the times in the results: at the middle of the time a task waited, every QPU held as many jobs as it may |
+| `:wake:reask` | A task submitted while its QPU is asked again for a job, steered through the mock: its own job is asked for within half the time of the first job (it takes 0.2 ms), and not when the first job ends |
+| `:speeds` | A QPU twice as fast gives more than half of the answers |
+| `:width`, `:width:none` | Circuits of four qubits and a QPU of three: the other one runs them all; with two QPUs too narrow, every task completes as rejected, without a job |
+| `:fail`, `:fail:named`, `:fail:prompt` | A QPU whose jobs all fail: every task that named none has its answer from the other one, and a task that named it ends without one. And at once: with threads that sleep for 30 s unless woken, ten runs of two chains each take a fraction of a second |
+| `:down`, `:down:named`, `:down:away` | A QPU that never takes a job: the same; and in a run of two seconds its backend is asked 11 times, where a QPU that is handed every task in turn would be asked about 200 times (the test allows 40) |
+| `:back` | A QPU that takes no job for 300 ms: its tasks go to the other one, and at the end it is up and has run jobs again |
+| `:lost`, `:lost:noretry` | A QPU that takes its jobs and loses the answer for 400 ms: the submission is given up on, and the task is asked for again, there or on the other QPU, under another tag. No mock sees a tag twice, and no task loses an attempt to it |
+| `:noopen` | A QPU whose backend cannot be opened has no device, and the other one runs the tasks |
+| `:badlist` | A list with a misspelt key gives no QPU at all |
+| `:mp`, `:mp:named`, `:mp:4`, `:mp:fail` | QPUs on two ranks, one and two of them, on 2 and 4 ranks; each QPU is on the rank the list says; a rank that owns none has the placeholder and nothing behind it |
+| `runtime/qpu/hardware_guard:list`, `:list:unknown` | In a list, one backend that drives a quantum device, or that does not exist, takes the others with it: the mock listed first is not opened |
+| `runtime/qpu/no_hardware_in_tests` | Also reads every `device_qpu_devices` of the test definitions: no backend but the mock and the guard test's own |
+| `apps/qaoa:qpus`, `:named`, `:sync`, `:fail`, `:fail:named`, `:grid` | The application on two and three QPUs of one rank, with and without `-Q`: final states equal byte for byte to the reference |
+| `apps/qaoa:qpus:mp:2`, `:mp:4`, `:sync:mp:3`, `:fail:mp` | The same with QPUs on two ranks, on 2 to 4 ranks. The counts of every rank that owns a QPU are added up and compared with the reference |
+
+One existing test changed. `runtime/qpu/overlap` checked that the QPU device carried the load of its one task from the moment the body returned. The load is now on a QPU from the moment that QPU takes the task. The test reads the times in the result and expects no load before the job is asked for, and one task's worth once it runs.
+
+### Does a test notice
+
+One deliberate bug at a time in a private copy of the sources, rebuilt, and the 170 QPU and QAOA tests of that copy run. 22 bugs: 18 fail a test, one more is seen by the thread sanitizer, and three are seen by nothing. The bugs were run in three passes, and tests were added and two dropped between them; each count is that of the pass the bug was last run in.
+
+| Deliberate bug | Tests that fail |
+|---|---|
+| **The load of a task** | |
+| The load stays on the QPU the device layer picked | 139: nearly every test that runs a quantum task |
+| The load is not taken back when a task goes back to wait | 31: every test with a job that fails |
+| **Which QPU runs a task** | |
+| A task forgets the QPU it named | 7: every test with named QPUs |
+| Every circuit fits every QPU | 3: `failure:rejected`, `multi:width`, `multi:width:none` |
+| A job that failed is tried again on the same QPU | 2: `multi:fail`, `multi:mp:fail` |
+| A result names the first QPU of its rank | 22: every test with more than one QPU on a rank |
+| **A QPU that takes no job** | |
+| The tasks of a submission that is given up on are not moved | 5: `multi:down`, `:down:away`, `:back`, `:lost`, `:lost:noretry` |
+| A QPU that is down takes tasks like the others | 1: `multi:down:away` |
+| A QPU that is down is never tried again | 3: `multi:back`, `multi:lost`, `multi:lost:noretry` |
+| The tag of a job counts attempts, as before | 2: `multi:lost`, `multi:lost:noretry` |
+| **The list** | |
+| The rank of an entry is ignored | 2: `multi:mp`, `multi:mp:4` |
+| The limit of an entry is ignored | 2: `multi:batch`, `multi:limits` |
+| The mock ignores the faults of its entry; its width | 9; 2 |
+| A misspelt key is accepted | 1: `multi:badlist` |
+| **The hardware guard** | |
+| Only the first entry of a list is checked | 2: `hardware_guard:list`, `:list:unknown` |
+| **Who wakes whom** | |
+| A thread that puts tasks into the pool wakes nobody | 1: `multi:fail:prompt` |
+| Neither look after a backend call (in the pass, and before sleeping) | 1: `multi:wake:reask` |
+| The pool is read without its lock when a job is put together | None of the tests. Under the thread sanitizer, three runs gave 72 reports with the QPU component in both stacks, in the heap of the tasks that wait, and one of the runs aborted |
+| The others are woken only after the backend call, not before | None |
+| The look before sleeping is left out, the one in the pass kept | None |
+| A QPU shows its places while its thread is at work | None |
+
+The three that nothing sees are parts of the wake-up rule that the other parts cover for in every case these tests create.
+
+- **Woken after the call, not before.** The task bodies wake the QPUs that sleep, and a thread looks at the pool again before it sleeps. What is lost is one round trip to the backend, in the one case where a thread holds tasks that only another QPU can run and has jobs of its own to submit. No test has QPUs that differ and tasks for each at once.
+- **The look before sleeping.** With the look inside the pass kept, a task is missed only when it comes in the few instructions between the two. No test can place a task there.
+- **Places shown while at work.** A body then wakes a thread that is inside its backend where it could have woken one that sleeps. That costs time, and no test measures it with a backend that is slow.
+
+The first pass, on 18 bugs, missed both wake-up bugs it had. `multi:fail:prompt` and `multi:wake:reask` were written for them; and thinking about what a planted bug would need to be caught found three checks the test did not have: where the list puts each QPU, that a QPU has the limit of its entry and reaches it, and how often a QPU that is down is asked.
+
+### Sanitizers
+
+The no-MPI builds of section 9.1 (gcc 12.4), 32 runs under each, on the code as built: 18 of the multi-QPU test, 9 of one QPU through the code that was rewritten, 5 of the application. The two tests written after these runs, `multi:fail:prompt` and `multi:wake:reask`, were not run under the sanitizers.
+
+- **Address sanitizer.** No memory error. 272 leak records, all the one of section 9.1 (a copy of a flow that a PTG task only writes).
+- **Thread sanitizer.** 9,795 reports. Three have the QPU component in both access stacks, and 129 have it in one. None is in the code of the pool: the heaps, the tasks that wait, the places a QPU shows.
+  - **The three with both** are one report three times: two QPU progress threads give a task back to the scheduler at the same time, into the same queue (`hbbuffer.c:63`). The queue's push reads a slot and then takes it with a compare-and-swap, so two pushers cannot both take it. It is the report of section 9.1 about one progress thread and a worker, now between two progress threads.
+  - **Of the 129:**
+    - 28 are that same push against a worker's pop;
+    - 75 are an access to a task in the QPU layer against a later reuse of the task's memory from its pool. That is the second kind of section 9.1, at more lines: `qpu_bind` now writes the task's device and load;
+    - 26 are new here, and are the device layer's own habit: `parsec_select_best_device` reads `device_load` without synchronisation (`device.c:293`), and so does the assertion at `scheduling.c:541`, while the QPU layer moves a load with an atomic add. The scheduler's own atomic adds meet those reads in the same way for GPUs.
+- **Two runs of the 32 did not pass under either sanitizer, neither because of it:** the script gave the test faults without telling it which to expect.
+- **The first pass**, before the review's fixes, had found one defect through a test that failed only under the thread sanitizer: the time stamp of "How a task gets its QPU".
+
+### What an independent review found
+
+An independent reviewer read the change while the first deliberate-bug pass ran, and ran the test program against the build. It found four defects, one of them by a run, and one weakness of a test. All are fixed, and each fix has a test or a deliberate bug where one can be written.
+
+| Finding | What was done |
+|---|---|
+| **A job was asked for twice under one tag** (reproduced: "4 tags used twice", and with no retry allowed, 3 tasks ended as failed beside a QPU that worked). A QPU took a job and lost the answer; the submission was given up on and the task moved; the same QPU, tried again, asked for the task under the tag it had used, since no attempt had been counted. The mock refuses a tag it has seen, which cost the task an attempt | The tag counts the jobs put together for the task. `multi:lost` and `multi:lost:noretry` run the reviewer's case |
+| **A task could be left on the stack beside a free place** (by reading): the second version of the wake-up rule, above. With one QPU this was a step back from M8 | The rule as built. `multi:wake:reask` is the reviewer's case |
+| **A task's record was read after it was put into the pool** (by reading): `qpu_wait_again` read which QPUs may run the task after it had released the lock, when another QPU may have run the task and freed the record | Read before |
+| **A task could be skipped when a QPU is given up on** (by reading): the clean-up took tasks out of the middle of the heap while it walked it. A skipped task would have waited for the QPU that is down to look again, then for its time-out. It needs backends that differ | The heap is made again from the tasks that stay. I had found the same on my own by then |
+| **`multi:noidle` is weaker than it sounds**: it counts tasks where it should count jobs, looks at one moment per task, skips waits under 10 ms and lets one moment in ten be off | It refuses to run when a job may carry several tasks. `-S` (no moment off) and the two `wake` tests are the strict form |
+| **The design said a list that gives a rank more than 16 devices disables the layer**, and nothing did | A QPU that would be the 17th device of its process is left out with a warning; and a QPU whose device cannot be added is taken out of the service again |
+
+The reviewer found nothing in: the load of a task on every path (retry, give-up, rejected, empty, a body that is not of the QPU type, stop); the other reads without the lock; how jobs are put together; start, stop, a second context and the statistics after a stop; the list and the modules; the mock's registry; and one QPU against M8, apart from the second finding. It found no check that cannot fail, and the collective calls of the tests are the same on every rank.
+
+### Things found on the way
+
+- **Q-IRIS on several QPUs** (arXiv:2605.11382, read in full through a separate pass on 2026-11-26). The paper names no rule for choosing among QPUs: it says "configurable scheduling policies", and that the driver "can concurrently dispatch multiple QIR programs ... to different accelerators". It does not say when a task is bound, whether tasks wait in one queue or one per device, what happens when a QPU fails, or how many QPUs ran at once; it runs "on a single node" and lists "multi-node support" as future work. So nothing published there conflicts with the rule of section 10.3, and nothing there can be compared with it. Section 5 still needs this added.
+- **The PTG body property `device=`** does not work at the base commit (section 10.3). A separate session reproduced it and has a fix on a branch of its own.
+- **A progress thread can be held up for milliseconds** inside a call to the mock (above). With one QPU that only delays its own job, which is why it was not seen before.
+
+### Departures from the plan
+
+1. **`@*` is not in the list syntax** (section 10.3 dropped it at the recheck), and entries may be separated by `|` as well as `;`: a `;` ends an argument in a CMake list, which is where the tests write their lists.
+2. **`device_qpu_enabled` still has to be set** with a list. The list says which QPUs there are, and the parameter stays the one switch that turns the layer on.
+3. **Statistics.** `parsec_qpu_service_stats()` keeps its signature and gives the rank's totals; `parsec_qpu_service_stats_of(q, ...)` and `parsec_qpu_mock_stats_of(q, ...)` are per QPU. Section 10.3 gave the first one a QPU number, which would have changed every existing test.
+4. **The hardware guard in a list.** A backend whose name says it drives hardware, or that does not exist, disables every QPU of the list. One that says so only when it is opened is closed again and left out, and the others stay, like any backend that cannot be opened.
+5. **The tasks of a submission that is given up on, the retry on another QPU, and the QPU that is tried again**: see "How a task gets its QPU".
+6. **The wake-up rule** is stricter than section 10.3 wrote it: see above. And **the tag of a job** counts jobs put together, not attempts (section 2.5).
+7. **The timing test** of section 10.3 ("in the time the model gives for one QPU of six places, within 5%") became `multi:noidle`, which reads the same property from the times in the results and does not depend on how fast the machine is.
+8. **Jobs that carry several tasks across QPUs** count the other QPUs' free places from what those last published, without a lock. The count can be a moment old. `multi:batch` checks the limits, not how evenly tasks are spread.
+9. **The seven deliberate bugs of M7** (section 9.6) were not planted again: their text no longer applies to the rewritten file. The tests that caught them all still pass.
+10. **More than 16 devices in a process**: the QPU that does not fit is left out, and the others stay. Section 10.3 disabled the layer.
+11. **Not built:** taking tasks across ranks (by design); a test of QPUs with different limits of shots; a run with a real backend.
+
+### For later milestones
+
+- **A backend sees its QPU's number** as the `device_index` of `open`, and reads its options with `parsec_qpu_list_option(number, key)`.
+- **A backend's calls may block.** `submit`, `results`, `cancel` and `abandon` are called without the pool's lock, and the other QPUs go on meanwhile.
+- **Experiments.** E5 and E6 can be run again on several QPUs, and the comparison of binding rules of section 10.6 needs a model with one queue and several groups of places.
+
+---
+
+# 10. Design revision: several QPUs, NVQLink, Qiskit (2026-11-26)
+
+Asked for after M8: state the deployment assumption for QPUs coupled to GPU systems through NVIDIA NVQLink, let a context have several QPUs, and say how Qiskit is supported. Nothing in this section was built when it was written. Section 10.3 has been built since, as M9: section 9.8 has what was built, and the places where this text was changed by it are marked.
+
+- **No deadline scopes this section.** Each choice is made on its merits, and the milestones are ordered by what they depend on.
+- **Source references** are to the branch head, `80d6aa45d`, not to the base.
+- **Other products.** Facts about them come from their documentation and public repositories, read on 2026-11-26 (sources at the end of the section). They are their vendors' claims, or readings of their code. None was run here. What could not be confirmed is marked.
+
+The project facts and sections 1.4, 2.1, 2.2, 2.6, 2.7, 6.7, 7.3 and 7.4 point here where this section replaces what they say.
+
+## 10.1 What changes
+
+| Before | Now |
+|---|---|
+| One QPU per run, on `device_qpu_owner_rank` (2.7) | Any number of QPUs. Each has an owner rank, a rank may own several, and the ranks that own none keep a placeholder module (10.3) |
+| One progress thread serves all QPU modules of a process (2.2) | One progress thread and one backend per QPU. The QPUs of a rank share one set of waiting tasks (10.3) |
+| A task is bound to a QPU when the device layer selects it, and `device.c` changes so that two QPUs are balanced (1.4, 2.7, 2.8) | A task is bound to a QPU when that QPU has a free place for it. The device layer does not change (10.3) |
+| Where the owner rank runs: wherever the provider can be reached (project facts, 2.6) | For an NVQLink-coupled QPU, on its real-time host; PaRSEC stays out of the real-time loop (10.2) |
+| IBM through a Python adapter on the Qiskit SDK (2.6, M4) | Two routes: that adapter, with Qiskit Aer first, and a backend in C on the Qiskit C API and QRMI. Also an OpenQASM 3 reader for circuits written in Qiskit (10.4) |
+
+## 10.2 Deployment assumption: QPUs coupled through NVQLink
+
+**What NVQLink is, as NVIDIA describes it [N1][N2].**
+
+- **Three parts.** The architecture names three parts:
+  - a *real-time host*, a GPU server that runs CUDA code;
+  - a *quantum system controller*, which does the coherent control and the readout of the QPU;
+  - a *real-time network* between the two. The reference network is RoCE (RDMA over Ethernet), and a vendor may use its own if it supports the `cudaq-realtime` API.
+- **Speed.** The product page gives a minimum round trip of under 4 us (controller to GPU to controller) and 400 Gb/s. The architecture blog says NVIDIA does not prescribe a latency, because QPUs and the work offloaded to the host differ. Instead it defines a benchmark that measures the round trip of a controller-to-host callback.
+- **What it is for.** The stated uses are calibration and decoding for quantum error correction.
+- **Who uses it.** Quantinuum announced that its future processors deploy with NVQLink, and its Helios QPU uses a GH200 as its real-time host [N2].
+- **Ising** is a set of open AI models for the same two jobs [N3][N4]:
+  - a 35-billion-parameter vision-language model for calibration;
+  - small 3D convolutional decoders, of 0.9 and 1.8 million parameters, for real-time decoding.
+
+  They work with CUDA-Q and NVQLink.
+
+**Assumptions of this design.**
+
+- **A1. Two time scales, two layers.** The real-time loop never passes through PaRSEC. That loop is decoding each error-correction cycle and feeding calibration back, and it runs on the real-time host under CUDA-Q.
+  - PaRSEC's unit is the job: a circuit, physical or logical, with its shots, or several circuits in one job. A job lasts milliseconds or more.
+  - A quantum task costs 37 to 65 us of latency in PaRSEC (E1, section 9.7). That is about ten times NVQLink's whole round trip, so putting PaRSEC in that loop would be wrong by design, not a matter of tuning.
+  - When circuits are shorter than PaRSEC's cost per task, they belong in one job. The device already forms such jobs under contention (section 2.8). An application that issues many short circuits should also give one task several circuits.
+- **A2. A QPU belongs to a node.**
+  - The owner rank of an NVQLink-coupled QPU runs on that QPU's real-time host, or on a node of the same system that reaches it. Which of the two a site allows was not found in NVIDIA's pages.
+  - With several QPUs, each has its own owner rank. One rank owns several QPUs when its node hosts or reaches several. Section 10.3 makes both possible.
+  - On such a system the project fact "can compute nodes reach the provider" has an answer by construction: the QPU is on the cluster's own network.
+- **A3. The real-time host's GPUs belong to the decoder.**
+  - While its QPU runs logical circuits, the rank that owns an NVQLink-coupled QPU should not run PaRSEC's GPU tasks on the host's GPUs.
+  - This is a deployment rule, not code: `device_cuda_enabled=0` on that rank, or a mask of its GPUs.
+  - Not verified: how much GPU capacity decoding leaves free. NVIDIA's pages do not say.
+- **A4. The backend for such a QPU is CUDA-Q.**
+  - The backend builds a kernel at run time from the native circuit (`cudaq::make_kernel`) and samples it with `cudaq::sample_async`. That call takes the index of the QPU, `qpu_id`, and returns a result object [N7].
+  - The result object has one call, a blocking `get()`. It has no timed wait and no test for readiness [N7]. So the backend waits for each job on a helper thread of its own, which wakes the progress thread, as the mock's helper threads do.
+  - CUDA-Q is C++. It would be an optional dependency of one backend file, built only on request, like any provider SDK (section 7.5).
+  - The same backend serves CUDA-Q's multi-QPU platform, where every GPU of a node is a simulated QPU chosen by its index [N5][N6]: one PaRSEC QPU per CUDA-Q QPU index.
+  - Not verified: that a kernel built at run time is sampled on a physical QPU the same way as on a simulator.
+- **A5. Nothing else changes in the runtime.** To the runtime, an NVQLink-coupled QPU is a QPU device with a backend, as the mock is. NVQLink changes where the owner rank runs and how short a useful job can be.
+
+This design does not assume that the runtime sees qubits, pulses or syndromes.
+
+## 10.3 Several QPUs per context
+
+### The cases
+
+1. **One process reaches several QPUs.** Examples:
+   - a node that hosts or reaches more than one QPU;
+   - CUDA-Q's multi-QPU platform, one simulated QPU per GPU of the node (`nvidia` target, `mqpu` option [N5]), which is the multi-QPU setting most users meet first;
+   - several cloud devices, of one provider or of two.
+2. **QPUs on several ranks.** One per NVQLink host, under assumption A2.
+3. **A mix of the two.**
+
+All three are served by one mechanism.
+
+### Where the code assumes one QPU
+
+| Where (`80d6aa45d`) | What |
+|---|---|
+| `device_qpu_component.c:217-219` | `device_qpu_enabled` above 1 is warned about and treated as 1 |
+| `device_qpu_module.c:52`, `:154-179` | One module, kept in the global `parsec_qpu_module` |
+| `device_qpu_module.c:76-99` | One owner rank, `device_qpu_owner_rank` |
+| `device_qpu_progress.c:184` | One service `svc` per process: one backend, one progress thread, one heap of waiting tasks, one set of counters |
+| `device_qpu_progress.c:1099`, `:1110` | `parsec_qpu_submit` uses the global module and does not read `task->selected_device` |
+| `device_qpu_progress.c:596-600` | A task whose circuit is too wide for the backend, or asks for too many shots, completes as rejected at once. With several QPUs that is right only when no QPU of the rank can run it |
+| `device_qpu_progress.c:188` | One reason why quantum tasks cannot run, for the whole process |
+| `device_qpu_backend_mock.c:837-843`, `:174`, `:178-191` | The mock's `open` ignores its device index and reads the process-wide parameters. The mock keeps one current backend for its statistics, and its two test hooks are process-wide |
+| `parsec_internal.h:132` | A taskpool's device mask is 16 bits, so a process has at most 16 devices of all kinds. The CPU takes one, and so does the recursive device in a build with it (`device.c:1121-1148`), so a process with 8 GPUs can have at most 6 QPUs. Nothing checks this where a device is added (`device.c:1182-1200`) |
+| `device.c:300` | Once a first device is picked, a device that is not a GPU is skipped unless `device_load_balance_allow_cpu` is set. So of several QPUs the device layer always picks the one with the highest index. Section 1.4 found this at the base, at `:299`. This design leaves it as it is (see "Binding a task to a QPU") |
+
+Two things are ready already. `parsec_qpu_device_info` takes a QPU index (`device_qpu.h:395`), so far only 0. A backend's `open` takes a device index (`device_qpu_backend.h:75`).
+
+### Configuration
+
+The MCA parameter `device_qpu_devices` lists the QPUs. The list is the same on every rank. Entries are separated by `;` (as built, also by `|`), and each entry is `backend[@rank] [key=value ...]`. For example:
+
+```text
+--mca device_qpu_devices "mock@0 slots=4; mock@0 slots=2 delay=exp:20000; qrmi@3 resource=<name>"
+```
+
+- **Numbering.** A QPU's number `q` is its position in the list, the same on every rank. That is how an application names a QPU.
+- **Rank.** `@rank` defaults to `device_qpu_owner_rank`, and `@-1` is the last rank.
+- **Keys.**
+  - Limits per QPU: `max_outstanding`, `max_batch`, `submit_interval`, `job_timeout`, `max_retries`, `unavailable_timeout`. Each defaults to the MCA parameter of the same name.
+  - The backend's own keys. For the mock: `slots`, `delay`, `queue_delay`, `job_delay`, `max_circuits`, `faults`, `threads`, `max_qubits`. For QRMI: the resource name.
+  - No key carries a credential (section 2.6).
+- **An empty list** means `device_qpu_enabled` copies of `device_qpu_backend@device_qpu_owner_rank`. Every existing command line and test therefore means what it meant, except that `device_qpu_enabled` above 1 now gives that many QPUs, which is what its description already says.
+- **Seeds.** The mock's seed of the samples stays global. The samples of an evaluation then do not depend on which QPU ran it, since they depend on (seed, key) only (section 9.2). Every byte-for-byte check of sections 4.5 and 9.5 therefore stays valid with any number of QPUs, whichever QPU runs each task. The times may differ per QPU, which is what QPUs of different speeds look like.
+- **The hardware guard** applies to every entry: an entry whose backend drives a quantum device opens only with `device_qpu_allow_hardware`.
+- **Errors.** A list that does not parse disables the QPU layer with a message on rank 0, as an unusable backend does now. So does a list that would give a rank more devices than the 16-bit mask holds. (As built: a list holds at most 16 QPUs, and a QPU that would be the 17th device of its process is left out with a warning; the others stay.)
+
+### Modules and services
+
+- **Modules.**
+  - The component's query gets no context (`device_qpu_component.c:240-256`), so it makes one module per entry of the list on every rank.
+  - Each module decides at attach, where the rank and the number of ranks are known (`parsec.c:814`, `:909-913`). On the entry's rank it opens the backend and adds a device of type `PARSEC_DEV_QPU`, named `qpu<q>(<backend>)`. On another rank it adds nothing; the device layer goes on to the next module when an attach declines (`device.c:1159`).
+  - On a rank the list gives no QPU, the first module attaches as a placeholder with no backend, as every rank but the owner does now. The QPU incarnations then survive taskpool start-up everywhere (open question 3 of section 1.1).
+- **One service per QPU.** Each QPU has its own backend, progress thread, jobs in flight, limits and counters. Each progress thread sleeps in its own backend's `wait`.
+- **Why a thread per QPU, not one for all, as section 2.2 planned:**
+  - The backend interface has one blocking `wait` per backend (section 9.2), and one thread cannot sleep in two.
+  - `submit`, `results` and `cancel` are called from the progress thread and return when the provider has answered. With a provider that is a network round trip. On a shared thread, one slow provider would delay the jobs of every other QPU.
+  - The extra threads cost little: they sleep, and a process has a handful of QPUs at most.
+- **One pool per rank.** The QPUs of a rank share what is now one service's: the stack task bodies push to, and the waiting tasks. A lock protects the waiting tasks, which today belong to one thread.
+- **Life cycle, per QPU, as now.**
+  - The backend opens when its module is attached. A QPU whose backend cannot open gives no device, and the others stay.
+  - The thread starts at the rank's first submission.
+  - Everything stops from the context's at-fini callback, before the workers are joined.
+- **Statistics are per QPU.** `parsec_qpu_device_info(q, ...)` and `parsec_qpu_service_stats(q, ...)` take the QPU's number in the list; today the second takes no number. The information says which rank owns QPU `q` and whether the calling rank does. What waits is counted per rank. (As built: `parsec_qpu_service_stats()` keeps its signature and gives the rank's totals, and `parsec_qpu_service_stats_of(q, ...)` is per QPU.)
+
+### Binding a task to a QPU
+
+**The rule: a task is bound to a QPU when that QPU has a free place for it, not before.**
+
+PaRSEC binds a GPU task to its GPU when the task is selected, because the task's data must be moved to that GPU's memory. A QPU holds no data (section 9.4), so nothing forces the choice that early, and waiting costs nothing. Binding late gives four things:
+
+1. **No place stays free while a task that could use it waits** on the same rank. With early binding each QPU keeps the tasks it was dealt, and when job times are as uneven as a provider's, some QPUs run dry while others still have tasks waiting.
+2. **QPUs of different speeds need no estimate.** A faster QPU frees its places sooner and so takes more tasks. Early binding would need the time a job takes on each QPU. The device layer has a nominal second for that (section 9.4), and giving it measured times needs a change to the device layer.
+3. **A QPU sees the circuit before it takes the task.** A QPU too narrow for a circuit never gets it. The device layer selects without seeing the circuit.
+4. **A QPU that stops answering keeps only the tasks it has.** The tasks that wait go to the others.
+
+With QPUs that are alike, `n` QPUs of `k` places each then behave as one QPU of `n` times `k` places, which is the model the experiments already use for one QPU.
+
+**How it works, with the device layer unchanged.**
+
+1. **Selection.** `parsec_select_best_device` picks the QPU incarnation and a QPU module of the rank. It is always the same one (`device.c:300`), and here that pick means only "a QPU of this rank". The scheduler adds the task's load to that module (`scheduling.c:151`).
+2. **Submission.** `parsec_qpu_submit`, still on the worker, takes that load off again, sets `task->load` to 0 and pushes the task to the rank's pool.
+3. **Binding.** A QPU with a free place takes, among the waiting tasks it may run, the first by priority and then arrival. It sets `task->selected_device` to its own module and `task->load` to its nominal time, and adds that to its `device_load`.
+4. **Completion.** The scheduler subtracts `task->load` from the load of `task->selected_device` (`scheduling.c:539`). That is right in every case, including a task that never had a job, whose load is 0.
+5. **Retry.** A task whose job failed goes back to the pool: its QPU takes the load off again. Its next job may run on another QPU.
+
+- **Why this is safe.** Between the body's return and the hand-off, the task belongs to the QPU layer (section 2.3). After the hook has returned ASYNC, the worker reads neither `selected_device` nor `load` (`scheduling.c:218-240`, `:604`), and no instrumentation module in the tree reads them. So no thread reads those fields while the QPU layer changes them.
+- **What the load means then.** A QPU's `device_load` counts the tasks it holds a job for. The test of hazard H12 (section 4.3) stays: every load is zero at the end.
+- **Which tasks a QPU may run:** those pinned to it, and the unpinned ones whose circuit and shots its backend takes (`nb_qubits`, `max_shots`).
+- **A task no QPU of the rank can run** completes as rejected at once, as now.
+
+**Pinning.** A task may name its QPU: when the circuit was compiled for one device, or when related evaluations must come from the same device, since noise differs from device to device.
+
+- A new call, `parsec_qpu_submit_on`, takes the QPU's number or `PARSEC_QPU_ANY`. `parsec_qpu_submit` becomes that call with `PARSEC_QPU_ANY`. A JDF body uses `PARSEC_QPU_SUBMIT_ON(Q, CIRCUIT, PARAMS, RESULT, SHOTS, KEY)`.
+- It is the same call in PTG and in DTD.
+- A task pinned to a QPU of another rank is refused with a message, as a quantum task on a rank without a QPU is now.
+
+**Jobs that carry several tasks** (section 2.8, as built in M7) stay per QPU, since a job runs on one device. The rule "tasks share a job only when more of them wait than jobs can be submitted" now counts the free places of all the rank's QPUs that may run them, under the pool's lock. So no task shares a job while another QPU has a place for it.
+
+**Failures, per QPU.**
+
+- **A job that fails or times out** sends its tasks back to the pool, each to be retried alone, as now. An unpinned task may be retried on another QPU. (As built: it is retried on another QPU whenever one that is up can run it. Otherwise a QPU whose jobs fail at once is free first every time and takes the same task again.)
+- **A submission the backend could not take** is asked again on the same QPU with the same tag, or abandoned there, as now. The provider may have the job, so it cannot move.
+- **A QPU unavailable for longer than its `unavailable_timeout`** stops taking tasks. The waiting tasks pinned to it complete as unavailable. An unpinned task, waiting or of the submission that was given up, completes as unavailable only when every QPU of the rank that may run it is in that state; otherwise it waits for one that is not. (Corrected in M9: this text had the tasks of the given-up submission complete as unavailable, against its own test.) As built, such a QPU is tried again after a while with one job (section 9.8).
+- **The result says which QPU ran the job.** The header gets the QPU's number in 8 of the 16 bits of `attempts` (`device_qpu.h`, `parsec_qpu_result_t`), so it stays 64 bytes, and its version goes from 1 to 2.
+
+**Wake-ups.** A task body wakes one QPU that has a free place, and none when all are full: a QPU that frees a place looks at the pool itself. A QPU that leaves a task it cannot take wakes a sibling that has a free place. (As built, the rule is stricter and has more parts: a QPU shows its places only while its thread sleeps; whoever puts tasks into the pool wakes the others before it calls its backend again; and a thread looks once more before it sleeps. Section 9.8 has the two failures that showed why.)
+
+### Alternatives considered
+
+| Alternative | For | Against |
+|---|---|---|
+| Bind at selection: the device layer picks the QPU with the least load, with `device.c:300` changed for QPU types | No state shared between the QPUs' threads. Which QPU runs a task does not depend on timing | Points 1 to 4 above. It also changes the device layer |
+| Pin with the PTG body property `device=` | The syntax exists | It does not work at this commit. For a body that is not CUDA or HIP, the compiler refers to a function it never generates (`jdf2c.c:4003`; the generator is reached for those two types only, `:7016`): a QPU body with `device=0` does not compile (tried). For CUDA and HIP, the generated loop declares a second `dev_index` (`:6806`), so the function always asks for a device one past the last and gets none, and the property has no effect. The loop was run alone, not on GPUs. No JDF in the tree uses the property. This is a defect of the base (`09c721868`, same line), not fixed here |
+| Pin with a body's `evaluate=` function that sets `task->selected_device` | By reading, it works for a body of any type (`jdf2c.c:4006-4007`, `device.c:186-193`). Not tried | PTG only: a DTD insertion names a device type, not a device (`insert_function.h:331-340`). An argument of the submission serves both |
+| One progress thread for all QPUs | No lock on the waiting tasks | The blocking calls, above. Waiting on several backends at once needs a new backend interface |
+
+### Placement across ranks
+
+The pool is per rank, because a task runs on the rank its affinity gives it.
+
+- **The application chooses the rank**, as now: the task's affinity names an element of a collection that lives on a rank that owns a QPU.
+- **Helpers:** `parsec_qpu_count()` and `parsec_qpu_rank_of(q)`.
+- **A QPU on one rank does not take tasks that wait on another.** PaRSEC moves no task between ranks for any device. Where QPUs can be reached from one node (cloud devices), giving them all to one rank avoids the question. Where each sits on its own node (assumption A2), the application spreads its quantum tasks over the owner ranks.
+
+### The QAOA application
+
+- **All QPUs on one rank:** nothing changes in the task graph. `Q` keeps its one element (`testing_qaoa.c:195`), and the tasks go to the pool unpinned.
+- **QPUs on several ranks:** `Q` gets one element per owner rank, and the quantum tasks of block `b` go to the owner rank number `b` modulo their count.
+- **Pinning per block** is an option of the driver (`-Q`), for hardware. It keeps both evaluations of a step on one device, so the comparison the optimizer makes between them carries no difference between devices. On the mock it changes nothing in the answers.
+- **No change for correctness elsewhere.** The sequential reference (A) and the MPI baseline (B) need none, since the samples depend on the key only.
+
+### Tests
+
+- **`runtime/qpu/multi`**: two and three mock QPUs on one rank. Checks:
+  - every task completes once, and its result names a QPU that exists;
+  - no QPU exceeds its own `max_outstanding` (the mock's `max_running`, per instance);
+  - a pinned task runs on its QPU only;
+  - every load is zero at the end.
+- **No free place while a task waits.** From the time stamps of the jobs: with QPUs alike, three QPUs of two places finish a fixed set of tasks in the time the model gives for one QPU of six places, within 5%. This is a timing test, to be run on idle cores (section 9.7). (As built, `multi:noidle` reads the property itself from the time stamps: at the middle of the time a task waited, every QPU held as many jobs as it may.)
+- **Speeds.** With one QPU twice as fast as the other, the fast one runs more than half of the unpinned tasks.
+- **Width.** With a QPU of 4 qubits and one of 12, every 8-qubit circuit runs on the second, and a 16-qubit circuit completes as rejected.
+- **Isolation.**
+  - With faults on one QPU (fail, unavailable), every unpinned task still completes with a result, through the other.
+  - The tasks pinned to the faulty QPU complete with its status, and no other task does.
+  - A QPU whose backend cannot open leaves the others working. A task pinned to a QPU that does not exist is refused with a message.
+- **`runtime/qpu/multi:mp`**: QPUs on rank 0 and on the last rank.
+- **Hardware guard.** `runtime/qpu/no_hardware_in_tests` also reads the values of `device_qpu_devices` in the test definitions.
+- **QAOA.** Final states equal byte for byte to the reference with 1, 2 and 3 QPUs, on one rank and spread over ranks, pinned and not.
+- **Unchanged behaviour.** All existing tests pass with an empty list.
+- **Sanitizers and deliberate bugs**, as in section 9. Bugs to plant:
+  - a load that is not moved with its task;
+  - a pinned task taken by another QPU;
+  - a QPU that takes a circuit too wide for it;
+  - the pool read without its lock.
+
+## 10.4 Qiskit
+
+"Supporting Qiskit" covers four different things, and each gives PaRSEC something else.
+
+1. **IBM hardware through Qiskit Runtime.** This is the plan of section 2.6 (M4): a persistent adapter process on the official SDK, which transpiles with Qiskit and submits with `qiskit-ibm-runtime`.
+2. **Qiskit Aer, a local simulator with noise models.** Through the same adapter, it gives a backend that:
+   - is noisy, where the mock is exact;
+   - is transpiled to a real device's gates and connectivity;
+   - needs no account and reaches no network.
+
+   It also tests the adapter, its protocol and the transpilation end to end without a provider. This changes one rule of section 2.6, that no test uses the adapter: an optional test may, registered only when Python and Qiskit Aer are found, and never required. The build still needs neither. Not verified in this pass: which noise models of IBM devices the current SDK ships.
+3. **A backend in C only, on the Qiskit C API and QRMI.** Both have moved since section 2.6 called the C API experimental and unable to submit.
+   - **The Qiskit C API transpiles.**
+     - Qiskit 2.2 added `qk_transpile()`, a standalone transpiler in C. It mirrors the preset pass managers, with some passes skipped [Q1][Q2].
+     - Qiskit 2.3 added functions for the individual stages and access to the DAG [Q3].
+     - The reference page warns that `qk_transpile()` may not work correctly when Python and C are mixed in one process. That does not arise here: PaRSEC has no Python.
+   - **The Qiskit C API reads and writes QPY.** Release 2.6.2, the latest (2026-11-05), has `qk_qpy_dump_file`, `qk_qpy_dump_buffer`, `qk_qpy_load_file` and `qk_qpy_load_buffer` (`crates/cext/src/qpy.rs` [Q6]). The file is not in release 2.5.0. QPY is one of the two forms in which the provider takes a circuit (section 2.6, source 5). No OpenQASM 3 writer was found in the C API: its file names and its circuit functions were searched.
+   - **QRMI has a C API**, read in `src/cext.rs` of its repository and in its example for IBM [Q4]:
+     - `qrmi_resource_new` and `qrmi_resource_free`;
+     - `qrmi_resource_acquire` and `qrmi_resource_release`;
+     - `qrmi_resource_target`, the device's description as text;
+     - `qrmi_resource_task_start`, `qrmi_resource_task_status`, `qrmi_resource_task_result`, `qrmi_resource_task_logs` and `qrmi_resource_task_stop`;
+     - `qrmi_resource_status_pending_job_count`, by its name the length of the device's queue (its code was not read);
+     - `qrmi_config_resource_names_get`, the resource names in a QRMI configuration.
+
+     No call waits for an event, so this backend's `wait` is a poll with back-off, as section 2.2 foresaw for such providers.
+   - **One payload kind per vendor.** A task's payload is of one of six kinds (`QiskitPrimitive`, `PasqalCloud`, `AliceBobFelis`, `IQMServer`, `Oqtopus`, `MaestroLocal`). The Qiskit kind holds the input of a primitive, as text, and a program id. This design covers that kind only.
+   - **QRMI backs IBM's Slurm plugin**, where a job asks for quantum resources with `--qpu=<names>`, a comma-separated list [Q5]. That fits section 10.3: each name becomes an entry `qrmi@<rank> resource=<name>`. The launch script writes the list from the names, so that every rank numbers the QPUs the same way.
+   - **Not verified:**
+     - how the QPY bytes go into the text input of a primitive;
+     - the input of the program that replaces the server-side Sampler (section 2.6, source 9).
+4. **Circuits written in Qiskit.** An application builds its circuits in Python and gives PaRSEC an OpenQASM 3 file. This needs a reader for the subset of OpenQASM 3 that the native format holds: the thirteen operations of section 9.2, with parameters as `input angle`. The reader is small and in C, with no dependency. A build with the Qiskit C library (M10) can read QPY files as well.
+
+**The two routes to IBM, compared.**
+
+| | Adapter in Python (M4) | Backend in C (M10) |
+|---|---|---|
+| Needs at run time, on the owner rank's node | Python, Qiskit and the IBM SDK | Two C libraries |
+| When IBM changes the program jobs go to | The SDK absorbs it | The backend writes the program's input itself, so it must follow |
+| Simulation with noise | Qiskit Aer | None |
+| At a centre that hands out QPUs through Slurm | Works, through the SDK | Fits directly: the job's resources are QRMI resources |
+| Maturity of what it builds on | The official SDK | Two young libraries, one of them (QRMI) written in Rust with a generated C header [Q4] |
+
+**Recommendation.** Build both, the adapter first.
+
+- **M4a**: the adapter with Qiskit Aer. It needs no account, and it tests everything up to the network. The OpenQASM 3 reader and writer come with it, since the adapter speaks OpenQASM 3 (section 2.6).
+- **M4b**: IBM hardware through the adapter, once there is an allocation.
+- **M10**: the backend in C. Both libraries are optional dependencies of one backend file, off by default (`-DPARSEC_QPU_WITH_QRMI=ON`), as section 7.5 requires.
+- **Qiskit never goes inside PaRSEC.** The build has no Python, as before.
+
+## 10.5 Milestones
+
+### M9: several QPUs per context
+
+Built on 2026-11-26: section 9.8.
+
+| Item | Description |
+|---|---|
+| Objective | Section 10.3: a list of QPUs, a service per QPU, one pool per rank, binding when a place is free, pinning, the QAOA application on several QPUs |
+| Files | Edited: `parsec/mca/device/qpu/device_qpu_component.c`, `device_qpu_module.c`, `device_qpu_progress.c`, `device_qpu_internal.h`, `device_qpu.h`, `device_qpu_backend_mock.c`; `tests/apps/qaoa/qaoa.jdf`, `testing_qaoa.c`; `tools/qpu/README.md`; the two files of `tests/runtime/qpu/` that list tests. New: `parsec/mca/device/qpu/device_qpu_list.c` (the list), `tests/runtime/qpu/qpu_multi.jdf`. Nothing outside the component and its tests |
+| Dependencies | M3, M7 |
+| Difficulty | Medium to high. The waiting tasks, which one thread owns today, become shared by several, in the code that M2 and M7 tested hardest |
+| Risks | A race in the pool, or a wake-up that is lost so that a task waits beside a free place. A load that does not follow its task. A process-wide assumption hidden in the split: the arrival counter, the reason quantum tasks cannot run, the mock's current backend and its test hooks. Picking the first task a QPU may run when tasks pinned elsewhere, or too wide for it, are ahead of it. The 16-device mask |
+| Tests | Section 10.3; all existing tests with an empty list; thread and address sanitizers; the deliberate-bug pass |
+| Acceptance criteria | Three mock QPUs on one rank, and QPUs on two ranks, give final QAOA states equal byte for byte to the reference. No QPU exceeds its limits. The timing test of section 10.3 holds. Faults stay on their QPU. Every load is zero at the end. Every existing test passes unchanged |
+
+### M4, split
+
+M4a and M4b as in section 10.4. M4's files, risks and tests stay as section 7.3 gives them, plus the Aer mode of the adapter and the OpenQASM 3 reader (`parsec/mca/device/qpu/device_qpu_qasm.c`, which M4 already lists, now in both directions). M4b still needs an allocation and `device_qpu_allow_hardware`, and no test reaches it.
+
+### M10: a backend in C on QRMI and the Qiskit C API
+
+| Item | Description |
+|---|---|
+| Objective | `device_qpu_backend_qrmi.c`: lower the native circuit to the Qiskit C API, transpile with `qk_transpile` against the target QRMI reports, write the circuit as QPY and the primitive's input around it, run it through QRMI. One QPU per QRMI resource |
+| Files | New: `parsec/mca/device/qpu/device_qpu_backend_qrmi.c`; a CMake option and a find module for the two libraries; `tests/runtime/qpu/qpu_qrmi_lowering.c` |
+| Dependencies | M2. M9 for more than one resource |
+| Difficulty | Medium to high: two young libraries |
+| Risks | The two unverified points of section 10.4. Version drift of both libraries: the QPY calls need Qiskit 2.6 |
+| Tests | The lowering, the transpilation and the input, without any QRMI call. A QRMI run only with `device_qpu_allow_hardware`, and never in the test suite |
+| Acceptance criteria | The input written for the QAOA circuits is accepted by the provider for one two-qubit circuit, by hand and with an explicit go-ahead, as in M4. The hardware guard covers the backend |
+
+### M11: a CUDA-Q backend
+
+Assumption A4 as a backend, for NVQLink-coupled QPUs and for CUDA-Q's simulated multi-QPU platform. It needs a CUDA-Q installation, and nothing here has one. Its milestone table is to be written when an installation exists.
+
+## 10.6 What this means for the plan
+
+- **Order.** M9 comes first: it needs nothing from outside, and the three backends are worth more with it. Then M4a. M10, M4b and M11 each wait for something from outside: access to hardware, or an installation.
+- **Experiments that M9 makes possible.**
+  - E5 with several QPUs: tasks that share jobs across QPUs.
+  - E6 with QPUs on several ranks.
+  - A new one: binding when a place is free against pinning in turn, at coefficients of variation of the job time of 0, 1 and 2. It measures what the rule of section 10.3 is worth, and the model of section 6.1 predicts it.
+- **Until M9 runs,** section 6.7's "One QPU. Nothing here supports claims about several" stays true. Any text about this work should present several QPUs as designed, not as measured.
+- **Related work** (section 5) gains:
+  - NVQLink, `cudaq-realtime` and Ising, below the runtime;
+  - QRMI with its Slurm plugin, beside it;
+  - Q-IRIS on several QPUs [R3], the closest prior runtime with more than one QPU. Read since (section 9.8): the paper names no rule for choosing among them.
+- **Found in passing:** the defect of the PTG `device=` property (section 10.3, alternatives). It is in ICLDisco/parsec at the base commit and is worth reporting there.
+
+## Sources for section 10
+
+- [N1] NVIDIA NVQLink product page: https://www.nvidia.com/en-us/solutions/quantum-computing/nvqlink/
+- [N2] NVIDIA NVQLink architecture: https://developer.nvidia.com/blog/nvidia-nvqlink-architecture-integrates-accelerated-computing-with-quantum-processors
+- [N3] NVIDIA Ising announcement: https://nvidianews.nvidia.com/news/nvidia-launches-ising-the-worlds-first-open-ai-models-to-accelerate-the-path-to-useful-quantum-computers
+- [N4] NVIDIA Ising workflows: https://developer.nvidia.com/blog/nvidia-ising-introduces-ai-powered-workflows-to-build-fault-tolerant-quantum-systems/
+- [N5] CUDA-Q, multiple QPUs: https://nvidia.github.io/cuda-quantum/latest/using/backends/sims/mqpusims.html
+- [N6] CUDA-Q, multi-processor platforms: https://nvidia.github.io/cuda-quantum/latest/using/backends/platform.html
+- [N7] CUDA-Q repository, main branch: https://github.com/NVIDIA/cuda-quantum (`runtime/cudaq/algorithms/sample.h` for `sample_async` and `qpu_id`; `runtime/common/Future.h` for the result object)
+- [Q1] Qiskit SDK 2.2 release notes: https://quantum.cloud.ibm.com/docs/api/qiskit/release-notes/2.2
+- [Q2] Qiskit C API, transpiler: https://quantum.cloud.ibm.com/docs/api/qiskit-c/qk-transpiler
+- [Q3] Qiskit SDK 2.3 release notes: https://quantum.cloud.ibm.com/docs/en/api/qiskit/release-notes/2.3
+- [Q4] QRMI repository, main branch: https://github.com/qiskit-community/qrmi (`src/cext.rs`; `examples/qrmi/c/ibm_quantum_compute_service/src/quantum_compute_service.c`; `cbindgen.toml`)
+- [Q5] IBM Quantum, Slurm plugin: https://quantum.cloud.ibm.com/docs/guides/slurm-plugin
+- [Q6] Qiskit repository: https://github.com/Qiskit/qiskit (`crates/cext/src/qpy.rs` at tag 2.6.2; absent at tag 2.5.0)
