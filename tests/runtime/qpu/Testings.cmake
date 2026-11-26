@@ -33,6 +33,12 @@ if(PARSEC_HAVE_QPU)
               ${_qpu} --mca device_qpu_backend guard_missing)
   qpu_addtest(runtime/qpu/hardware_guard:control ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_guard
               ${_qpu} --mca device_qpu_backend mock)
+  # In a list of QPUs, one backend that may not be used takes the others with
+  # it: the mock that is listed first is not opened either.
+  qpu_addtest(runtime/qpu/hardware_guard:list ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_guard
+              ${_qpu} --mca device_qpu_backend guard_physical --mca device_qpu_devices "mock|guard_physical")
+  qpu_addtest(runtime/qpu/hardware_guard:list:unknown ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_guard
+              ${_qpu} --mca device_qpu_backend guard_missing --mca device_qpu_devices "mock|guard_missing")
 
   # The QPU as a device: none unless asked for; one on every rank when it is;
   # a backend on the rank that owns it and nowhere else; and a quantum task on
@@ -267,6 +273,131 @@ if(PARSEC_HAVE_QPU)
   # The QPU service started and stopped many times in one process.
   qpu_addtest(runtime/qpu/restart ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_chain -I 30 -n 8 -l 2
               ${_qpu} --mca device_qpu_mock_delay uniform:0:500)
+
+  # Several QPUs in one run. Their list separates its entries with '|' here:
+  # a ';' would end the argument in a CMake list.
+  #
+  # Two and three QPUs of one rank that are alike: every answer is the one of
+  # its inputs whichever QPU gave it, no QPU goes over its own limit, and at
+  # the end each task was counted by one QPU and no QPU carries a load. Then
+  # the same with tasks that name their QPU, all of them and every other
+  # chain; with jobs that carry several tasks; and with the list left out,
+  # where device_qpu_enabled says how many QPUs there are.
+  set(_qpu_m0 -- --mca device_qpu_enabled 1 --mca device_qpu_max_outstanding 2 --mca device_qpu_mock_slots 2)
+  set(_qpu_m ${_qpu_m0} --mca device_qpu_mock_delay uniform:200:5000)
+  qpu_addtest(runtime/qpu/multi ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 24 -l 3
+              ${_qpu_m} --mca device_qpu_devices "mock|mock")
+  qpu_addtest(runtime/qpu/multi:three ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 24 -l 3
+              ${_qpu_m} --mca device_qpu_devices "mock | mock | mock")
+  qpu_addtest(runtime/qpu/multi:enabled ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 24 -l 3
+              -- --mca device_qpu_enabled 3 --mca device_qpu_max_outstanding 2 --mca device_qpu_mock_slots 2
+              --mca device_qpu_mock_delay uniform:200:5000)
+  qpu_addtest(runtime/qpu/multi:named ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 24 -l 3 -P turn
+              ${_qpu_m} --mca device_qpu_devices "mock|mock|mock")
+  qpu_addtest(runtime/qpu/multi:named:half ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 24 -l 3 -P half
+              ${_qpu_m} --mca device_qpu_devices "mock|mock|mock")
+  qpu_addtest(runtime/qpu/multi:named:one ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 12 -l 2 -P 1
+              ${_qpu_m} --mca device_qpu_devices "mock|mock|mock")
+  qpu_addtest(runtime/qpu/multi:batch ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 60 -l 2
+              ${_qpu_m} --mca device_qpu_devices "mock max_outstanding=1 slots=1|mock max_outstanding=1 slots=1"
+              --mca device_qpu_max_batch 4 --mca device_qpu_mock_job_delay const:2000)
+  # Each QPU has its own limits: one place here, three there.
+  qpu_addtest(runtime/qpu/multi:limits ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 40 -l 2 -c
+              ${_qpu_m0} --mca device_qpu_devices "mock max_outstanding=1 slots=1|mock max_outstanding=3 slots=3"
+              --mca device_qpu_mock_delay const:10000)
+  # No place stays free while a task waits: 48 tasks at once on three QPUs of
+  # two places, with jobs of very different lengths.
+  qpu_addtest(runtime/qpu/multi:noidle ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 48 -l 1 -W
+              ${_qpu_m0} --mca device_qpu_devices "mock|mock|mock" --mca device_qpu_mock_delay exp:40000)
+  # A task that is submitted while its QPU is at work, and that has a place the
+  # moment after, is not left on the way: the thread looks once more before
+  # it sleeps. Here the mock holds the thread, asked again for a job it did
+  # not take at first, until the second task is submitted; that task found
+  # no place shown and woke nobody. Jobs of two seconds, and threads that
+  # sleep for 30 s when nobody wakes them.
+  qpu_addtest(runtime/qpu/multi:wake:reask ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -G
+              -- --mca device_qpu_enabled 1 --mca device_qpu_max_outstanding 2 --mca device_qpu_mock_slots 2
+              --mca device_qpu_mock_delay const:2000000 --mca device_qpu_retry_backoff 2 --mca device_qpu_poll_max 30000)
+  # A QPU that is twice as fast runs more than half of the tasks.
+  qpu_addtest(runtime/qpu/multi:speeds ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 60 -l 1 -M 1
+              ${_qpu_m} --mca device_qpu_devices "mock delay=const:20000|mock delay=const:10000")
+  # Circuits of four qubits, and one QPU that is too narrow for them: the
+  # other one runs them all. When both are too narrow, every task is rejected.
+  qpu_addtest(runtime/qpu/multi:width ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 24 -l 2 -O 1
+              ${_qpu_m} --mca device_qpu_devices "mock max_qubits=3|mock max_qubits=12")
+  qpu_addtest(runtime/qpu/multi:width:none ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 24 -l 2 -R
+              ${_qpu_m} --mca device_qpu_devices "mock max_qubits=3|mock max_qubits=2")
+  # A QPU whose jobs all fail: a task that named none gets its answer from
+  # the other QPU, and a task that named the one that fails ends without one.
+  qpu_addtest(runtime/qpu/multi:fail ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 24 -l 2 -f 0
+              ${_qpu_m} --mca device_qpu_devices "mock faults=fail:p=1|mock" --mca device_qpu_retry_backoff 2)
+  qpu_addtest(runtime/qpu/multi:fail:named ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 24 -l 2 -f 0 -P half
+              ${_qpu_m} --mca device_qpu_devices "mock faults=fail:p=1|mock" --mca device_qpu_retry_backoff 2)
+  # The task of a job that failed goes to the other QPU at once, also when
+  # that one sleeps and nothing else is going on: two chains only, and
+  # threads that sleep for 30 s when nobody wakes them. The run is done in a
+  # fraction of a second (it is given 5). Whether the last task of a run goes
+  # to the QPU that fails first is a matter of turns, so the run is done 10
+  # times.
+  add_test(NAME runtime/qpu/multi:fail:prompt
+           COMMAND ${CMAKE_COMMAND} -DREPEAT=10 -P ${PROJECT_SOURCE_DIR}/tests/runtime/qpu/repeat_test.cmake --
+                   ${PROJECT_BINARY_DIR}/tests/runtime/qpu/qpu_multi -n 2 -l 6 -f 0 -t 5000
+                   -- --mca device_qpu_enabled 1 --mca device_qpu_max_outstanding 2 --mca device_qpu_mock_slots 2
+                   --mca device_qpu_mock_delay uniform:200:5000 --mca device_qpu_retry_backoff 2
+                   --mca device_qpu_poll_max 30000 --mca device_qpu_devices "mock faults=fail:p=1|mock")
+  set_tests_properties(runtime/qpu/multi:fail:prompt PROPERTIES TIMEOUT 180)
+  # A QPU that never takes a job: it is given up on, its tasks go to the
+  # other one, and those that named it complete as unavailable.
+  qpu_addtest(runtime/qpu/multi:down ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 24 -l 2 -f 0
+              ${_qpu_m} --mca device_qpu_devices "mock faults=unavailable:p=1 unavailable_timeout=60|mock"
+              --mca device_qpu_retry_backoff 2)
+  qpu_addtest(runtime/qpu/multi:down:named ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 24 -l 2 -f 0 -P half
+              ${_qpu_m} --mca device_qpu_devices "mock faults=unavailable:p=1 unavailable_timeout=60|mock"
+              --mca device_qpu_retry_backoff 2)
+  # Once it is given up on, it is left alone: in a run of two seconds it is
+  # asked a dozen times (while its first job is asked again, and once each
+  # time it is tried), not the two hundred times of a QPU that is handed
+  # every task in turn.
+  qpu_addtest(runtime/qpu/multi:down:away ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 16 -l 12 -f 0 -a 40
+              ${_qpu_m0} --mca device_qpu_devices "mock faults=unavailable:p=1 unavailable_timeout=50|mock"
+              --mca device_qpu_retry_backoff 2 --mca device_qpu_mock_delay const:20000)
+  # A QPU that takes no job for the first 300 ms and then does: the tasks
+  # go to the other one in the meantime, and it is used again afterwards.
+  qpu_addtest(runtime/qpu/multi:back ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 16 -l 12 -u 0
+              ${_qpu_m0} --mca device_qpu_devices "mock faults=unavailable:for=300 unavailable_timeout=50|mock"
+              --mca device_qpu_retry_backoff 2 --mca device_qpu_mock_delay const:20000)
+  # A QPU whose backend cannot be opened gives no device, and the others
+  # run the tasks: here the second mock is given a delay it cannot read, and
+  # the third one says only when it is opened that it drives a quantum device.
+  qpu_addtest(runtime/qpu/multi:noopen ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 24 -l 2 -X 1
+              ${_qpu_m} --mca device_qpu_devices "mock|mock delay=nonsense")
+  # A QPU that takes its jobs and loses the answer, for the first 400 ms: the
+  # submission is given up on, which cancels the job, and its task goes to
+  # the other QPU or, later, to this one again. That is another job, under
+  # another tag: no backend is asked twice under one tag for two jobs.
+  qpu_addtest(runtime/qpu/multi:lost ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 8 -l 2 -u 0
+              -- --mca device_qpu_enabled 1 --mca device_qpu_max_outstanding 1 --mca device_qpu_mock_slots 1
+              --mca device_qpu_devices "mock faults=lost:for=400 unavailable_timeout=50|mock"
+              --mca device_qpu_retry_backoff 2 --mca device_qpu_mock_delay const:300000)
+  qpu_addtest(runtime/qpu/multi:lost:noretry ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 8 -l 2 -u 0
+              -- --mca device_qpu_enabled 1 --mca device_qpu_max_outstanding 1 --mca device_qpu_mock_slots 1
+              --mca device_qpu_devices "mock faults=lost:for=400 unavailable_timeout=50|mock"
+              --mca device_qpu_retry_backoff 2 --mca device_qpu_mock_delay const:300000 --mca device_qpu_max_retries 0)
+  # A list that cannot be read gives no QPU at all, and says so.
+  qpu_addtest(runtime/qpu/multi:badlist ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_discovery -x
+              -- --mca device_qpu_enabled 1 --mca device_qpu_devices "mock slots=2|mock sluts=2")
+
+  if( MPI_C_FOUND )
+    # QPUs on two ranks, one and two of them; and ranks that own none.
+    qpu_addtest(runtime/qpu/multi:mp ${MPI_TEST_CMD_LIST} 2 runtime/qpu/qpu_multi -n 24 -l 3 -E 0,1,1
+                ${_qpu_m} --mca device_qpu_devices "mock@0|mock@1|mock@1")
+    qpu_addtest(runtime/qpu/multi:mp:named ${MPI_TEST_CMD_LIST} 2 runtime/qpu/qpu_multi -n 24 -l 3 -P turn
+                ${_qpu_m} --mca device_qpu_devices "mock@0|mock@1|mock@1")
+    qpu_addtest(runtime/qpu/multi:mp:4 ${MPI_TEST_CMD_LIST} 4 runtime/qpu/qpu_multi -n 24 -l 3 -P half -E 0,-1,-1
+                ${_qpu_m} --mca device_qpu_devices "mock@0|mock@-1|mock@-1")
+    qpu_addtest(runtime/qpu/multi:mp:fail ${MPI_TEST_CMD_LIST} 2 runtime/qpu/qpu_multi -n 24 -l 2 -f 1
+                ${_qpu_m} --mca device_qpu_devices "mock@0|mock@1 faults=fail:p=1|mock@1" --mca device_qpu_retry_backoff 2)
+  endif( MPI_C_FOUND )
 
   if( MPI_C_FOUND )
     foreach(_np 2 4)

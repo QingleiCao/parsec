@@ -28,6 +28,8 @@
  * element k is on rank fixed_rank, or on rank k modulo the number of ranks
  * when fixed_rank is negative. */
 parsec_data_collection_t *qpu_test_placement_new(int myrank, int nodes, int fixed_rank);
+/* The same with element k on the (k modulo nb_ranks)-th rank of a list. */
+parsec_data_collection_t *qpu_test_placement_list_new(int myrank, int nodes, const int *ranks, int nb_ranks);
 void qpu_test_placement_free(parsec_data_collection_t *dc);
 
 /* A collection of n blocks of QPU_TEST_BLOCK bytes that all live on one

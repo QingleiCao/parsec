@@ -23,6 +23,9 @@ if(PARSEC_HAVE_QPU)
   qpu_addtest_executable(qpu_chain)
   target_ptg_sources(qpu_chain PRIVATE "qpu_chain.jdf")
 
+  qpu_addtest_executable(qpu_multi)
+  target_ptg_sources(qpu_multi PRIVATE "qpu_multi.jdf")
+
   # The same test with a quantum task whose body is not of the QPU type: such
   # a body may submit as well, and the job goes to the QPU of the process all
   # the same. The type is one word of the JDF, so the source is copied with

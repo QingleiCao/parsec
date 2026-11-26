@@ -21,13 +21,16 @@
 typedef struct {
     parsec_data_collection_t super;
     int fixed_rank;
+    int nb_ranks;       /* not zero: element k is on ranks[k mod nb_ranks] */
+    int ranks[64];
 } qpu_test_placement_t;
 
 static uint32_t placement_rank(parsec_data_collection_t *dc, int k)
 {
     qpu_test_placement_t *p = (qpu_test_placement_t*)dc;
-    if( p->fixed_rank >= 0 ) return (uint32_t)p->fixed_rank;
     if( k < 0 ) k = -k;
+    if( p->nb_ranks > 0 ) return (uint32_t)p->ranks[k % p->nb_ranks];
+    if( p->fixed_rank >= 0 ) return (uint32_t)p->fixed_rank;
     return (uint32_t)(k % (int)dc->nodes);
 }
 
@@ -96,6 +99,17 @@ parsec_data_collection_t *qpu_test_placement_new(int myrank, int nodes, int fixe
     dc->data_of     = placement_data_of;
     dc->data_of_key = placement_data_of_key;
     p->fixed_rank   = (fixed_rank >= nodes) ? nodes - 1 : fixed_rank;
+    return dc;
+}
+
+parsec_data_collection_t *qpu_test_placement_list_new(int myrank, int nodes, const int *ranks, int nb_ranks)
+{
+    parsec_data_collection_t *dc = qpu_test_placement_new(myrank, nodes, -1);
+    qpu_test_placement_t *p = (qpu_test_placement_t*)dc;
+
+    if( nb_ranks > 64 ) nb_ranks = 64;
+    for( int i = 0; i < nb_ranks; i++ ) p->ranks[i] = (ranks[i] < nodes) ? ranks[i] : nodes - 1;
+    p->nb_ranks = nb_ranks;
     return dc;
 }
 
