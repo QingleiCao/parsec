@@ -17,7 +17,11 @@
  * service is what runs the jobs: a progress thread that takes the jobs task
  * bodies submit, keeps a bounded number of them at the backend, and
  * completes each task when its job is over by handing it back to a worker.
- * There is one of each per process, and the service runs on one rank only.
+ *
+ * A run has one QPU or several (device_qpu_devices). Each has a module and a
+ * service of its own on the rank that owns it, and the QPUs of one rank share
+ * the tasks that wait: a task is bound to a QPU when that QPU has a place
+ * for its job, not before.
  */
 
 #include "parsec/mca/device/device.h"
@@ -28,9 +32,14 @@
 
 BEGIN_C_DECLS
 
+/** Most QPUs a run may have. A process has at most 16 devices of all kinds
+ *  (the device mask of a taskpool is 16 bits), so no rank can own more. */
+#define PARSEC_QPU_MAX_QPUS  16
+
 /** Values of the MCA parameters, filled by parsec_qpu_register_params(). */
 typedef struct parsec_qpu_params_s {
     int   enabled;                /**< device_qpu_enabled */
+    char *devices;                /**< device_qpu_devices */
     char *backend;                /**< device_qpu_backend */
     int   allow_hardware;         /**< device_qpu_allow_hardware */
     int   owner_rank;             /**< device_qpu_owner_rank */
@@ -50,6 +59,7 @@ typedef struct parsec_qpu_params_s {
     char *mock_queue_delay;       /**< device_qpu_mock_queue_delay */
     char *mock_job_delay;         /**< device_qpu_mock_job_delay */
     int   mock_max_circuits;      /**< device_qpu_mock_max_circuits */
+    int   mock_submit_delay;      /**< device_qpu_mock_submit_delay */
     char *mock_faults;            /**< device_qpu_mock_faults */
     int   mock_threads;           /**< device_qpu_mock_threads */
     int   mock_max_qubits;        /**< device_qpu_mock_max_qubits */
@@ -61,32 +71,68 @@ extern int parsec_qpu_output_stream;
 /** Register the parameters above. Safe to call more than once. */
 void parsec_qpu_register_params(void);
 
-/** Let task bodies use the service in the context being initialized, and
- *  arrange for it to stop when that context is finalized. Main thread only.
- *  Fails when the backend that was asked for does not exist, or drives a
- *  quantum device while device_qpu_allow_hardware is not set. */
-int parsec_qpu_service_enable(void);
-
-/** Open the backend and say what it is. Called on the rank that owns the
- *  QPU when its device is attached, so that a backend that cannot be used
- *  gives no device; the progress thread starts with the first submission.
- *  max_batch receives the most tasks one job will carry: what was asked for
- *  with device_qpu_max_batch, and no more circuits than the backend takes in
- *  a job. Main thread only. */
-int parsec_qpu_service_open(parsec_qpu_caps_t *caps, uint32_t *max_outstanding, uint32_t *max_batch);
-
 /* ------------------------------------------------------------------------
- * The device module (device_qpu_module.c)
+ * The list of QPUs (device_qpu_list.c): see there for its syntax.
  * --------------------------------------------------------------------- */
 
-/** The QPU as the runtime sees it. Every rank has one, so that no rank drops
- *  the QPU incarnations of its task classes; the one on the owner rank has
- *  the backend, and the others take no task. */
+/** Read the list: `spec` when it names a QPU, and `enabled` QPUs of the
+ *  backend `backend` otherwise. On a list that cannot be read nothing is
+ *  kept, and *why says what is wrong with it. Main thread only. */
+PARSEC_DECLSPEC int parsec_qpu_list_set(const char *spec, int enabled, const char *backend, const char **why);
+PARSEC_DECLSPEC void parsec_qpu_list_free(void);
+/** How many QPUs the list holds: 0 when none was read. */
+PARSEC_DECLSPEC int parsec_qpu_list_size(void);
+PARSEC_DECLSPEC const char *parsec_qpu_list_backend(int qpu);
+/** The rank that owns a QPU, in a run of nb_ranks ranks. It is not checked:
+ *  a rank that does not exist means that nobody owns the QPU. */
+PARSEC_DECLSPEC int parsec_qpu_list_rank(int qpu, int nb_ranks);
+/** What the entry of a QPU says for a key: NULL when it does not have it,
+ *  and for a QPU that is not in the list; or `value` then. */
+PARSEC_DECLSPEC const char *parsec_qpu_list_option(int qpu, const char *key);
+PARSEC_DECLSPEC int parsec_qpu_list_option_int(int qpu, const char *key, int value);
+PARSEC_DECLSPEC const char *parsec_qpu_list_option_string(int qpu, const char *key, const char *value);
+
+/* ------------------------------------------------------------------------
+ * The service (device_qpu_progress.c)
+ * --------------------------------------------------------------------- */
+
+struct parsec_device_qpu_module_s;
+
+/** Let task bodies use the service in the context being initialized, and
+ *  arrange for it to stop when that context is finalized. Main thread only.
+ *  Fails when a backend the list names does not exist, or drives a quantum
+ *  device while device_qpu_allow_hardware is not set: no QPU is used then. */
+int parsec_qpu_service_enable(void);
+
+/** Say why quantum tasks cannot run in the context being initialized. */
+void parsec_qpu_service_refuse(const char *why);
+
+/** Open the backend of a QPU of this rank and say what it is. Called when
+ *  the device of that QPU is attached, so that a backend that cannot be used
+ *  gives no device; the progress threads start with the first submission.
+ *  max_batch receives the most tasks one job will carry: what was asked for,
+ *  and no more circuits than the backend takes in a job. Main thread only. */
+int parsec_qpu_service_open(struct parsec_device_qpu_module_s *module, parsec_qpu_caps_t *caps,
+                            uint32_t *max_outstanding, uint32_t *max_batch);
+/** Take that back: close the backend of the QPU that was opened last, whose
+ *  device did not make it into the context. Main thread only. */
+void parsec_qpu_service_forget(struct parsec_device_qpu_module_s *module);
+
+/* ------------------------------------------------------------------------
+ * The device modules (device_qpu_module.c)
+ * --------------------------------------------------------------------- */
+
+/** A QPU as the runtime sees it, on the rank that owns it. A rank that owns
+ *  no QPU has one all the same, a placeholder with no backend that takes no
+ *  task, so that no rank drops the QPU incarnations of its task classes. */
 typedef struct parsec_device_qpu_module_s {
     parsec_device_module_t super;
+    int                    number;           /**< of the QPU, in the list */
     int                    owner_rank;       /**< the rank that runs the jobs */
+    int                    nb_ranks;         /**< of the run; a rank past them owns nothing */
     int                    owner;            /**< this process is that rank */
     int                    attached;         /**< the runtime has it among its devices */
+    int                    service;          /**< which of the QPUs of this rank it is; -1 when not the owner */
     parsec_qpu_caps_t      caps;             /**< of the backend; zero when not the owner */
     uint32_t               max_outstanding;  /**< 0 when not the owner */
     uint32_t               max_batch;        /**< most tasks in one job; 0 when not the owner */
@@ -95,29 +141,40 @@ typedef struct parsec_device_qpu_module_s {
     char                   name_buffer[64];
 } parsec_device_qpu_module_t;
 
-/** The module of this process, or NULL when the component is not in use. */
-extern parsec_device_qpu_module_t *parsec_qpu_module;
-
-/** Create the module, for the component's query: a NULL-terminated array
- *  that the component owns. */
+/** Create the modules, one per QPU of the list, for the component's query:
+ *  a NULL-terminated array that the component owns. Which of them this rank
+ *  attaches is decided when they are attached. */
 parsec_device_module_t **parsec_qpu_module_new(const parsec_device_base_component_t *component);
-/** Take the module out of the runtime and free it, for the component's close. */
+/** Take the modules out of the runtime and free them, for the component's close. */
 void parsec_qpu_module_free(parsec_device_module_t **modules);
+/** The rank that owns the first QPU when this rank owns none and has a
+ *  placeholder for them; -2 when this rank has no placeholder. */
+int parsec_qpu_module_placeholder(void);
 
 /** What the scheduler is given as the time of a quantum task, for the load
  *  of the device: one second, whatever jobs take. The load is then the
- *  number of tasks the device holds, in seconds. The time jobs do take is
+ *  number of tasks the device holds a job for, in seconds. The time jobs do take is
  *  measured (latency_ns above) and is not fed back to the scheduler: the
  *  device layer reads the estimate of a device without synchronisation, so
  *  it is written once, when the device is attached. */
 #define PARSEC_QPU_TASK_TIME_NS  1000000000LL
 
 /** Stop the service if it runs: cancel what is left, join the progress
- *  thread, close the backend. Returns the number of tasks abandoned, which
+ *  threads, close the backends. Returns the number of tasks abandoned, which
  *  is zero unless the application did not wait for a taskpool. */
 PARSEC_DECLSPEC int parsec_qpu_service_fini(void);
 
-/** Counters of the service. The first group only grows. */
+/** Counters of the service: of all the QPUs of this rank together
+ *  (parsec_qpu_service_stats), or of one of them
+ *  (parsec_qpu_service_stats_of). The first group only grows.
+ *
+ *  Tasks wait for the rank, not for a QPU, and some complete without a job
+ *  of any QPU. So tasks_submitted, tasks_completed, empty_jobs, the three
+ *  counts of tasks that failed, pending and max_pending are counted for the
+ *  rank only, and are zero for one QPU; how many tasks a QPU ran is what
+ *  parsec_qpu_device_info() says it executed. For the rank, max_in_flight
+ *  and max_job_tasks are the largest of its QPUs, and the times of the
+ *  progress threads are added up. */
 typedef struct parsec_qpu_stats_s {
     uint64_t tasks_submitted;   /**< bodies that returned ASYNC */
     uint64_t jobs_submitted;    /**< jobs the backend accepted */
@@ -157,11 +214,20 @@ typedef struct parsec_qpu_stats_s {
     uint64_t tasks_coalesced;   /**< tasks those jobs carried: the tasks the backend took are
                                  *   jobs_submitted - jobs_coalesced + tasks_coalesced */
     uint32_t max_job_tasks;     /**< most tasks in one job */
+
+    uint64_t tasks_moved;       /**< tasks given back to wait for another QPU because this one
+                                 *   took no job for too long */
+    uint32_t nb_qpus;           /**< QPUs of this rank; 1 for one QPU */
+    uint32_t down;              /**< of them, those that took no job for too long and are
+                                 *   left alone for a while */
 } parsec_qpu_stats_t;
 
-/** Read the counters. Always succeeds; everything is zero before the first
- *  submission of a context. */
+/** Read the counters of this rank. Always succeeds; everything is zero
+ *  before the first submission of a context. */
 PARSEC_DECLSPEC void parsec_qpu_service_stats(parsec_qpu_stats_t *stats);
+/** The same for one QPU, named by its number in the list.
+ *  PARSEC_ERR_NOT_FOUND when this rank does not own it. */
+PARSEC_DECLSPEC int parsec_qpu_service_stats_of(int qpu, parsec_qpu_stats_t *stats);
 
 /* ------------------------------------------------------------------------
  * The exact sampler (device_qpu_sampler.c). It needs neither the runtime
@@ -290,9 +356,14 @@ typedef parsec_qpu_mock_fault_t (*parsec_qpu_mock_fault_fn_t)(uint64_t tag, cons
                                                               uint64_t call, void *arg);
 PARSEC_DECLSPEC void parsec_qpu_mock_set_fault_fn(parsec_qpu_mock_fault_fn_t fn, void *arg);
 
+/** Counters of the mock: of all the mocks that are open in this process
+ *  together (parsec_qpu_mock_stats), or of the one of a QPU
+ *  (parsec_qpu_mock_stats_of). Together, the counts are added up, the
+ *  high-water marks are the largest of them, and the shortest time between
+ *  two submissions is the shortest of them. */
 typedef struct parsec_qpu_mock_stats_s {
     uint64_t opens;           /**< backends opened by this process since it started */
-    /* The rest is about the backend that is open, if any. */
+    /* The rest is about the backends that are open, if any. */
     uint64_t submit_calls;    /**< submissions received */
     uint64_t submits;         /**< jobs created */
     uint64_t circuits;        /**< circuits those jobs carried */
@@ -332,6 +403,9 @@ typedef struct parsec_qpu_mock_stats_s {
                                *   fewer than two */
 } parsec_qpu_mock_stats_t;
 PARSEC_DECLSPEC void parsec_qpu_mock_stats(parsec_qpu_mock_stats_t *stats);
+/** The same for the mock that was opened for one QPU, named by its number
+ *  in the list. PARSEC_ERR_NOT_FOUND when no mock is open for it here. */
+PARSEC_DECLSPEC int parsec_qpu_mock_stats_of(int qpu, parsec_qpu_mock_stats_t *stats);
 
 /* ------------------------------------------------------------------------
  * Small helpers shared by the files of the component.

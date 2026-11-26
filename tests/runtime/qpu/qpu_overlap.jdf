@@ -185,14 +185,31 @@ int main(int argc, char *argv[])
             errors++;
         }
     }
-    /* All that time the device held the quantum task: its load was what one
-     * task counts for. */
+    /* The device holds the quantum task from the moment it takes the task for
+     * a job: from then on its load is what one task counts for. Until then
+     * the task waits, on no QPU, and the load is zero. A link of the chain
+     * read the load when it ended. The job was put together right after
+     * t_submit and was running at the backend from t_start, so a reading
+     * before the first has to be zero and one after the second a task's
+     * worth; between the two it may be either. */
     for( int i = 0; i < m; i++ ) {
-        if( PARSEC_QPU_TASK_TIME_NS != work_load[i] ) {
-            fprintf(stderr, "WORK(%d) saw a load of %lld ns on the QPU device while its one job was outstanding, "
-                    "expected %lld ns\n", i, (long long)work_load[i], (long long)PARSEC_QPU_TASK_TIME_NS);
+        const int64_t expected = (work_end[i] < result->t_submit) ? 0 : PARSEC_QPU_TASK_TIME_NS;
+
+        if( (work_end[i] >= result->t_submit) && (work_end[i] < result->t_start) ) continue;
+        if( expected != work_load[i] ) {
+            fprintf(stderr, "WORK(%d) saw a load of %lld ns on the QPU device %s, expected %lld ns\n",
+                    i, (long long)work_load[i],
+                    (0 == expected) ? "before the QPU took the task" : "while its one job was outstanding",
+                    (long long)expected);
             errors++;
         }
+    }
+    /* And the job was outstanding for most of the chain: the last link at
+     * least saw it. */
+    if( (m > 0) && (PARSEC_QPU_TASK_TIME_NS != work_load[m - 1]) ) {
+        fprintf(stderr, "the last link of the chain saw a load of %lld ns on the QPU device, expected %lld ns\n",
+                (long long)work_load[m - 1], (long long)PARSEC_QPU_TASK_TIME_NS);
+        errors++;
     }
 
     /* So the run is as long as the job, not as the job plus the chain. */

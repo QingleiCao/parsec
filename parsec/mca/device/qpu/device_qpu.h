@@ -204,8 +204,10 @@ PARSEC_DECLSPEC uint64_t parsec_qpu_circuit_measured(const parsec_qpu_circuit_t 
  * bitstring appears twice.
  * --------------------------------------------------------------------- */
 
-#define PARSEC_QPU_RESULT_VERSION   1
+#define PARSEC_QPU_RESULT_VERSION   2
 #define PARSEC_QPU_ENTRY_SIZE       12
+/** What a result says for its QPU when no QPU ran a job for it. */
+#define PARSEC_QPU_NONE             0xffu
 
 typedef enum parsec_qpu_status_e {
     PARSEC_QPU_STATUS_OK          = 0,
@@ -237,7 +239,10 @@ typedef struct parsec_qpu_result_s {
     uint8_t  status;           /**< parsec_qpu_status_t */
     uint8_t  flags;            /**< PARSEC_QPU_RESULT_* */
     uint16_t nb_qubits;
-    uint16_t attempts;         /**< jobs it took at the backend, 1 when the first one worked */
+    uint8_t  attempts;         /**< jobs it took at the backends, 1 when the first one worked */
+    uint8_t  qpu;              /**< number of the QPU that ran the last of them, in the list
+                                *   of the run (0 when there is one QPU); PARSEC_QPU_NONE for
+                                *   a task that never had a job */
     uint32_t shots_requested;
     uint32_t shots_returned;   /**< sum of the counts of the entries */
     uint32_t nb_entries;
@@ -295,11 +300,14 @@ static inline void parsec_qpu_result_set_entry(parsec_qpu_result_t *result, uint
  */
 #define PARSEC_QPU_KEY_AUTO         UINT64_MAX
 
+/** For the QPU of a submission: any QPU of the rank the task runs on. */
+#define PARSEC_QPU_ANY              (-1)
+
 /**
  * Submit the quantum job of a task and give the task up until it is done.
  *
  * To be called once, as the last thing a body does:
- *     return parsec_qpu_submit(es, this_task, circuit, params, result, shots, key);
+ *     return parsec_qpu_submit_on(es, this_task, qpu, circuit, params, result, shots, key);
  * After the call the task belongs to the QPU layer and may already be
  * completed, so the caller must not touch it again.
  *
@@ -307,8 +315,17 @@ static inline void parsec_qpu_result_set_entry(parsec_qpu_result_t *result, uint
  * job lives; the runtime keeps them in place for a task that returned ASYNC.
  * The result is written before the task is completed.
  *
+ * Which QPU runs the job. With PARSEC_QPU_ANY the task waits with the others
+ * of its rank, and the first QPU of that rank that has a place for a job and
+ * can run this circuit takes it; a job that failed may be tried again on
+ * another one. The result says which QPU ran it. With the number of a QPU
+ * the job runs on that one and on no other: for a circuit that was prepared
+ * for one device, or for evaluations that have to come from the same device.
+ * That QPU has to be one of the rank the task runs on.
+ *
  * @param[in] es      the execution stream running the body
  * @param[in] task    the task
+ * @param[in] qpu     the number of a QPU in the list of the run, or PARSEC_QPU_ANY
  * @param[in] circuit host copy holding a parsec_qpu_circuit_t and its operations
  * @param[in] params  host copy holding circuit->nb_params doubles; may be NULL
  *                    when the circuit has no parameter slot
@@ -320,12 +337,18 @@ static inline void parsec_qpu_result_set_entry(parsec_qpu_result_t *result, uint
  *
  * @return PARSEC_HOOK_RETURN_ASYNC when the job was accepted, and
  *         PARSEC_HOOK_RETURN_ERROR on a programming error (QPU support not
- *         enabled, a rank that does not own the QPU, a missing argument, a
- *         circuit that is not well-formed).
+ *         enabled, a rank that owns no QPU, a QPU that is not of this rank,
+ *         a missing argument, a circuit that is not well-formed).
  *         A job that fails later is not an error of this call: the task
  *         completes with a status other than PARSEC_QPU_STATUS_OK in its
  *         result.
  */
+PARSEC_DECLSPEC parsec_hook_return_t
+parsec_qpu_submit_on(parsec_execution_stream_t *es, parsec_task_t *task, int qpu,
+                     parsec_data_copy_t *circuit, parsec_data_copy_t *params,
+                     parsec_data_copy_t *result, int shots, uint64_t key);
+
+/** The same on any QPU of the rank. */
 PARSEC_DECLSPEC parsec_hook_return_t
 parsec_qpu_submit(parsec_execution_stream_t *es, parsec_task_t *task,
                   parsec_data_copy_t *circuit, parsec_data_copy_t *params,
@@ -337,9 +360,11 @@ parsec_qpu_submit(parsec_execution_stream_t *es, parsec_task_t *task,
  *         return PARSEC_QPU_SUBMIT(C, TH, RES, 1024);
  *     END
  */
+#define PARSEC_QPU_SUBMIT_ON(QPU, CIRCUIT, PARAMS, RESULT, SHOTS, KEY)    \
+    parsec_qpu_submit_on(es, (parsec_task_t*)this_task, (QPU),            \
+                         _f_##CIRCUIT, _f_##PARAMS, _f_##RESULT, (SHOTS), (KEY))
 #define PARSEC_QPU_SUBMIT_KEYED(CIRCUIT, PARAMS, RESULT, SHOTS, KEY)      \
-    parsec_qpu_submit(es, (parsec_task_t*)this_task,                      \
-                      _f_##CIRCUIT, _f_##PARAMS, _f_##RESULT, (SHOTS), (KEY))
+    PARSEC_QPU_SUBMIT_ON(PARSEC_QPU_ANY, CIRCUIT, PARAMS, RESULT, SHOTS, KEY)
 #define PARSEC_QPU_SUBMIT(CIRCUIT, PARAMS, RESULT, SHOTS)                 \
     PARSEC_QPU_SUBMIT_KEYED(CIRCUIT, PARAMS, RESULT, SHOTS, PARSEC_QPU_KEY_AUTO)
 
@@ -349,17 +374,32 @@ parsec_qpu_submit(parsec_execution_stream_t *es, parsec_task_t *task,
  * on). params_index is negative when there are no parameters.
  */
 PARSEC_DECLSPEC parsec_hook_return_t
+parsec_qpu_submit_dtd_on(parsec_execution_stream_t *es, parsec_task_t *task, int qpu,
+                         int circuit_index, int params_index, int result_index,
+                         int shots, uint64_t key);
+PARSEC_DECLSPEC parsec_hook_return_t
 parsec_qpu_submit_dtd(parsec_execution_stream_t *es, parsec_task_t *task,
                       int circuit_index, int params_index, int result_index,
                       int shots, uint64_t key);
 
 /* ------------------------------------------------------------------------
- * The QPU device
+ * The QPU devices
  * --------------------------------------------------------------------- */
 
-/** What the QPU device of this process is and holds. */
+/** How many QPUs the run has, on all ranks together: the entries of
+ *  device_qpu_devices, or device_qpu_enabled without that list. 0 when QPU
+ *  support is not enabled in this context. The same on every rank. */
+PARSEC_DECLSPEC int parsec_qpu_count(void);
+
+/** The rank that owns a QPU, where the tasks that use it have to be placed.
+ *  -1 for a QPU that is not in the list, and for one that no rank owns. */
+PARSEC_DECLSPEC int parsec_qpu_rank_of(int qpu);
+
+/** What a QPU is and holds, as this process knows it. */
 typedef struct parsec_qpu_device_info_s {
-    int         device_index;          /**< among the devices of the runtime, as parsec_mca_device_get() takes it */
+    int         device_index;          /**< among the devices of the runtime, as parsec_mca_device_get() takes it.
+                                        *   On a rank that owns no QPU, the device that stands for them all
+                                        *   there; -1 on a rank that owns other QPUs and not this one */
     int         owner_rank;            /**< the rank that runs the jobs */
     int         is_owner;              /**< this process is that rank */
     const char *backend;               /**< name of the backend; valid until parsec_fini() */
@@ -374,22 +414,22 @@ typedef struct parsec_qpu_device_info_s {
     /* What it is doing. */
     uint64_t    executed_tasks;        /**< tasks it completed */
     int64_t     load_ns;               /**< what the scheduler keeps as the load of the device:
-                                        *   task_time_ns for every task it holds */
+                                        *   task_time_ns for every task it holds a job for. A
+                                        *   task that waits is on no QPU yet, and counts for none */
     int64_t     task_time_ns;          /**< what one task counts for in the load: a nominal second */
     int64_t     latency_estimate_ns;   /**< how long a job takes from its submission to its
                                         *   result: a moving average over the jobs that ended
-                                        *   well, of one task or of several, 0 before any has.
-                                        *   The jobs that the tasks held will make, times this,
-                                        *   over max_outstanding, estimates the wait; with every
-                                        *   task its own job that is the tasks held. */
+                                        *   well, of one task or of several, 0 before any has */
 } parsec_qpu_device_info_t;
 
 /**
- * Describe the QPU device of this process. qpu is 0: there is one QPU per
- * process so far.
+ * Describe a QPU, named by its number in the list of the run (0 when there
+ * is one). Any rank may ask about any QPU: what the backend said, and what
+ * the QPU is doing, are known on the rank that owns it and zero elsewhere.
  *
- * @return PARSEC_SUCCESS, PARSEC_ERR_NOT_FOUND when this process has no such
- *         device (QPU support is not enabled in this context, or the backend
+ * @return PARSEC_SUCCESS, PARSEC_ERR_NOT_FOUND when there is no such QPU
+ *         (QPU support is not enabled in this context, the list has no QPU
+ *         of that number, or this is the rank that owns it and its backend
  *         could not be used), PARSEC_ERR_BAD_PARAM for a NULL info.
  */
 PARSEC_DECLSPEC int parsec_qpu_device_info(int qpu, parsec_qpu_device_info_t *info);

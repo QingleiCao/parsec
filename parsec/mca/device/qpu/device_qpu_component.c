@@ -19,16 +19,18 @@
  * The QPU component.
  *
  * It registers the parameters of the QPU layer and, when device_qpu_enabled
- * is set, offers the device layer one module of type PARSEC_DEV_QPU
+ * is set, reads the list of the QPUs of the run (device_qpu_list.c), offers
+ * the device layer one module of type PARSEC_DEV_QPU for each of them
  * (device_qpu_module.c) and lets task bodies use the QPU service
  * (device_qpu_progress.c) in the context being initialized.
  *
- * The life of the service does not follow open and close here. Its backend
- * is opened when the module is attached, on the rank that owns the QPU; its
- * progress thread starts with the first submission; and both are stopped
- * from a parsec_context_at_fini() callback, which runs before the workers
- * are joined and long before the device layer closes its components. What
- * close has left to do is take the module out of the runtime.
+ * The life of the service does not follow open and close here. The backend
+ * of a QPU is opened when its module is attached, on the rank that owns it;
+ * the progress threads start with the first submission; and all of it is
+ * stopped from a parsec_context_at_fini() callback, which runs before the
+ * workers are joined and long before the device layer closes its
+ * components. What close has left to do is take the modules out of the
+ * runtime.
  */
 
 static int device_qpu_component_open(void);
@@ -38,6 +40,7 @@ static int device_qpu_component_register(void);
 
 parsec_qpu_params_t parsec_qpu_params = {
     .enabled                = 0,
+    .devices                = NULL,
     .backend                = NULL,
     .allow_hardware         = 0,
     .owner_rank             = 0,
@@ -57,6 +60,7 @@ parsec_qpu_params_t parsec_qpu_params = {
     .mock_queue_delay       = NULL,
     .mock_job_delay         = NULL,
     .mock_max_circuits      = 64,
+    .mock_submit_delay      = 0,
     .mock_faults            = NULL,
     .mock_threads           = 2,
     .mock_max_qubits        = 24
@@ -97,24 +101,40 @@ mca_base_component_t *device_qpu_static_component(void)
 void parsec_qpu_register_params(void)
 {
     (void)parsec_mca_param_reg_int_name("device_qpu", "enabled",
-                                        "Number of QPUs to use in the next PaRSEC context (0 disables QPU support)",
+                                        "Number of QPUs to use in the next PaRSEC context (0 disables QPU "
+                                        "support). With device_qpu_devices, that list says how many there "
+                                        "are, and this only has to be set",
                                         false, false, 0, &parsec_qpu_params.enabled);
+    (void)parsec_mca_param_reg_string_name("device_qpu", "devices",
+                                           "The QPUs of the run, when they are not all alike: entries separated "
+                                           "by ';' or '|', each <backend>[@<rank>] [<key>=<value> ...]. The position of "
+                                           "an entry is the number of its QPU, so the list has to be the same on "
+                                           "every rank. A rank of -1 is the last one; without a rank the QPU is "
+                                           "on device_qpu_owner_rank. Keys: max_outstanding, max_batch, "
+                                           "submit_interval, job_timeout, max_retries, unavailable_timeout, which "
+                                           "default to the parameters of those names; and for the mock: slots, "
+                                           "delay, queue_delay, job_delay, submit_delay, max_circuits, faults, "
+                                           "threads, max_qubits, which default to device_qpu_mock_<key>. Without a list "
+                                           "there are device_qpu_enabled QPUs of device_qpu_backend",
+                                           false, false, "", &parsec_qpu_params.devices);
     (void)parsec_mca_param_reg_string_name("device_qpu", "backend",
-                                           "Backend that runs the quantum jobs. The only one so far is the mock, "
-                                           "which runs in the process, samples the circuits exactly and reaches "
-                                           "no quantum device",
+                                           "Backend that runs the quantum jobs of the QPUs that "
+                                           "device_qpu_devices does not describe. The only one so far is the "
+                                           "mock, which runs in the process, samples the circuits exactly and "
+                                           "reaches no quantum device",
                                            false, false, "mock", &parsec_qpu_params.backend);
     (void)parsec_mca_param_reg_int_name("device_qpu", "allow_hardware",
                                         "Allow a backend that drives a physical quantum device. Without it such "
                                         "a backend refuses to open, so nothing reaches hardware by accident",
                                         false, false, 0, &parsec_qpu_params.allow_hardware);
     (void)parsec_mca_param_reg_int_name("device_qpu", "owner_rank",
-                                        "Rank that owns the QPU: it opens the backend and runs every job, and "
-                                        "quantum tasks have to be placed there (-1: the last rank)",
+                                        "Rank that owns the QPUs for which device_qpu_devices names none: it "
+                                        "opens their backends and runs their jobs, and the quantum tasks that "
+                                        "use them have to be placed there (-1: the last rank)",
                                         false, false, 0, &parsec_qpu_params.owner_rank);
     (void)parsec_mca_param_reg_int_name("device_qpu", "max_outstanding",
-                                        "Most jobs kept at the backend at the same time; further ones wait "
-                                        "in the runtime, by task priority and then by arrival",
+                                        "Most jobs kept at the backend of a QPU at the same time; further "
+                                        "ones wait in the runtime, by task priority and then by arrival",
                                         false, false, 8, &parsec_qpu_params.max_outstanding);
     (void)parsec_mca_param_reg_int_name("device_qpu", "max_batch",
                                         "Most tasks whose circuits go to the backend as one job (1: every task "
@@ -180,6 +200,11 @@ void parsec_qpu_register_params(void)
     (void)parsec_mca_param_reg_int_name("device_qpu", "mock_max_circuits",
                                         "Circuits the mock backend takes in one job",
                                         false, false, 64, &parsec_qpu_params.mock_max_circuits);
+    (void)parsec_mca_param_reg_int_name("device_qpu", "mock_submit_delay",
+                                        "Time in microseconds the mock backend takes to answer a submission, "
+                                        "as a provider takes a round trip to; the thread that submits is held "
+                                        "that long",
+                                        false, false, 0, &parsec_qpu_params.mock_submit_delay);
     (void)parsec_mca_param_reg_string_name("device_qpu", "mock_queue_delay",
                                            "Time a job waits on the mock backend, once it has a slot, before it "
                                            "runs; it models the queue of the provider and takes what "
@@ -211,12 +236,18 @@ static int device_qpu_component_register(void)
 
 static int device_qpu_component_open(void)
 {
+    const char *why = NULL;
+
     if( 0 == parsec_qpu_params.enabled ) {
         return MCA_ERROR;
     }
-    if( parsec_qpu_params.enabled > 1 ) {
-        parsec_warning("device_qpu_enabled is %d, but a single QPU is supported so far; using one",
-                       parsec_qpu_params.enabled);
+    if( PARSEC_SUCCESS != parsec_qpu_list_set(parsec_qpu_params.devices, parsec_qpu_params.enabled,
+                                              parsec_qpu_params.backend, &why) ) {
+        /* Not a part of it: a list that is half understood would give a run
+         * other QPUs than the ones that were asked for. */
+        parsec_warning("QPU: device_qpu_devices cannot be read (%s); quantum tasks cannot run in this context", why);
+        parsec_qpu_service_refuse("device_qpu_devices cannot be read");
+        return MCA_ERROR;
     }
     parsec_qpu_output_stream = parsec_device_output;
     if( parsec_qpu_params.verbose >= 0 ) {
@@ -230,13 +261,14 @@ static int device_qpu_component_open(void)
             parsec_output_close(parsec_qpu_output_stream);
         }
         parsec_qpu_output_stream = -1;
+        parsec_qpu_list_free();
         return MCA_ERROR;
     }
     return MCA_SUCCESS;
 }
 
-/* One module, on every rank: see device_qpu_module.c for what the ranks that
- * do not own the QPU do with theirs. */
+/* One module per QPU of the list, on every rank: see device_qpu_module.c for
+ * which of them a rank attaches. */
 static int device_qpu_component_query(mca_base_module_t **module, int *priority)
 {
     void *modules;
@@ -264,5 +296,6 @@ static int device_qpu_component_close(void)
         parsec_qpu_module_free(parsec_device_qpu_component.modules);
         parsec_device_qpu_component.modules = NULL;
     }
+    parsec_qpu_list_free();
     return MCA_SUCCESS;
 }

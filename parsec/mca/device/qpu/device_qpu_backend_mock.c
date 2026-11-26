@@ -138,6 +138,7 @@ typedef struct mock_backend_s {
     uint32_t              slots;
     uint32_t              max_qubits;
     uint32_t              max_circuits; /* per job */
+    int64_t               submit_delay; /* time it takes to answer a submission */
     parsec_qpu_delay_t    delay;      /* time one circuit of a job runs */
     parsec_qpu_delay_t    job_delay;  /* time a job runs on top of that, whatever it carries */
     parsec_qpu_delay_t    queue_delay;/* time it waits in its slot before that */
@@ -168,10 +169,14 @@ typedef struct mock_backend_s {
     mock_job_t           *work_head, *work_tail;
 
     parsec_qpu_mock_stats_t stats;
+    int                   number;     /* of the QPU it was opened for */
 } mock_backend_t;
 
-/* There is one mock per process at a time; tests read its counters. */
-static mock_backend_t *mock_current = NULL;
+/* The mocks that are open, one per QPU of this process that uses the mock;
+ * tests read their counters. */
+#define MOCK_MAX_OPEN  64
+static mock_backend_t *mock_opened[MOCK_MAX_OPEN];
+static int mock_opened_n = 0;
 static pthread_mutex_t mock_current_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t mock_opens = 0;
 
@@ -192,21 +197,73 @@ void parsec_qpu_mock_set_fault_fn(parsec_qpu_mock_fault_fn_t fn, void *arg)
     mock_fault_arg = arg;
 }
 
+/* What one mock counted, added to what is there: counts are added up, the
+ * high-water marks are the largest, and the shortest time between two
+ * submissions is the shortest. Called with mock_current_lock held. */
+static void mock_stats_add(mock_backend_t *mock, parsec_qpu_mock_stats_t *stats)
+{
+    const parsec_qpu_mock_stats_t *m = &mock->stats;
+
+    pthread_mutex_lock(&mock->lock);
+    stats->submit_calls     += m->submit_calls;
+    stats->submits          += m->submits;
+    stats->circuits         += m->circuits;
+    stats->tag_hits         += m->tag_hits;
+    stats->deferred         += m->deferred;
+    stats->rejected         += m->rejected;
+    stats->cancels          += m->cancels;
+    stats->abandoned        += m->abandoned;
+    stats->results          += m->results;
+    stats->failures         += m->failures;
+    stats->provider_cancels += m->provider_cancels;
+    stats->ghost_events     += m->ghost_events;
+    stats->computed         += m->computed;
+    stats->late             += m->late;
+    stats->duplicate_tags   += m->duplicate_tags;
+    stats->key_overlaps     += m->key_overlaps;
+    stats->inputs_changed   += m->inputs_changed;
+    stats->mixed_shots      += m->mixed_shots;
+    stats->changed_jobs     += m->changed_jobs;
+    if( m->max_running  > stats->max_running )  stats->max_running  = m->max_running;
+    if( m->max_held     > stats->max_held )     stats->max_held     = m->max_held;
+    if( m->max_circuits > stats->max_circuits ) stats->max_circuits = m->max_circuits;
+    if( (m->min_submit_gap >= 0) && ((stats->min_submit_gap < 0) || (m->min_submit_gap < stats->min_submit_gap)) ) {
+        stats->min_submit_gap = m->min_submit_gap;
+    }
+    for( uint32_t i = 0; i < mock->held_n; i++ ) {
+        if( !mock->held[i]->acked ) stats->unknown_jobs++;
+    }
+    pthread_mutex_unlock(&mock->lock);
+}
+
 void parsec_qpu_mock_stats(parsec_qpu_mock_stats_t *stats)
 {
     memset(stats, 0, sizeof(*stats));
     stats->min_submit_gap = -1;
     pthread_mutex_lock(&mock_current_lock);
-    if( NULL != mock_current ) {
-        pthread_mutex_lock(&mock_current->lock);
-        *stats = mock_current->stats;
-        for( uint32_t i = 0; i < mock_current->held_n; i++ ) {
-            if( !mock_current->held[i]->acked ) stats->unknown_jobs++;
-        }
-        pthread_mutex_unlock(&mock_current->lock);
+    for( int i = 0; i < mock_opened_n; i++ ) {
+        mock_stats_add(mock_opened[i], stats);
     }
     stats->opens = mock_opens;
     pthread_mutex_unlock(&mock_current_lock);
+}
+
+int parsec_qpu_mock_stats_of(int qpu, parsec_qpu_mock_stats_t *stats)
+{
+    int rc = PARSEC_ERR_NOT_FOUND;
+
+    memset(stats, 0, sizeof(*stats));
+    stats->min_submit_gap = -1;
+    pthread_mutex_lock(&mock_current_lock);
+    for( int i = 0; i < mock_opened_n; i++ ) {
+        if( mock_opened[i]->number != qpu ) continue;
+        mock_stats_add(mock_opened[i], stats);
+        rc = PARSEC_SUCCESS;
+        break;
+    }
+    stats->opens = mock_opens;
+    pthread_mutex_unlock(&mock_current_lock);
+    return rc;
 }
 
 /* ------------------------------------------------------------------------
@@ -834,20 +891,37 @@ static void mock_destroy(mock_backend_t *mock)
     free(mock);
 }
 
+static int mock_close(parsec_qpu_backend_t *backend);
+
 static int mock_open(parsec_qpu_backend_t **backend, int device_index)
 {
     mock_backend_t *mock = (mock_backend_t*)calloc(1, sizeof(mock_backend_t));
+    /* What the entry of this QPU says in device_qpu_devices, and what the
+     * parameters of the mock say for what it leaves out. The seeds are those
+     * of the run: what an evaluation gives does not depend on which QPU ran
+     * it. */
+    const int q = device_index;
+    const int slots        = parsec_qpu_list_option_int(q, "slots", parsec_qpu_params.mock_slots);
+    const int max_qubits   = parsec_qpu_list_option_int(q, "max_qubits", parsec_qpu_params.mock_max_qubits);
+    const int max_circuits = parsec_qpu_list_option_int(q, "max_circuits", parsec_qpu_params.mock_max_circuits);
+    const int threads      = parsec_qpu_list_option_int(q, "threads", parsec_qpu_params.mock_threads);
+    const int submit_delay = parsec_qpu_list_option_int(q, "submit_delay", parsec_qpu_params.mock_submit_delay);
+    const char *delay       = parsec_qpu_list_option_string(q, "delay", parsec_qpu_params.mock_delay);
+    const char *queue_delay = parsec_qpu_list_option_string(q, "queue_delay", parsec_qpu_params.mock_queue_delay);
+    const char *job_delay   = parsec_qpu_list_option_string(q, "job_delay", parsec_qpu_params.mock_job_delay);
+    const char *faults      = parsec_qpu_list_option_string(q, "faults", parsec_qpu_params.mock_faults);
     pthread_condattr_t attr;
     int nb_helpers;
 
-    (void)device_index;
     mock->super.ops  = &parsec_qpu_backend_mock_ops;
+    mock->number     = q;
     mock->seed       = (uint64_t)parsec_qpu_params.mock_seed;
     mock->delay_seed = (0 != parsec_qpu_params.mock_delay_seed) ? (uint64_t)parsec_qpu_params.mock_delay_seed : mock->seed;
-    mock->slots      = (uint32_t)(parsec_qpu_params.mock_slots > 0 ? parsec_qpu_params.mock_slots : 1);
-    mock->max_qubits = (uint32_t)(parsec_qpu_params.mock_max_qubits > 0 ? parsec_qpu_params.mock_max_qubits : 1);
+    mock->slots      = (uint32_t)(slots > 0 ? slots : 1);
+    mock->max_qubits = (uint32_t)(max_qubits > 0 ? max_qubits : 1);
     if( mock->max_qubits > PARSEC_QPU_SAMPLER_MAX_QUBITS ) mock->max_qubits = PARSEC_QPU_SAMPLER_MAX_QUBITS;
-    mock->max_circuits = (uint32_t)(parsec_qpu_params.mock_max_circuits > 0 ? parsec_qpu_params.mock_max_circuits : 1);
+    mock->max_circuits = (uint32_t)(max_circuits > 0 ? max_circuits : 1);
+    mock->submit_delay = (int64_t)(submit_delay > 0 ? submit_delay : 0) * 1000LL;
     mock->running    = (mock_job_t**)calloc(mock->slots, sizeof(mock_job_t*));
     mock->next_id    = 1;
     mock->t_open     = parsec_qpu_now_ns();
@@ -863,34 +937,30 @@ static int mock_open(parsec_qpu_backend_t **backend, int device_index)
     pthread_cond_init(&mock->work_cond, NULL);
     pthread_cond_init(&mock->idle_cond, NULL);
 
-    if( PARSEC_SUCCESS != parsec_qpu_delay_parse(&mock->delay, parsec_qpu_params.mock_delay) ) {
-        parsec_warning("QPU mock: device_qpu_mock_delay is '%s'; expected const:<us>, uniform:<min us>:<max us>, "
-                       "exp:<mean us>, lognormal:<median us>:<sigma> or replay:<readable file of delays in us>",
-                       (NULL != parsec_qpu_params.mock_delay) ? parsec_qpu_params.mock_delay : "");
+    if( PARSEC_SUCCESS != parsec_qpu_delay_parse(&mock->delay, delay) ) {
+        parsec_warning("QPU mock: device_qpu_mock_delay, or delay= for QPU %d, is '%s'; expected const:<us>, "
+                       "uniform:<min us>:<max us>, exp:<mean us>, lognormal:<median us>:<sigma> or "
+                       "replay:<readable file of delays in us>", q, (NULL != delay) ? delay : "");
         goto bad;
     }
-    if( PARSEC_SUCCESS != parsec_qpu_delay_parse(&mock->queue_delay,
-                                                 (NULL != parsec_qpu_params.mock_queue_delay)
-                                                 ? parsec_qpu_params.mock_queue_delay : "const:0") ) {
-        parsec_warning("QPU mock: device_qpu_mock_queue_delay is '%s'; it takes what device_qpu_mock_delay takes",
-                       parsec_qpu_params.mock_queue_delay);
+    if( PARSEC_SUCCESS != parsec_qpu_delay_parse(&mock->queue_delay, (NULL != queue_delay) ? queue_delay : "const:0") ) {
+        parsec_warning("QPU mock: device_qpu_mock_queue_delay, or queue_delay= for QPU %d, is '%s'; it takes what "
+                       "device_qpu_mock_delay takes", q, queue_delay);
         goto bad;
     }
-    if( PARSEC_SUCCESS != parsec_qpu_delay_parse(&mock->job_delay,
-                                                 (NULL != parsec_qpu_params.mock_job_delay)
-                                                 ? parsec_qpu_params.mock_job_delay : "const:0") ) {
-        parsec_warning("QPU mock: device_qpu_mock_job_delay is '%s'; it takes what device_qpu_mock_delay takes",
-                       parsec_qpu_params.mock_job_delay);
+    if( PARSEC_SUCCESS != parsec_qpu_delay_parse(&mock->job_delay, (NULL != job_delay) ? job_delay : "const:0") ) {
+        parsec_warning("QPU mock: device_qpu_mock_job_delay, or job_delay= for QPU %d, is '%s'; it takes what "
+                       "device_qpu_mock_delay takes", q, job_delay);
         goto bad;
     }
-    if( PARSEC_SUCCESS != mock_parse_faults(mock, parsec_qpu_params.mock_faults) ) {
-        parsec_warning("QPU mock: device_qpu_mock_faults is '%s'; expected none, or a list of <fault>:<rule>=<value> "
-                       "with fault one of fail, hang, unavailable, lost, reject, noresult, duplicate, late, cancelled and rule "
-                       "one of p, first, every, key, for", parsec_qpu_params.mock_faults);
+    if( PARSEC_SUCCESS != mock_parse_faults(mock, faults) ) {
+        parsec_warning("QPU mock: device_qpu_mock_faults, or faults= for QPU %d, is '%s'; expected none, or a list "
+                       "of <fault>:<rule>=<value> with fault one of fail, hang, unavailable, lost, reject, noresult, "
+                       "duplicate, late, cancelled and rule one of p, first, every, key, for", q, faults);
         goto bad;
     }
 
-    nb_helpers = (parsec_qpu_params.mock_threads > 0) ? parsec_qpu_params.mock_threads : 1;
+    nb_helpers = (threads > 0) ? threads : 1;
     if( nb_helpers > MOCK_MAX_HELPERS ) nb_helpers = MOCK_MAX_HELPERS;
     for( mock->nb_helpers = 0; mock->nb_helpers < nb_helpers; mock->nb_helpers++ ) {
         if( 0 != pthread_create(&mock->helpers[mock->nb_helpers], NULL, mock_helper_main, mock) ) break;
@@ -901,7 +971,13 @@ static int mock_open(parsec_qpu_backend_t **backend, int device_index)
     }
 
     pthread_mutex_lock(&mock_current_lock);
-    mock_current = mock;
+    if( MOCK_MAX_OPEN == mock_opened_n ) {
+        pthread_mutex_unlock(&mock_current_lock);
+        parsec_warning("QPU mock: too many mocks are open in this process");
+        /* Its helpers are there by now: go the way of a mock that is closed. */
+        return (PARSEC_SUCCESS == mock_close(&mock->super)) ? PARSEC_ERR_OUT_OF_RESOURCE : PARSEC_ERROR;
+    }
+    mock_opened[mock_opened_n++] = mock;
     mock_opens++;
     pthread_mutex_unlock(&mock_current_lock);
 
@@ -938,6 +1014,12 @@ static int mock_submit(parsec_qpu_backend_t *backend, const parsec_qpu_request_t
     if( (nb < 1) || ((uint32_t)nb > mock->max_circuits) ) return PARSEC_ERR_NOT_SUPPORTED;
     for( int i = 0; i < nb; i++ ) {
         if( (requests[i].circuit->nb_qubits > mock->max_qubits) || (0 == requests[i].shots) ) return PARSEC_ERR_BAD_PARAM;
+    }
+    if( mock->submit_delay > 0 ) {
+        /* The round trip to a provider: the caller is held, and nothing of
+         * the mock is. */
+        struct timespec trip = { (time_t)(mock->submit_delay / 1000000000LL), (long)(mock->submit_delay % 1000000000LL) };
+        nanosleep(&trip, NULL);
     }
 
     pthread_mutex_lock(&mock->lock);
@@ -1299,7 +1381,11 @@ static int mock_close(parsec_qpu_backend_t *backend)
     mock_backend_t *mock = (mock_backend_t*)backend;
 
     pthread_mutex_lock(&mock_current_lock);
-    if( mock_current == mock ) mock_current = NULL;
+    for( int i = 0; i < mock_opened_n; i++ ) {
+        if( mock_opened[i] != mock ) continue;
+        mock_opened[i] = mock_opened[--mock_opened_n];
+        break;
+    }
     pthread_mutex_unlock(&mock_current_lock);
 
     /* Whatever a helper is at, it gives up at the next operation. */
