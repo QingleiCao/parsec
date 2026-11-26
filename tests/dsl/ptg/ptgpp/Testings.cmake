@@ -47,6 +47,10 @@ set_tests_properties(
   PASS_REGULAR_EXPRESSION "A NULL is forwarded"
 )
 
+parsec_addtest_cmd(dsl/ptg/ptgpp/device_property ${SHM_TEST_CMD_LIST} dsl/ptg/ptgpp/device_property)
+if(PARSEC_HAVE_CUDA)
+  parsec_addtest_cmd(dsl/ptg/ptgpp/device_property:gpu ${SHM_TEST_CMD_LIST} ${CTEST_CUDA_LAUNCHER_OPTIONS} dsl/ptg/ptgpp/device_property --require-gpu --mca device_cuda_enabled 2)
+endif(PARSEC_HAVE_CUDA)
 parsec_addtest_cmd(dsl/ptg/ptgpp/write_check ${SHM_TEST_CMD_LIST} dsl/ptg/ptgpp/write_check)
 
 if( MPI_C_FOUND )
