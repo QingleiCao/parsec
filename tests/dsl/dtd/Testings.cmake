@@ -24,6 +24,17 @@ parsec_addtest_cmd(dsl/dtd/explicit_task_creation ${SHM_TEST_CMD_LIST} dsl/dtd/d
 parsec_addtest_cmd(dsl/dtd/task_class_release ${SHM_TEST_CMD_LIST} dsl/dtd/dtd_test_task_class_release)
 parsec_addtest_cmd(dsl/dtd/template_counter ${SHM_TEST_CMD_LIST} dsl/dtd/dtd_test_template_counter)
 parsec_addtest_cmd(dsl/dtd/untie ${SHM_TEST_CMD_LIST} dsl/dtd/dtd_test_untie)
+# The thread that runs the waiting task holds all the other tasks in its own
+# queues: every scheduler has to let the other threads take them. llp is left
+# out: in a PARSEC_DEBUG_PARANOID build it fails an assertion of its own (the
+# reference count of a list item) as soon as this test schedules a task.
+foreach(_sched ${MCA_sched})
+  if(_sched STREQUAL "llp")
+    continue()
+  endif()
+  parsec_addtest_cmd(dsl/dtd/wait_in_task:${_sched} ${SHM_TEST_CMD_LIST} dsl/dtd/dtd_test_wait_in_task
+                     --mca mca_sched ${_sched} --mca runtime_num_cores 2)
+endforeach()
 parsec_addtest_cmd(dsl/dtd/new_tile:cpu ${SHM_TEST_CMD_LIST} dsl/dtd/dtd_test_new_tile --mca device_cuda_enabled 0)
 if(PARSEC_HAVE_CUDA AND CMAKE_CUDA_COMPILER)
   parsec_addtest_cmd(dsl/dtd/new_tile:gpu ${SHM_TEST_CMD_LIST} ${CTEST_CUDA_LAUNCHER_OPTIONS} dsl/dtd/dtd_test_new_tile --require-gpu --mca device_cuda_enabled 1 --mca device cuda)
