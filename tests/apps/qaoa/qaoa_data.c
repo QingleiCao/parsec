@@ -20,6 +20,8 @@
 typedef struct qaoa_tiles_s {
     parsec_data_collection_t super;
     int             owner;          /* negative: tile k on rank k mod nodes */
+    int             nb_ranks;       /* not zero: tile k on ranks[k mod nb_ranks] */
+    int             ranks[16];
     int             n;
     size_t          tile_bytes;
     parsec_data_t **data;           /* [n] created on first use */
@@ -28,8 +30,9 @@ typedef struct qaoa_tiles_s {
 
 static uint32_t tiles_rank(const qaoa_tiles_t *t, int k)
 {
-    if( t->owner >= 0 ) return (uint32_t)t->owner;
     if( k < 0 ) k = -k;
+    if( t->nb_ranks > 0 ) return (uint32_t)t->ranks[k % t->nb_ranks];
+    if( t->owner >= 0 ) return (uint32_t)t->owner;
     return (uint32_t)(k % (int)t->super.nodes);
 }
 
@@ -93,6 +96,15 @@ static parsec_data_t *tiles_data_of(parsec_data_collection_t *dc, ...)
     k = va_arg(ap, int);
     va_end(ap);
     return tiles_data_of_key(dc, (parsec_data_key_t)k);
+}
+
+void qaoa_tiles_set_ranks(parsec_data_collection_t *dc, const int *ranks, int nb_ranks)
+{
+    qaoa_tiles_t *t = (qaoa_tiles_t*)dc;
+
+    if( nb_ranks > 16 ) nb_ranks = 16;
+    for( int i = 0; i < nb_ranks; i++ ) t->ranks[i] = (ranks[i] < (int)dc->nodes) ? ranks[i] : (int)dc->nodes - 1;
+    t->nb_ranks = nb_ranks;
 }
 
 parsec_data_collection_t *qaoa_tiles_new(int myrank, int nodes, int owner, int n, size_t tile_bytes)

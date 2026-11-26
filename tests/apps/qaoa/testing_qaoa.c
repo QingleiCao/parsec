@@ -72,6 +72,8 @@ static int verbose = 0;
 static int fail_mode = FAIL_NONE;
 static int compare = 1;
 static int expect_shared = 0;
+/* -Q: every block names a QPU of the rank its quantum tasks run on. */
+static int name_qpus = 0;
 static int colour_sync = 0;
 static int machine = 0;
 static const char *log_prefix = NULL;
@@ -157,6 +159,11 @@ static int run_one(parsec_context_t *parsec, int rank, int world, const qaoa_ins
     struct rusage ru0, ru1;
     const int violations = qaoa_taskpool_violations();
     int errors = 0, rc, owner, have_ref = 0;
+    /* The QPUs of the run, the ranks that own one, each once, and whether
+     * this rank does. */
+    const int nb_qpus = parsec_qpu_count();
+    int owners[PARSEC_QPU_MAX_QPUS], nq = 0, owns_here = 0, *qpus = NULL;
+    int64_t mine[11], sum[11];
 
     /* Every rank has to see a QPU device, and one of them has to own it. A
      * rank that found otherwise must not leave the others to start a run
@@ -178,6 +185,29 @@ static int run_one(parsec_context_t *parsec, int rank, int world, const qaoa_ins
         if( 0 != anywhere ) return 1;
     }
     owner = info.owner_rank;
+    for( int q = 0; q < nb_qpus; q++ ) {
+        const int r = parsec_qpu_rank_of(q);
+        int known = 0;
+
+        if( r < 0 ) continue;                    /* nobody owns that one: nothing runs there */
+        if( r == rank ) owns_here = 1;
+        for( int i = 0; i < nq; i++ ) known |= (owners[i] == r);
+        if( !known ) owners[nq++] = r;
+    }
+    if( 0 == nq ) owners[nq++] = owner;
+    if( name_qpus ) {
+        /* Block b runs its quantum tasks on the rank owners[b mod nq], and
+         * names the QPUs of that rank in turn. */
+        qpus = (int*)malloc((size_t)K * sizeof(int));
+        for( int b = 0; b < K; b++ ) {
+            int of_rank[PARSEC_QPU_MAX_QPUS], n = 0;
+
+            for( int q = 0; q < nb_qpus; q++ ) {
+                if( parsec_qpu_rank_of(q) == owners[b % nq] ) of_rank[n++] = q;
+            }
+            qpus[b] = (n > 0) ? of_rank[(b / nq) % n] : PARSEC_QPU_ANY;
+        }
+    }
     qaoa_sizes(&sizes, inst, cfg);
 
     /* The reference first, on every rank: it says what to expect of this
@@ -192,13 +222,14 @@ static int run_one(parsec_context_t *parsec, int rank, int world, const qaoa_ins
     }
 
     X = qaoa_tiles_new(rank, world, -1, K, sizes.state);        /* the state of block b, on rank b mod P */
-    Q = qaoa_tiles_new(rank, world, owner, 1, 0);               /* where the quantum tasks run */
+    Q = qaoa_tiles_new(rank, world, owners[0], nq, 0);          /* where the quantum tasks run: a rank that owns a QPU */
+    qaoa_tiles_set_ranks(Q, owners, nq);
     A = qaoa_tiles_new(rank, world, 0, 1, sizes.all);           /* every final state, on rank 0 */
     G = qaoa_tiles_new(rank, world, 0, R, sizes.report);        /* what each round added up to, on rank 0 */
     E = qaoa_tiles_new(rank, world, -1, K, sizes.boundary);     /* an empty boundary per block, next to its state */
     qaoa_empty_boundaries(E, inst);
 
-    tp = qaoa_taskpool_new(inst, cfg, X, Q, A, G, E, &sizes, colour_sync, NULL != log_prefix);
+    tp = qaoa_taskpool_new(inst, cfg, X, Q, A, G, E, &sizes, colour_sync, NULL != log_prefix, nq, qpus);
     if( NULL == tp ) {
         if( 0 == rank ) fprintf(stderr, "testing_qaoa: %d round(s) of %d step(s), %d layer(s) and %d shot(s) is not a run\n",
                                 R, T, cfg->layers, cfg->shots);
@@ -207,6 +238,7 @@ static int run_one(parsec_context_t *parsec, int rank, int world, const qaoa_ins
         qaoa_tiles_free(A);
         qaoa_tiles_free(G);
         qaoa_tiles_free(E);
+        free(qpus);
         if( have_ref ) qaoa_run_free(&ref);
         return errors + 1;
     }
@@ -373,55 +405,82 @@ static int run_one(parsec_context_t *parsec, int rank, int world, const qaoa_ins
         parsec_qpu_service_stats(&s1);
         parsec_qpu_mock_stats(&m1);
         printf("qaoa_result system=%s instance=%s blocks=%d colours=%d ranks=%d rounds=%d steps=%d layers=%d shots=%d "
-               "time_ms=%.3f cpu_s=%.3f jobs=%lld circuits=%lld late=%lld owner=%d\n",
+               "time_ms=%.3f cpu_s=%.3f jobs=%lld circuits=%lld late=%lld owner=%d qpus=%d\n",
                colour_sync ? "C-sync" : ((info.max_batch > 1) ? "D" : "C"), inst->name, K, inst->part.nb_colours, world,
                R, T, cfg->layers, cfg->shots, elapsed_us * 1e-3, cpu_us * 1e-6,
-               (0 == owner) ? (long long)(s1.jobs_submitted - before.jobs_submitted) : -1LL,
-               (0 == owner) ? (long long)(m1.circuits - mock_before.circuits) : -1LL,
-               (0 == owner) ? (long long)(m1.late - mock_before.late) : -1LL, owner);
+               ((1 == nq) && (0 == owner)) ? (long long)(s1.jobs_submitted - before.jobs_submitted) : -1LL,
+               ((1 == nq) && (0 == owner)) ? (long long)(m1.circuits - mock_before.circuits) : -1LL,
+               ((1 == nq) && (0 == owner)) ? (long long)(m1.late - mock_before.late) : -1LL, owner, nb_qpus);
     }
 
-    /* ---- the QPU, on the rank that owns it and on the others ---- */
-    if( rank == owner ) {
-        const long tasks   = (long)(after.tasks_completed - before.tasks_completed);
-        const long jobs    = (long)(after.jobs_submitted - before.jobs_submitted);
-        const long empties = (long)(after.empty_jobs - before.empty_jobs);
-        const long failed  = (long)(after.tasks_failed - before.tasks_failed);
-        const long retries = (long)(after.retries - before.retries);
+    /* ---- the QPUs, on the ranks that own one and on the others ----
+     * What the QPUs did is counted on the rank that owns them. With QPUs on
+     * several ranks the counts are added up over the ranks, and every rank
+     * that owns one checks the sums. */
+    memset(mine, 0, sizeof(mine));
+    if( owns_here ) {
+        mine[0]  = (int64_t)(after.tasks_completed - before.tasks_completed);
+        mine[1]  = (int64_t)(after.jobs_submitted - before.jobs_submitted);
+        mine[2]  = (int64_t)(after.empty_jobs - before.empty_jobs);
+        mine[3]  = (int64_t)(after.tasks_failed - before.tasks_failed);
+        mine[4]  = (int64_t)(after.retries - before.retries);
+        mine[5]  = (int64_t)(after.jobs_coalesced - before.jobs_coalesced);
+        mine[6]  = (int64_t)(after.tasks_coalesced - before.tasks_coalesced);
+        mine[7]  = (int64_t)(after.tasks_submitted - before.tasks_submitted);
+        mine[8]  = (int64_t)(after.jobs_failed - before.jobs_failed);
+        mine[9]  = (int64_t)(mock_after.submits - mock_before.submits);
+        mine[10] = (int64_t)(mock_after.circuits - mock_before.circuits);
+    }
+    memcpy(sum, mine, sizeof(sum));
+    if( PARSEC_SUCCESS != parsec_tests_allreduce(parsec, mine, sum, 11, parsec_datatype_int64_t, PARSEC_TESTS_REDUCE_SUM) ) {
+        memcpy(sum, mine, sizeof(sum));
+    }
+    if( owns_here ) {
+        const long tasks   = (long)sum[0];
+        const long jobs    = (long)sum[1];
+        const long empties = (long)sum[2];
+        const long failed  = (long)sum[3];
+        const long retries = (long)sum[4];
         /* Jobs that carried the circuits of several tasks, and those tasks.
          * A job of one task is one circuit. */
-        const long shared_jobs  = (long)(after.jobs_coalesced - before.jobs_coalesced);
-        const long shared_tasks = (long)(after.tasks_coalesced - before.tasks_coalesced);
+        const long shared_jobs  = (long)sum[5];
+        const long shared_tasks = (long)sum[6];
         const long circuits     = jobs - shared_jobs + shared_tasks;
-        const long limit        = (long)info.max_batch;
+        long limit = 0;
 
-        EXPECT(tasks == evaluations, "the QPU completed %ld tasks, one per evaluation makes %ld", tasks, evaluations);
-        EXPECT((long)(after.tasks_submitted - before.tasks_submitted) == evaluations, "%ld quantum tasks submitted, expected %ld",
-               (long)(after.tasks_submitted - before.tasks_submitted), evaluations);
-        EXPECT((0 == after.pending) && (0 == after.in_flight), "the QPU still holds %u pending and %u jobs in flight",
+        EXPECT(tasks == evaluations, "the QPUs completed %ld tasks, one per evaluation makes %ld", tasks, evaluations);
+        EXPECT((long)sum[7] == evaluations, "%ld quantum tasks submitted, expected %ld", (long)sum[7], evaluations);
+        EXPECT((0 == after.pending) && (0 == after.in_flight), "the QPUs of this rank still hold %u pending and %u jobs in flight",
                after.pending, after.in_flight);
-        EXPECT(parsec_qpu_device_info(0, &info) == PARSEC_SUCCESS && (0 == info.load_ns),
-               "the QPU device still has a load of %lld ns", (long long)info.load_ns);
+        /* Every QPU of this rank: none carries a load, and the most tasks a
+         * job of one of them may carry. */
+        for( int q = 0; q < nb_qpus; q++ ) {
+            if( (PARSEC_SUCCESS != parsec_qpu_device_info(q, &info)) || !info.is_owner ) continue;
+            EXPECT(0 == info.load_ns, "QPU %d still has a load of %lld ns", q, (long long)info.load_ns);
+            if( (long)info.max_batch > limit ) limit = (long)info.max_batch;
+        }
         EXPECT(mock_after.duplicate_tags == mock_before.duplicate_tags, "a job was asked for twice under one tag");
         EXPECT(mock_after.key_overlaps == mock_before.key_overlaps, "two jobs of one evaluation were held at once");
         EXPECT(mock_after.inputs_changed == mock_before.inputs_changed, "the inputs of a job changed while the backend held it");
         EXPECT((mock_after.mixed_shots == mock_before.mixed_shots) && (mock_after.changed_jobs == mock_before.changed_jobs),
                "a job carried circuits that ask for different numbers of shots, or was asked for again with other circuits");
-        EXPECT((long)(mock_after.submits - mock_before.submits) == jobs, "the backend created %ld jobs, the device counts %ld",
-               (long)(mock_after.submits - mock_before.submits), jobs);
-        EXPECT((long)(mock_after.circuits - mock_before.circuits) == circuits,
-               "the backend was given %ld circuits; the device counts %ld jobs, of which %ld carried %ld tasks",
-               (long)(mock_after.circuits - mock_before.circuits), jobs, shared_jobs, shared_tasks);
+        EXPECT((long)sum[9] == jobs, "the backends created %ld jobs, the devices count %ld", (long)sum[9], jobs);
+        EXPECT((long)sum[10] == circuits,
+               "the backends were given %ld circuits; the devices count %ld jobs, of which %ld carried %ld tasks",
+               (long)sum[10], jobs, shared_jobs, shared_tasks);
         EXPECT((limit >= 1) && ((long)after.max_job_tasks <= limit) && ((long)mock_after.max_circuits <= limit),
                "a job carried %u tasks and the backend was given one of %u circuits; the limit is %ld",
                after.max_job_tasks, mock_after.max_circuits, limit);
         EXPECT((limit > 1) || (0 == shared_jobs), "%ld jobs carried more than one task, and no job may", shared_jobs);
         EXPECT(0 == (after.stray_events - before.stray_events), "%ld final states came for jobs that were not in flight",
                (long)(after.stray_events - before.stray_events));
-        all_jobs         += jobs;
-        all_circuits     += circuits;
-        all_shared_jobs  += shared_jobs;
-        all_shared_tasks += shared_tasks;
+        if( rank == owners[0] ) {
+            /* Once, where it is reported from. */
+            all_jobs         += jobs;
+            all_circuits     += circuits;
+            all_shared_jobs  += shared_jobs;
+            all_shared_tasks += shared_tasks;
+        }
         if( after.max_job_tasks > most_in_a_job ) most_in_a_job = after.max_job_tasks;
         if( have_ref ) {
             const long skipped_evaluations = 2L * T * ref.skipped;
@@ -438,7 +497,7 @@ static int run_one(parsec_context_t *parsec, int rank, int world, const qaoa_ins
                 /* One circuit per evaluation, in however many jobs. */
                 EXPECT(circuits == ref.jobs, "the QPU ran %ld circuits in %ld jobs, the reference asked its sampler for %ld",
                        circuits, jobs, ref.jobs);
-                EXPECT((0 == failed) && (0 == retries) && (after.jobs_failed == before.jobs_failed),
+                EXPECT((0 == failed) && (0 == retries) && (0 == sum[8]),
                        "%ld tasks ended without a result and %ld jobs were retried with nothing to make them", failed, retries);
                 break;
             case FAIL_KEYS:
@@ -463,13 +522,14 @@ static int run_one(parsec_context_t *parsec, int rank, int world, const qaoa_ins
             }
         }
     } else {
-        /* A rank that does not own the QPU has no backend and took no task. */
-        EXPECT(0 == after.backend_open, "a backend is open on a rank that does not own the QPU");
-        EXPECT(0 == after.tasks_submitted, "%llu quantum tasks were taken on a rank that does not own the QPU",
+        /* A rank that owns no QPU has no backend and took no task. */
+        EXPECT(0 == after.backend_open, "a backend is open on a rank that owns no QPU");
+        EXPECT(0 == after.tasks_submitted, "%llu quantum tasks were taken on a rank that owns no QPU",
                (unsigned long long)after.tasks_submitted);
-        EXPECT(0 == mock_after.opens, "a backend was opened on a rank that does not own the QPU");
+        EXPECT(0 == mock_after.opens, "a backend was opened on a rank that owns no QPU");
     }
 
+    free(qpus);
     qaoa_taskpool_free(tp);
     qaoa_tiles_free(X);
     qaoa_tiles_free(Q);
@@ -503,6 +563,7 @@ int main(int argc, char *argv[])
     for( int i = 1; i < test_argc; i++ ) {
         if( 0 == strcmp(argv[i], "-v") ) { verbose = 1; continue; }
         if( 0 == strcmp(argv[i], "-C") ) { expect_shared = 1; continue; }
+        if( 0 == strcmp(argv[i], "-Q") ) { name_qpus = 1; continue; }
         if( 0 == strcmp(argv[i], "-y") ) { colour_sync = 1; continue; }
         if( 0 == strcmp(argv[i], "-M") ) { machine = 1; continue; }
         if( i + 1 >= test_argc ) { fprintf(stderr, "testing_qaoa: %s needs a value\n", argv[i]); return 1; }

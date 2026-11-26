@@ -78,6 +78,19 @@ if(PARSEC_HAVE_QPU)
   # A generated instance, as for a measurement: 8 blocks of 10 qubits, two layers.
   qaoa_addtest(apps/qaoa:generated ${SHM_TEST_CMD_LIST} apps/qaoa/testing_qaoa -g 8:10:4:3 -p 2 -T 4 -R 3 -s 256 ${_qaoa})
 
+  # Several QPUs. Three on one rank: the blocks' jobs go to whichever has a
+  # place, or each block names its own (-Q), and the answers are the
+  # reference's either way, because what an evaluation gives depends on its
+  # key and not on the QPU that ran it. The list separates its entries with
+  # '|': a ';' would end the argument in a CMake list.
+  qaoa_addtest(apps/qaoa:qpus ${SHM_TEST_CMD_LIST} apps/qaoa/testing_qaoa ${_qaoa} --mca device_qpu_devices "mock|mock|mock")
+  qaoa_addtest(apps/qaoa:qpus:named ${SHM_TEST_CMD_LIST} apps/qaoa/testing_qaoa -Q ${_qaoa} --mca device_qpu_devices "mock|mock|mock")
+  qaoa_addtest(apps/qaoa:qpus:sync ${SHM_TEST_CMD_LIST} apps/qaoa/testing_qaoa -y ${_qaoa} --mca device_qpu_devices "mock|mock")
+  qaoa_addtest(apps/qaoa:qpus:fail ${SHM_TEST_CMD_LIST} apps/qaoa/testing_qaoa -F keys ${_qaoa} --mca device_qpu_devices "mock|mock|mock")
+  qaoa_addtest(apps/qaoa:qpus:fail:named ${SHM_TEST_CMD_LIST} apps/qaoa/testing_qaoa -Q -F keys ${_qaoa} --mca device_qpu_devices "mock|mock")
+  qaoa_addtest(apps/qaoa:qpus:grid ${SHM_TEST_CMD_LIST} apps/qaoa/testing_qaoa -g grid:16:6:2:2 -T 3 -R 3 ${_qaoa}
+               --mca device_qpu_devices "mock slots=1 max_outstanding=1|mock slots=3 max_outstanding=3")
+
   if( MPI_C_FOUND )
     # The same on several ranks: block b on rank b modulo their number, the
     # QPU on rank 0. Some instances have fewer blocks than there are ranks.
@@ -88,6 +101,12 @@ if(PARSEC_HAVE_QPU)
     qaoa_addtest(apps/qaoa:mp:3 ${MPI_TEST_CMD_LIST} 3 apps/qaoa/testing_qaoa ${_qaoa})
     # The QPU on the last rank.
     qaoa_addtest(apps/qaoa:mp:last ${MPI_TEST_CMD_LIST} 4 apps/qaoa/testing_qaoa ${_qaoa} --mca device_qpu_owner_rank -1)
+    # QPUs on several ranks: the blocks' quantum tasks go to the ranks that
+    # own one in turn, and the ranks that own none run only classical tasks.
+    qaoa_addtest(apps/qaoa:qpus:mp:2 ${MPI_TEST_CMD_LIST} 2 apps/qaoa/testing_qaoa ${_qaoa} --mca device_qpu_devices "mock@0|mock@1")
+    qaoa_addtest(apps/qaoa:qpus:mp:4 ${MPI_TEST_CMD_LIST} 4 apps/qaoa/testing_qaoa -Q ${_qaoa} --mca device_qpu_devices "mock@0|mock@-1|mock@-1")
+    qaoa_addtest(apps/qaoa:qpus:sync:mp:3 ${MPI_TEST_CMD_LIST} 3 apps/qaoa/testing_qaoa -y ${_qaoa} --mca device_qpu_devices "mock@1|mock@2")
+    qaoa_addtest(apps/qaoa:qpus:fail:mp ${MPI_TEST_CMD_LIST} 2 apps/qaoa/testing_qaoa -F keys ${_qaoa} --mca device_qpu_devices "mock@0|mock@1|mock@1")
     qaoa_addtest(apps/qaoa:fail:mp ${MPI_TEST_CMD_LIST} 2 apps/qaoa/testing_qaoa -F keys ${_qaoa})
     # C-sync on three ranks, and with failing evaluations on four.
     qaoa_addtest(apps/qaoa:sync:mp:3 ${MPI_TEST_CMD_LIST} 3 apps/qaoa/testing_qaoa -y ${_qaoa})

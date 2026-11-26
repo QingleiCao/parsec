@@ -30,6 +30,9 @@ BEGIN_C_DECLS
  * and only says where a task runs.
  */
 parsec_data_collection_t *qaoa_tiles_new(int myrank, int nodes, int owner, int n, size_t tile_bytes);
+/** Put tile k on the (k modulo nb_ranks)-th rank of a list instead. Only for
+ *  tiles that hold nothing (tile_bytes 0), and before the first use. */
+void qaoa_tiles_set_ranks(parsec_data_collection_t *dc, const int *ranks, int nb_ranks);
 /** The memory of tile k, or NULL on a rank that does not hold it. */
 void *qaoa_tiles_ptr(parsec_data_collection_t *dc, int k);
 void  qaoa_tiles_free(parsec_data_collection_t *dc);
@@ -116,7 +119,7 @@ parsec_taskpool_t *qaoa_taskpool_new(const qaoa_instance_t *inst, const qaoa_con
                                      parsec_data_collection_t *X, parsec_data_collection_t *Q,
                                      parsec_data_collection_t *A, parsec_data_collection_t *G,
                                      parsec_data_collection_t *E, const qaoa_sizes_t *sizes,
-                                     int colour_sync, int log);
+                                     int colour_sync, int log, int nb_qpu_ranks, const int *qpus);
 /** To be called once the taskpool has been waited for. */
 void qaoa_taskpool_free(parsec_taskpool_t *tp);
 

@@ -38,7 +38,10 @@ extern "C" %{
  * rewritten, and a copy sent to another rank has been received before.
  *
  * Where the tasks run: everything of block b on the rank of X(b); the
- * quantum tasks on the rank of Q(0), which is the rank that owns the QPU.
+ * quantum tasks of block b on the rank of Q(b mod NQ): Q has one element for
+ * each rank that owns a QPU, so with one such rank that is the rank of Q(0).
+ * A quantum task names no QPU, and runs on whichever QPU of its rank has a
+ * place for its job; or it names the QPU its block was given (qpus).
  * Two chains keep the accounts, and nothing depends on them but the report
  * at the end: FINAL collects the last state of every block on the rank of
  * A(0), and SUM adds up what the updates of a round report, going from the
@@ -177,6 +180,8 @@ R              [ type = int ]
 T              [ type = int ]
 circuit_bytes  [ type = int ]
 colour_sync    [ type = int ]
+NQ             [ type = int ]
+qpus           [ type = "const int*" ]
 
 /**************************************************
  * INIT(b): the first assignment of block b
@@ -329,7 +334,7 @@ b = 0 .. K-1
 t = 0 .. T-1
 e = 0 .. 1
 
-: Q(0)
+: Q(b % NQ)
 
 READ  C   <- C BUILD(r, b)                                          [ type_remote = CIRCUIT ]
 READ  TH  <- %{ return (0 == t) && (0 == e); %} ? TH0 BUILD(r, b)   [ type_remote = THETA ]
@@ -344,7 +349,7 @@ BODY [type=QPU]
     /* The key names the evaluation: the sequential reference gives its
      * sampler the same one, and so draws the same counts. */
     TRACE("QEXEC(%d, %d, %d, %d)", r, b, t, e);
-    return PARSEC_QPU_SUBMIT_KEYED(C, TH, RES, cfg->shots, qaoa_key(r, b, t, e));
+    return PARSEC_QPU_SUBMIT_ON((NULL != qpus) ? qpus[b] : PARSEC_QPU_ANY, C, TH, RES, cfg->shots, qaoa_key(r, b, t, e));
 }
 END
 
@@ -566,7 +571,7 @@ parsec_taskpool_t *qaoa_taskpool_new(const qaoa_instance_t *instance, const qaoa
                                      parsec_data_collection_t *dcX, parsec_data_collection_t *dcQ,
                                      parsec_data_collection_t *dcA, parsec_data_collection_t *dcG,
                                      parsec_data_collection_t *dcE, const qaoa_sizes_t *sizes,
-                                     int colour_sync, int log)
+                                     int colour_sync, int log, int nb_qpu_ranks, const int *qpus)
 {
     parsec_qaoa_taskpool_t *tp;
     int index[QAOA_NB_KINDS];
@@ -579,7 +584,8 @@ parsec_taskpool_t *qaoa_taskpool_new(const qaoa_instance_t *instance, const qaoa
         (config->layers < 1) || (config->layers > QAOA_MAX_LAYERS) ) return NULL;
 
     tp = parsec_qaoa_new(instance, config, dcX, dcQ, dcA, dcG, dcE,
-                         instance->part.nb_blocks, config->rounds, config->steps, (int)sizes->circuit, !!colour_sync);
+                         instance->part.nb_blocks, config->rounds, config->steps, (int)sizes->circuit, !!colour_sync,
+                         (nb_qpu_ranks > 0) ? nb_qpu_ranks : 1, qpus);
 
     /* One taskpool at a time: what these point to is of the last one made. */
     free(qaoa_phase_done); qaoa_phase_done = NULL;
