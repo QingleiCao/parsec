@@ -173,6 +173,12 @@ parsec_dtd_ordering_correctly( parsec_execution_stream_t *es,
                 continue;
             }
 
+            if( FLOW_OF(current_task, current_dep)->flags & FLOW_SHARES_TILE ) {
+                /* Another flow of the task stands for this one in the chain of
+                 * the tile: the readers and the successors are its business. */
+                continue;
+            }
+
             if(action_mask & PARSEC_ACTION_RELEASE_LOCAL_DEPS) {
                 if( PARSEC_INPUT == op_type_on_current_flow ) {
                     if(parsec_dtd_task_is_local(current_task)){

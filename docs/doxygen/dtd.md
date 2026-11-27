@@ -157,6 +157,12 @@ plain data structures. `PARSEC_REF` passes a pointer value without creating a
 data dependency. `PARSEC_SCRATCH` asks the runtime to allocate temporary task
 storage. `PASSED_BY_REF` with a DTD tile creates a tracked data flow.
 
+The same tile may be passed for several data flows of one task, as happens when
+a kernel written for distinct tiles is called with one of them twice. The task
+is then a single user of that tile: a reader if all these flows read it, a
+writer if at least one of them writes it, and its body gets the same copy for
+each of these flows.
+
 Task bodies recover parameters in insertion order:
 
 ```c
