@@ -20,6 +20,7 @@
 
 #include "parsec/mca/sched/sched.h"
 #include "parsec/mca/sched/lfq/sched_lfq.h"
+#include "parsec/utils/mca_param.h"
 #include "parsec/papi_sde.h"
 
 /*
@@ -75,8 +76,24 @@ static int sched_lfq_component_query(mca_base_module_t **module, int *priority)
     return MCA_SUCCESS;
 }
 
+int parsec_sched_lfq_overflow_batch = 32;
+int parsec_sched_lfq_overflow_spins = 256;
+
 static int sched_lfq_component_register(void)
 {
+    parsec_mca_param_reg_int_name("sched_lfq", "overflow_batch",
+                                  "Largest number of tasks a thread takes from the overflow queue in one visit: "
+                                  "the first is executed, the others wait in a list of the thread, that the thread "
+                                  "empties before it takes tasks from the other threads. 1 takes one task per visit.",
+                                  false, false, parsec_sched_lfq_overflow_batch, &parsec_sched_lfq_overflow_batch);
+    if( parsec_sched_lfq_overflow_batch < 1 )
+        parsec_sched_lfq_overflow_batch = 1;
+    parsec_mca_param_reg_int_name("sched_lfq", "overflow_spins",
+                                  "How many times a thread tries again the lock of the overflow queue when the queue "
+                                  "holds tasks but another thread is in it. 0 gives up at the first failure.",
+                                  false, false, parsec_sched_lfq_overflow_spins, &parsec_sched_lfq_overflow_spins);
+    if( parsec_sched_lfq_overflow_spins < 0 )
+        parsec_sched_lfq_overflow_spins = 0;
     PARSEC_PAPI_SDE_DESCRIBE_COUNTER("SCHEDULER::PENDING_TASKS::SCHED=LFQ",
                               "the number of pending tasks for the LFQ scheduler");
     PARSEC_PAPI_SDE_DESCRIBE_COUNTER("SCHEDULER::PENDING_TASKS::QUEUE=<VPID>/<QID>::SCHED=LFQ",

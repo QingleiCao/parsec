@@ -187,6 +187,68 @@ static void check_list_sort(parsec_list_t* l1, parsec_list_t* l2)
     check_lifo_translate_inorder(l2,l1,"l2","l1");
 }
 
+static void check_unchain_front(parsec_list_t* l1, parsec_list_t* l2)
+{
+    static const int sizes[] = { 1, 2, 3, 7, 64, 1000 };
+    parsec_list_item_t *ring, *item;
+    unsigned int total = 0, s = 0;
+    int nb, n, max, step = 0;
+    unsigned int expected = 0;
+
+    printf(" - take the elements of l1 from its head, several at a time, check their order, chain them in l2\n");
+
+    nb = -1;
+    if( (NULL != parsec_list_nolock_unchain_front(l2, 4, &nb)) || (0 != nb) )
+        fatal(" ! Error: elements were taken from the empty list l2\n");
+    nb = -1;
+    if( (NULL != parsec_list_nolock_unchain_front(l1, 0, &nb)) || (0 != nb) )
+        fatal(" ! Error: elements were taken from l1 with max = 0\n");
+
+    while( total < NBELT ) {
+        max = sizes[s++ % (sizeof(sizes)/sizeof(sizes[0]))];
+        ring = parsec_list_nolock_unchain_front(l1, max, &nb);
+        if( NULL == ring )
+            fatal(" ! Error: l1 is empty after %u elements -- expecting %u\n", total, NBELT);
+        if( (nb < 1) || (nb > max) )
+            fatal(" ! Error: %d elements returned for max = %d\n", nb, max);
+        if( (nb < max) && (total + nb != NBELT) )
+            fatal(" ! Error: only %d elements returned for max = %d, while l1 is not empty\n", nb, max);
+        /* The elements of l1 are sorted by base, in one direction or the other */
+        if( 0 == total ) {
+            expected = ((elt_t*)ring)->base;
+            if( (0 != expected) && (NBELT-1 != expected) )
+                fatal(" ! Error: l1 does not start with 0 or %u\n", NBELT-1);
+            step = (0 == expected) ? 1 : -1;
+        }
+        n = 0;
+        item = ring;
+        do {
+            if( ((elt_t*)item)->base != expected )
+                fatal(" ! Error: found element %u where %u was expected\n", ((elt_t*)item)->base, expected);
+            check_elt( (elt_t*)item );
+            if( item->list_next->list_prev != item )
+                fatal(" ! Error: the ring is not well formed after element %u\n", ((elt_t*)item)->base);
+            expected += step;
+            n++;
+            item = (parsec_list_item_t*)item->list_next;
+        } while( item != ring );
+        if( n != nb )
+            fatal(" ! Error: the ring holds %d elements, %d were announced\n", n, nb);
+        total += nb;
+        parsec_list_nolock_chain_back(l2, ring);
+    }
+    if( !parsec_list_nolock_is_empty(l1) )
+        fatal(" ! Error: l1 should be empty\n");
+    if( NULL != parsec_list_nolock_unchain_front(l1, 4, &nb) )
+        fatal(" ! Error: elements were taken from l1, which is empty\n");
+
+    /* l2 has the elements in the order l1 had them: give them back */
+    ring = parsec_list_nolock_unchain_front(l2, NBELT + 1, &nb);
+    if( (NULL == ring) || ((unsigned int)nb != NBELT) || !parsec_list_nolock_is_empty(l2) )
+        fatal(" ! Error: expected the %u elements of l2 in one ring, got %d\n", NBELT, nb);
+    parsec_list_nolock_chain_back(l1, ring);
+}
+
 static pthread_mutex_t heavy_synchro_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  heavy_synchro_cond = PTHREAD_COND_INITIALIZER;
 static unsigned int    heavy_synchro = 0;
@@ -306,6 +368,10 @@ int main(int argc, char *argv[])
     check_lifo_translate_inorder(&l2, &l1, "l2", "l1");
 
     check_list_sort(&l1, &l2);
+
+    check_unchain_front(&l1, &l2);
+    check_lifo_translate_inorder(&l1, &l2, "l1", "l2");
+    check_lifo_translate_inorder(&l2, &l1, "l2", "l1");
 
 
     printf("Parallel test.\n");

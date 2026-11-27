@@ -1,0 +1,89 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+/**
+ * A thread that waits inside a task must not keep other tasks to itself.
+ *
+ * START makes NT WORK tasks and NF FILL tasks ready at once, far more than
+ * the queue of a thread holds. Every worker thread waits inside one WORK task
+ * until all the other WORK tasks are completed. The MARGIN first and last
+ * WORK tasks are not waited in: these are the ones that the thread that
+ * executes START keeps close, the others go through whatever the scheduler
+ * shares between threads, and a thread that takes several of them at once
+ * holds the rest while it waits. Thread 0 never waits: it is the one that has
+ * to complete them all.
+ *
+ * A FILL task asks to be executed again as long as a WORK task is missing,
+ * so the scheduler always has tasks to hand out. A scheduler that lets a
+ * thread keep tasks until nothing else is left never completes this test.
+ */
+
+#include <time.h>
+#include "parsec/sys/atomic.h"
+#include "tests/runtime/scheduling/stalled_state.h"
+%}
+
+NT       [type="int"]
+NF       [type="int"]
+MARGIN   [type="int"]
+A        [type="parsec_data_collection_t*"]
+
+START(k)
+ k = 0..0
+
+:A(0)
+
+CTL W -> W WORK(0..NT-1)
+CTL F -> F FILL(0..NF-1)
+
+BODY
+    /* Nothing to do: all the other tasks become ready when this one completes */
+END
+
+WORK(i)
+ i = 0..NT-1
+
+:A(i)
+
+CTL W <- W START(0)
+
+BODY
+{
+    int th = es->th_id;
+
+    if( (0 != th) && (i >= MARGIN) && (i < NT - MARGIN) && !stalled_has_parked[th] ) {
+        struct timespec ts = { 0, 50000 };
+        stalled_has_parked[th] = 1;
+        (void)parsec_atomic_fetch_inc_int32(&stalled_nb_parked);
+        /* Before the release every WORK task counts at most once, as completed
+         * or as waited in: the sum reaches NT when nothing else is left to do. */
+        while( !stalled_released ) {
+            if( stalled_nb_done + stalled_nb_parked == NT )
+                stalled_released = 1;
+            else
+                nanosleep(&ts, NULL);
+        }
+    }
+    if( 0 == th )
+        stalled_nb_done_by_master++;
+    (void)parsec_atomic_fetch_inc_int32(&stalled_nb_done);
+}
+END
+
+FILL(j)
+ j = 0..NF-1
+
+:A(j)
+
+CTL F <- F START(0)
+
+BODY
+{
+    if( stalled_nb_done != NT )
+        return PARSEC_HOOK_RETURN_AGAIN;
+}
+END
