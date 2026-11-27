@@ -239,7 +239,7 @@ parsec_dtd_ordering_correctly( parsec_execution_stream_t *es,
             desc_flow_index = (DESC_OF(current_task, current_dep))->flow_index;
             desc_op_type = (FLOW_OF(current_desc, desc_flow_index)->op_type & PARSEC_GET_OP_TYPE);
 
-            int get_out = 0, tmp_desc_flow_index, release_parent = 0;
+            int get_out = 0, tmp_desc_flow_index, release_parent = 0, count_reader = 0;
             parsec_dtd_task_t *nextinline = current_desc;
 
             do {
@@ -258,6 +258,17 @@ parsec_dtd_ordering_correctly( parsec_execution_stream_t *es,
 
                 get_out = 1;  /* by default escape */
                 if( !(PARSEC_OUTPUT == desc_op_type || PARSEC_INOUT == desc_op_type) ) {
+                    /* Count this reader before looking for what follows it. If
+                     * nothing does, the tile is told below that it has no live
+                     * user left, and from then on a writer inserted on the tile
+                     * is released by its own insertion: this count is the only
+                     * thing that makes it wait for the reader.
+                     */
+                    count_reader = (action_mask & PARSEC_ACTION_RELEASE_LOCAL_DEPS) &&
+                                   parsec_dtd_task_is_local(current_desc);
+                    if( count_reader ) {
+                        parsec_dtd_data_copy_reader_retain(current_task->super.data[current_dep].data_out);
+                    }
 
                   look_for_next:
                     nextinline = (DESC_OF(current_desc, desc_flow_index))->task;
@@ -269,6 +280,10 @@ parsec_dtd_ordering_correctly( parsec_execution_stream_t *es,
                             /* We have same descendant using same data in multiple flows
                              * So we activate the successor once and skip the other times
                              */
+                            if( count_reader ) {
+                                /* It is counted as a reader for the last of these flows only */
+                                parsec_dtd_data_copy_reader_release(current_task->super.data[current_dep].data_out);
+                            }
                             if( parsec_dtd_task_is_remote(current_desc) ) {
                                 /* releasing remote read task that is in the chain */
                                 parsec_dtd_remote_task_release( current_desc );
@@ -286,12 +301,6 @@ parsec_dtd_ordering_correctly( parsec_execution_stream_t *es,
                                 goto look_for_next;
                             }
 
-                        }
-                    }
-
-                    if(action_mask & PARSEC_ACTION_RELEASE_LOCAL_DEPS) {
-                        if(parsec_dtd_task_is_local(current_desc)){
-                           parsec_dtd_data_copy_reader_retain(current_task->super.data[current_dep].data_out);
                         }
                     }
                 } else {
