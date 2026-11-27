@@ -251,6 +251,9 @@ static void test_mempool(void)
     /* threaded: every thread uses its own thread mempool */
     parsec_mempool_construct(&shared_mempool, PARSEC_OBJ_CLASS(pooled_t), sizeof(pooled_t),
                              offsetof(pooled_t, mempool_owner), NB_THREADS);
+    /* and no cache line holds fields of two of them, wherever the array starts */
+    assert((char*)&shared_mempool.thread_mempools[1] - (char*)shared_mempool.thread_mempools[0].pad
+           >= PARSEC_MEMPOOL_CACHE_LINE);
     for(intptr_t t = 0; t < NB_THREADS; t++)
         pthread_create(&threads[t], NULL, mempool_thread, (void*)t);
     for(int t = 0; t < NB_THREADS; t++)
