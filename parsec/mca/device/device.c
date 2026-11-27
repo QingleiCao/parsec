@@ -518,6 +518,63 @@ void parsec_compute_best_unit( uint64_t length, float* updated_value, char** bes
     return;
 }
 
+/* Whether the statistics find es when they go through the streams of the
+ * virtual processes. */
+static inline int parsec_device_stream_is_counted(const parsec_execution_stream_t *es)
+{
+    const parsec_vp_t *vp = es->virtual_process;
+    return (NULL != vp) && ((uint32_t)es->th_id < (uint32_t)vp->nb_cores) &&
+           (vp->execution_streams[es->th_id] == es);
+}
+
+void parsec_device_count_executed_task(parsec_execution_stream_t *es,
+                                       parsec_device_module_t *device)
+{
+    if( !parsec_device_stream_is_counted(es) ) {
+        parsec_atomic_fetch_inc_int64((int64_t*)&device->executed_tasks);
+        return;
+    }
+    if( es->executed_tasks_device == device ) {
+        es->executed_tasks++;
+        return;
+    }
+    /* The stream changes device: what it counted goes to the previous one */
+    if( 0 != es->executed_tasks ) {
+        parsec_atomic_fetch_add_int64((int64_t*)&es->executed_tasks_device->executed_tasks,
+                                      (int64_t)es->executed_tasks);
+    }
+    es->executed_tasks        = 1;
+    es->executed_tasks_device = device;
+}
+
+/* Go through the streams that count tasks for device. Return the number of
+ * tasks they hold. With give, that number is also added to
+ * device->executed_tasks and the streams start again from zero, and with
+ * forget they stop counting for device: both write the counts of other
+ * streams, and are for when no stream executes a task on device.
+ */
+static uint64_t parsec_device_executed_tasks_in_streams(parsec_device_module_t *device,
+                                                        int give, int forget)
+{
+    parsec_context_t *context = device->context;
+    uint64_t count = 0;
+
+    if( NULL == context ) return 0;
+    for(int32_t p = 0; p < context->nb_vp; p++) {
+        parsec_vp_t *vp = context->virtual_processes[p];
+        if( NULL == vp ) continue;
+        for(int32_t t = 0; t < vp->nb_cores; t++) {
+            parsec_execution_stream_t *es = vp->execution_streams[t];
+            if( (NULL == es) || (es->executed_tasks_device != device) ) continue;
+            count += es->executed_tasks;
+            if( give || forget ) es->executed_tasks = 0;
+            if( forget ) es->executed_tasks_device = NULL;
+        }
+    }
+    if( give ) device->executed_tasks += count;
+    return count;
+}
+
 void parsec_devices_save_statistics(uint64_t **pstats) {
     if(NULL == *pstats) {
         *pstats = (uint64_t*)calloc(parsec_nb_devices * 7 /* see below for the number of arrays */, sizeof(uint64_t));
@@ -538,7 +595,7 @@ void parsec_devices_save_statistics(uint64_t **pstats) {
         parsec_device_module_t *device = parsec_devices[i];
         if(NULL == device) continue;
         assert( i == device->device_index );
-        executed_tasks[i] = device->executed_tasks;
+        executed_tasks[i] = device->executed_tasks + parsec_device_executed_tasks_in_streams(device, 0, 0);
         nb_evictions[i]   = device->nb_evictions;
         transfer_in[i]    = device->data_in_from_device[0]; /* cpu-core device */
         transfer_out[i]   = device->data_out_to_host;
@@ -659,6 +716,7 @@ void parsec_mca_device_reset_statistics(parsec_context_t *parsec_context) {
     for(uint32_t i = 0; i < parsec_nb_devices; i++) {
         if( NULL == (device = parsec_devices[i]) ) continue;
         assert( i == device->device_index );
+        (void)parsec_device_executed_tasks_in_streams(device, 1, 0);
         device->executed_tasks       = 0;
         memset(device->data_in_from_device, 0, sizeof(uint64_t)*device->data_in_array_size);
         device->data_out_to_host     = 0;
@@ -1224,6 +1282,8 @@ int parsec_mca_device_remove(parsec_device_module_t* device)
         goto unlock_and_return_rc;
     }
     parsec_devices[device->device_index] = NULL;
+    /* No stream may keep counting for a device that is gone */
+    (void)parsec_device_executed_tasks_in_streams(device, 1, 1);
     device->context = NULL;
     device->device_index = -1;
     if(NULL != device->data_in_from_device) {

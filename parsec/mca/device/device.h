@@ -345,6 +345,26 @@ PARSEC_DECLSPEC int parsec_mca_device_is_gpu(uint32_t devindex);
 PARSEC_DECLSPEC int parsec_mca_device_remove(parsec_device_module_t* device);
 
 /**
+ * Count one task that the stream es executed on device, which is not an
+ * accelerator, when it is not the device es is already counting for (that
+ * case only increments es->executed_tasks, see __parsec_execute()).
+ *
+ * The tasks a stream executes are counted in the stream and not in
+ * device->executed_tasks, to keep every stream from writing the same cache
+ * line of the device for every task. What a stream counted goes to
+ * device->executed_tasks when the stream starts counting for another device
+ * and when the device is removed; until then the statistics add the counts of
+ * the streams to it (parsec_devices_save_statistics()). They are exact once
+ * the tasks are complete, and approximate while streams execute tasks.
+ *
+ * A stream that is not one of the streams of a virtual process (the
+ * communication thread) is not looked at by the statistics: its tasks are
+ * counted in device->executed_tasks directly.
+ */
+PARSEC_DECLSPEC void parsec_device_count_executed_task(parsec_execution_stream_t *es,
+                                                       parsec_device_module_t *device);
+
+/**
  * Reset the current devices statistics.
  */
 PARSEC_DECLSPEC void parsec_mca_device_reset_statistics(parsec_context_t* parsec_context);
