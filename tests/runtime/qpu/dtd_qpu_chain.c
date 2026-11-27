@@ -11,17 +11,32 @@
  *
  *   prep     writes a circuit and its parameters into two new tiles     rank k mod P
  *   qexec    reads them, submits the job, returns ASYNC                 the QPU's rank
- *   scribble overwrites the circuit tile                                rank k mod P
+ *   scribble overwrites the circuit tile, where that is the QPU's rank  rank k mod P
  *   check    reads the result and verifies it                           rank k mod P
  *
  * scribble is a writer inserted after a reader that is still outstanding.
  * DTD has to hold it until the quantum task has completed, which is when the
  * job is over and not when the body returned. The mock reads the circuit at
  * the end of the job, so a scribble that ran too early changes the result,
- * and check, which rebuilds the original circuit by itself, sees it. (Across
- * ranks the quantum task works on its own copy of the circuit, so this bites
- * on the chains that live on the QPU's rank, and on all of them with one
- * rank.)
+ * and check, which rebuilds the original circuit by itself, sees it.
+ *
+ * scribble is inserted only for the chains whose circuit lives on the QPU's
+ * rank (all of them with one rank). Across ranks the quantum task works on
+ * its own copy of the circuit, so a scribble there says nothing about the
+ * QPU layer; and DTD does not hold a writer back for a reader on another
+ * rank until the tile has been sent, so the copy that arrives can be the
+ * overwritten one (seen once in a hundred runs of this test under load, and
+ * every time with large tiles in a test without any quantum task). That is
+ * DTD's to fix, not this test's to trip over.
+ *
+ * On the QPU's own rank the test can still fail, about once in a hundred runs
+ * on a busy machine, with "the circuit flow does not hold a well-formed
+ * circuit": scribble ran before the body of the quantum task. That is DTD
+ * too, and no quantum task is needed to see it. The walk over the successors
+ * of a completed task counts a reader of the copy only after it has marked
+ * the tile's last user as gone, and a writer inserted between the two is
+ * released by its own insertion and finds no reader counted. This test stays
+ * as it is: holding scribble back is what it is for.
  *
  * The chains are inserted in two halves, the second while jobs of the first
  * are outstanding: a taskpool keeps taking quantum tasks while earlier ones
@@ -195,9 +210,11 @@ int main(int argc, char *argv[])
                                                    PARSEC_DTD_EMPTY_FLAG, params,
                                                    PARSEC_DTD_EMPTY_FLAG, result,
                                                    PARSEC_DTD_ARG_END);
-            parsec_dtd_insert_task_with_task_class(dtd_tp, scribble_tc, 0, PARSEC_DEV_CPU,
-                                                   PARSEC_DTD_EMPTY_FLAG, circuit,
-                                                   PARSEC_DTD_ARG_END);
+            if( home == qrank ) {
+                parsec_dtd_insert_task_with_task_class(dtd_tp, scribble_tc, 0, PARSEC_DEV_CPU,
+                                                       PARSEC_DTD_EMPTY_FLAG, circuit,
+                                                       PARSEC_DTD_ARG_END);
+            }
             parsec_dtd_insert_task_with_task_class(dtd_tp, check_tc, 0, PARSEC_DEV_CPU,
                                                    PARSEC_AFFINITY, &home,
                                                    PARSEC_DTD_EMPTY_FLAG, result,
@@ -253,9 +270,15 @@ int main(int argc, char *argv[])
         if( 0 == rank ) fprintf(stderr, "%ld check tasks ran, expected %d\n", checked, nt);
         errors++;
     }
-    if( scribbled != nt ) {
-        if( 0 == rank ) fprintf(stderr, "%ld scribble tasks ran, expected %d\n", scribbled, nt);
-        errors++;
+    {
+        /* One per chain that lives on the QPU's rank. */
+        int expected = 0;
+
+        for( int k = 0; k < nt; k++ ) expected += ((k % world) == qrank);
+        if( scribbled != expected ) {
+            if( 0 == rank ) fprintf(stderr, "%ld scribble tasks ran, expected %d\n", scribbled, expected);
+            errors++;
+        }
     }
 
     for( int i = 0; i < 3 * nt; i++ ) {

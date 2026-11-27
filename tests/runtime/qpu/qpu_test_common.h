@@ -90,10 +90,13 @@ int qpu_test_check_service(int ran_quantum_tasks, long tasks, long empty, int ve
  * qpu_test_check_device(1, tasks + what qpu_test_expect_also_executed() was told). */
 int qpu_test_check_invariants(long tasks, int verbose);
 
-/* Check the QPU device of this process once everything is done: it is
- * there, with the type of a QPU and not taken for a GPU; it owns the QPU or
- * not, as said; it holds no load; and it executed exactly `executed` tasks.
- * On the owner its backend is described; elsewhere it has none. */
+/* Check the QPU devices of this process once everything is done: on a rank
+ * that owns QPUs, each of them; elsewhere the one device that stands for the
+ * QPUs of other ranks, which has to be there. Each has the type of a QPU and
+ * is not taken for a GPU; the rank owns QPUs or not, as said; no device holds
+ * a load; and together they executed exactly `executed` tasks, each counted
+ * for one QPU by the service. On the owner the backends are described;
+ * elsewhere there is none. */
 int qpu_test_check_device(int owner, long executed);
 
 /* Tasks the device executed that the service did not complete since it last

@@ -54,11 +54,39 @@ if(PARSEC_HAVE_QPU)
   # an accelerator wrote is read by a quantum task, and what the quantum task
   # wrote is read by an accelerator. Without a CUDA device the CPU bodies of
   # the same task classes stand in.
-  qpu_addtest(runtime/qpu/cpu_gpu_qpu ${SHM_TEST_CMD_LIST} runtime/qpu/cpu_gpu_qpu -n 16
+  qpu_addtest(runtime/qpu/cpu_gpu_qpu ${SHM_TEST_CMD_LIST} runtime/qpu/cpu_gpu_qpu -n 16 -q 1
               ${_qpu} --mca device_qpu_mock_delay uniform:200:5000)
+  # The same with three QPUs: the quantum task of a chain runs on whichever
+  # has a place, between the same two accelerator tasks.
+  qpu_addtest(runtime/qpu/cpu_gpu_qpu:qpus ${SHM_TEST_CMD_LIST} runtime/qpu/cpu_gpu_qpu -n 16 -q 3
+              ${_qpu} --mca device_qpu_mock_delay uniform:200:5000 --mca device_qpu_devices "mock|mock|mock")
+  # What a QPU prints with device_show_statistics: the tasks it ran. The
+  # device layer prints its table first and sets its counts back to zero, so
+  # the QPU has to have counted them itself.
+  # The run has to succeed and to print the line: repeat_test.cmake checks both.
+  add_test(NAME runtime/qpu/cpu_gpu_qpu:statistics
+           COMMAND ${CMAKE_COMMAND} -DREPEAT=1 "-DEXPECT=QPU 0, qpu[(]mock[)] on rank 0: 16 task[(]s[)], 16 job[(]s[)] at the backend"
+                   -P ${PROJECT_SOURCE_DIR}/tests/runtime/qpu/repeat_test.cmake --
+                   ${PROJECT_BINARY_DIR}/tests/runtime/qpu/cpu_gpu_qpu -n 16 -q 1
+                   -- --mca device_qpu_enabled 1 --mca device_show_statistics 1)
+  set_tests_properties(runtime/qpu/cpu_gpu_qpu:statistics PROPERTIES TIMEOUT 180)
+  # The same line of each of two QPUs, with every block naming one in turn:
+  # 12 of the 24 tasks each, whichever thread gets to them first.
+  add_test(NAME runtime/qpu/multi:named:statistics
+           COMMAND ${CMAKE_COMMAND} -DREPEAT=1
+                   "-DEXPECT=QPU 0, qpu0[(]mock[)] on rank 0: 12 task[(]s[)], 12 job[(]s[)] at the backend.*QPU 1, qpu1[(]mock[)] on rank 0: 12 task[(]s[)], 12 job[(]s[)] at the backend"
+                   -P ${PROJECT_SOURCE_DIR}/tests/runtime/qpu/repeat_test.cmake --
+                   ${PROJECT_BINARY_DIR}/tests/runtime/qpu/qpu_multi -n 12 -l 2 -P turn
+                   -- --mca device_qpu_enabled 1 --mca device_qpu_max_outstanding 2 --mca device_qpu_mock_slots 2
+                   --mca device_qpu_mock_delay uniform:200:5000 --mca device_show_statistics 1
+                   --mca device_qpu_devices "mock|mock")
+  set_tests_properties(runtime/qpu/multi:named:statistics PROPERTIES TIMEOUT 180)
   if(PARSEC_HAVE_CUDA)
-    qpu_addtest(runtime/qpu/cpu_gpu_qpu:gpu ${SHM_TEST_CMD_LIST} ${CTEST_CUDA_LAUNCHER_OPTIONS} runtime/qpu/cpu_gpu_qpu -g -n 16
+    qpu_addtest(runtime/qpu/cpu_gpu_qpu:gpu ${SHM_TEST_CMD_LIST} ${CTEST_CUDA_LAUNCHER_OPTIONS} runtime/qpu/cpu_gpu_qpu -g -n 16 -q 1
                 ${_qpu} --mca device_cuda_enabled 1 --mca device_qpu_mock_delay uniform:200:5000)
+    qpu_addtest(runtime/qpu/cpu_gpu_qpu:gpu:qpus ${SHM_TEST_CMD_LIST} ${CTEST_CUDA_LAUNCHER_OPTIONS} runtime/qpu/cpu_gpu_qpu -g -n 16 -q 3
+                ${_qpu} --mca device_cuda_enabled 1 --mca device_qpu_mock_delay uniform:200:5000
+                --mca device_qpu_devices "mock|mock|mock")
     # Two device components that both give modules: every device of both is there.
     qpu_addtest(runtime/qpu/discovery:gpu ${SHM_TEST_CMD_LIST} ${CTEST_CUDA_LAUNCHER_OPTIONS} runtime/qpu/qpu_discovery -g 1
                 ${_qpu} --mca device_cuda_enabled 1)
@@ -106,6 +134,10 @@ if(PARSEC_HAVE_QPU)
               ${_qpu} --mca device_qpu_mock_delay const:400000)
   qpu_addtest(runtime/qpu/overlap:1worker ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_overlap -t 1 -d 400000
               ${_qpu} --mca device_qpu_mock_delay const:400000)
+  # These two measure a run against the length of its job. Every process binds
+  # its first worker to the first core, so a test running beside them takes
+  # time from the one worker: they run alone.
+  set_tests_properties(runtime/qpu/overlap runtime/qpu/overlap:1worker PROPERTIES RUN_SERIAL TRUE)
 
   # Termination with tasks outstanding.
   qpu_addtest(runtime/qpu/termination ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_termination -n 8 -d 100000
@@ -309,6 +341,11 @@ if(PARSEC_HAVE_QPU)
   # two places, with jobs of very different lengths.
   qpu_addtest(runtime/qpu/multi:noidle ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_multi -n 48 -l 1 -W
               ${_qpu_m0} --mca device_qpu_devices "mock|mock|mock" --mca device_qpu_mock_delay exp:40000)
+  # It reads times too, and runs alone: when other processes take its cores,
+  # the three threads get to ask for their first jobs 10 to 30 ms after the
+  # tasks were submitted, and those are moments with a free place. With the
+  # same processes on other cores, not one moment is off.
+  set_tests_properties(runtime/qpu/multi:noidle PROPERTIES RUN_SERIAL TRUE)
   # A task that is submitted while its QPU is at work, and that has a place the
   # moment after, is not left on the way: the thread looks once more before
   # it sleeps. Here the mock holds the thread, asked again for a job it did
@@ -407,6 +444,12 @@ if(PARSEC_HAVE_QPU)
       qpu_addtest(runtime/qpu/discovery:mp:${_np} ${MPI_TEST_CMD_LIST} ${_np} runtime/qpu/qpu_discovery ${_qpu})
       qpu_addtest(runtime/qpu/termination:mp:${_np} ${MPI_TEST_CMD_LIST} ${_np} runtime/qpu/qpu_termination -n 8 -d 100000
                   ${_qpu} --mca device_qpu_mock_delay const:100000)
+      # (The dynamic termination detector asserts when a message arrives for a
+      # taskpool its rank has not yet marked ready, termdet_fourcounter_module.c
+      # in parsec_termdet_fourcounter_incoming_message_start: once in a hundred
+      # runs of this test under load, and once in two thousand of a test of
+      # that detector without any quantum task. A failure of that kind here is
+      # that race, which is the detector's.)
       qpu_addtest(runtime/qpu/termination:dynamic:mp:${_np} ${MPI_TEST_CMD_LIST} ${_np} runtime/qpu/qpu_termination_dynamic -n 8 -d 100000
                   ${_qpu} --mca device_qpu_mock_delay const:100000)
       qpu_addtest(runtime/qpu/stress:mp:${_np} ${MPI_TEST_CMD_LIST} ${_np} runtime/qpu/qpu_chain -n 200 -l 5

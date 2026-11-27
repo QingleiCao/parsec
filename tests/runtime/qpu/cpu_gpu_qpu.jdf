@@ -37,6 +37,9 @@ extern "C" %{
  *   -n NT     chains (default 16)
  *   -s SHOTS  shots per job (default 100)
  *   -g        the CUDA bodies must run
+ *   -q N      the context must have N QPU devices (default: one at least).
+ *             With several, a quantum task runs on whichever has a place,
+ *             and the tasks the devices executed are counted together
  *   -v        verbose
  */
 
@@ -209,20 +212,28 @@ int main(int argc, char *argv[])
     parsec_context_t *parsec;
     parsec_cpu_gpu_qpu_taskpool_t *tp;
     parsec_data_collection_t *W, *A, *B;
-    int nt = 16, shots = 100, want_gpu = 0, nb_cuda;
-    int rank = 0, world = 1, rc, test_argc, pargc, errors = 0;
+    int nt = 16, shots = 100, want_gpu = 0, want_qpus = 0, nb_cuda, nb_qpus;
+    int rank = 0, world = 1, rc, test_argc, pargc, errors = 0, q_given = 0;
     char **pargv;
 
     qpu_test_split_args(argc, argv, &test_argc, &pargc, &pargv);
     for( int i = 1; i < test_argc; i++ ) {
         if( 0 == strcmp(argv[i], "-v") ) { verbose = 1; continue; }
         if( 0 == strcmp(argv[i], "-g") ) { want_gpu = 1; continue; }
-        if( i + 1 >= test_argc ) break;
+        if( strcmp(argv[i], "-n") && strcmp(argv[i], "-s") && strcmp(argv[i], "-q") ) {
+            fprintf(stderr, "cpu_gpu_qpu: %s is not an option\n", argv[i]);
+            return 1;
+        }
+        if( i + 1 >= test_argc ) {
+            fprintf(stderr, "cpu_gpu_qpu: %s takes a number\n", argv[i]);
+            return 1;
+        }
         if( 0 == strcmp(argv[i], "-n") ) nt = atoi(argv[++i]);
         else if( 0 == strcmp(argv[i], "-s") ) shots = atoi(argv[++i]);
+        else { want_qpus = atoi(argv[++i]); q_given = 1; }
     }
-    if( (nt <= 0) || (shots <= 0) ) {
-        fprintf(stderr, "cpu_gpu_qpu: -n and -s must be positive\n");
+    if( (nt <= 0) || (shots <= 0) || (q_given && (want_qpus <= 0)) ) {
+        fprintf(stderr, "cpu_gpu_qpu: -n, -s and -q must be positive\n");
         return 1;
     }
 
@@ -240,8 +251,13 @@ int main(int argc, char *argv[])
         PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
         return -PARSEC_ERR_DEVICE;
     }
-    if( 1 != parsec_context_query(parsec, PARSEC_CONTEXT_QUERY_DEVICES, PARSEC_DEV_QPU) ) {
+    nb_qpus = parsec_context_query(parsec, PARSEC_CONTEXT_QUERY_DEVICES, PARSEC_DEV_QPU);
+    if( nb_qpus < 1 ) {
         fprintf(stderr, "cpu_gpu_qpu: the context has no QPU device (--mca device_qpu_enabled 1)\n");
+        errors++;
+    }
+    if( (want_qpus > 0) && (want_qpus != nb_qpus) ) {
+        fprintf(stderr, "cpu_gpu_qpu: the context has %d QPU device(s), expected %d\n", nb_qpus, want_qpus);
         errors++;
     }
 
@@ -290,8 +306,8 @@ int main(int argc, char *argv[])
     rc = parsec_tests_context_fini(&parsec);
     PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
 
-    printf("cpu_gpu_qpu: %d chains, %d CUDA device(s); %d CUDA bodies, %d CPU bodies, %d QPU bodies: %s\n",
-           nt, nb_cuda, gpu_bodies, cpu_bodies, qpu_bodies, errors ? "FAILED" : "passed");
+    printf("cpu_gpu_qpu: %d chains, %d CUDA device(s), %d QPU device(s); %d CUDA bodies, %d CPU bodies, %d QPU bodies: %s\n",
+           nt, nb_cuda, nb_qpus, gpu_bodies, cpu_bodies, qpu_bodies, errors ? "FAILED" : "passed");
     return errors ? 1 : 0;
 }
 

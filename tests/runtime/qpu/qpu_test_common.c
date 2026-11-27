@@ -398,66 +398,127 @@ void qpu_test_expect_also_executed(long tasks)
     also_executed = tasks;
 }
 
-int qpu_test_check_device(int owner, long executed)
+/* One QPU device of this rank against what the runtime holds for it. `stats`
+ * are the statistics of that QPU. What the device executed, as the QPU layer
+ * says it and as the statistics of the runtime count it, is added to the two
+ * sums. */
+static int qpu_test_check_one_device(int qpu, const parsec_qpu_device_info_t *info, const parsec_qpu_stats_t *stats,
+                                     const uint64_t *saved, uint64_t *executed, uint64_t *counted)
 {
-    parsec_qpu_device_info_t info;
-    parsec_qpu_stats_t stats;
-    parsec_device_module_t *device;
+    parsec_device_module_t *device = parsec_mca_device_get((uint32_t)info->device_index);
     int errors = 0;
 
-    if( PARSEC_SUCCESS != parsec_qpu_device_info(0, &info) ) {
-        fprintf(stderr, "QPU device: this process has none\n");
-        return 1;
-    }
-    parsec_qpu_service_stats(&stats);
-    device = parsec_mca_device_get((uint32_t)info.device_index);
-    EXPECT((NULL != device) && (PARSEC_DEV_QPU == device->type), "device %d is not of the QPU type", info.device_index);
-    EXPECT(!parsec_mca_device_is_gpu((uint32_t)info.device_index), "device %d is taken for a GPU", info.device_index);
-    EXPECT(!!owner == !!info.is_owner, "this rank %s the QPU, and was expected %sto",
-           info.is_owner ? "owns" : "does not own", owner ? "" : "not ");
-    EXPECT(0 == info.load_ns, "the device still holds a load of %lld ns", (long long)info.load_ns);
-    EXPECT((uint64_t)executed == info.executed_tasks, "the device executed %llu tasks, expected %ld",
-           (unsigned long long)info.executed_tasks, executed);
-    /* The statistics the runtime keeps for every device, as it prints them
-     * with device_show_statistics, count the same tasks. */
-    {
-        uint64_t *saved = NULL;
-        parsec_devices_save_statistics(&saved);
-        EXPECT((NULL != saved) && ((uint64_t)executed == saved[info.device_index]),
-               "the device statistics of the runtime count %llu tasks for the QPU, expected %ld",
-               (NULL != saved) ? (unsigned long long)saved[info.device_index] : 0ULL, executed);
-        if( NULL != saved ) parsec_devices_free_statistics(&saved);
-    }
+    EXPECT((NULL != device) && (PARSEC_DEV_QPU == device->type), "device %d is not of the QPU type", info->device_index);
+    EXPECT(!parsec_mca_device_is_gpu((uint32_t)info->device_index), "device %d is taken for a GPU", info->device_index);
+    EXPECT(0 == info->load_ns, "the device still holds a load of %lld ns", (long long)info->load_ns);
+    *executed += info->executed_tasks;
+    if( NULL != saved ) *counted += saved[info->device_index];
     /* What the description says is what the runtime itself reads in the module. */
     if( NULL != device ) {
-        EXPECT(device->device_load == info.load_ns, "the device is described with a load of %lld ns, and has %lld ns",
-               (long long)info.load_ns, (long long)device->device_load);
-        EXPECT(device->executed_tasks == info.executed_tasks, "the device is described with %llu executed tasks, and has %llu",
-               (unsigned long long)info.executed_tasks, (unsigned long long)device->executed_tasks);
-        EXPECT((PARSEC_QPU_TASK_TIME_NS == device->time_estimate_default) && (info.task_time_ns == device->time_estimate_default),
+        EXPECT(device->device_load == info->load_ns, "the device is described with a load of %lld ns, and has %lld ns",
+               (long long)info->load_ns, (long long)device->device_load);
+        EXPECT(device->executed_tasks == info->executed_tasks, "the device is described with %llu executed tasks, and has %llu",
+               (unsigned long long)info->executed_tasks, (unsigned long long)device->executed_tasks);
+        EXPECT((PARSEC_QPU_TASK_TIME_NS == device->time_estimate_default) && (info->task_time_ns == device->time_estimate_default),
                "the scheduler is given %lld ns per quantum task and the device is described with %lld ns, expected %lld ns",
-               (long long)device->time_estimate_default, (long long)info.task_time_ns, (long long)PARSEC_QPU_TASK_TIME_NS);
+               (long long)device->time_estimate_default, (long long)info->task_time_ns, (long long)PARSEC_QPU_TASK_TIME_NS);
     }
-    if( info.is_owner ) {
-        EXPECT(info.nb_qubits == (uint32_t)parsec_qpu_params.mock_max_qubits,
-               "the device takes %u qubits, the mock was given %d", info.nb_qubits, parsec_qpu_params.mock_max_qubits);
-        EXPECT((info.max_outstanding >= 1) && (info.max_outstanding <= (uint32_t)parsec_qpu_params.max_outstanding),
-               "the device keeps at most %u jobs outstanding, the limit is %d",
-               info.max_outstanding, parsec_qpu_params.max_outstanding);
-        EXPECT(0 == info.is_physical, "the device says it is a quantum device");
-        if( stats.jobs_timed > 0 ) {
+    if( info->is_owner ) {
+        /* The entry of a QPU in device_qpu_devices goes before the parameters. */
+        const int qubits = parsec_qpu_list_option_int(qpu, "max_qubits", parsec_qpu_params.mock_max_qubits);
+        const int limit  = parsec_qpu_list_option_int(qpu, "max_outstanding", parsec_qpu_params.max_outstanding);
+
+        EXPECT(info->nb_qubits == (uint32_t)qubits, "the device takes %u qubits, the mock was given %d", info->nb_qubits, qubits);
+        EXPECT((info->max_outstanding >= 1) && (info->max_outstanding <= (uint32_t)limit),
+               "the device keeps at most %u jobs outstanding, the limit is %d", info->max_outstanding, limit);
+        EXPECT(0 == info->is_physical, "the device says it is a quantum device");
+        /* The service counts for each QPU the tasks it gave back as executed
+         * on that QPU's device, which is the count a QPU prints with
+         * device_show_statistics. The device may have counted more: tasks of
+         * an earlier run, and tasks whose body did not submit. */
+        EXPECT(stats->tasks_executed <= info->executed_tasks, "the service counts %llu tasks for the QPU, its device executed %llu",
+               (unsigned long long)stats->tasks_executed, (unsigned long long)info->executed_tasks);
+        if( stats->jobs_timed > 0 ) {
             /* One job at least ended well: the device says how long a job takes,
              * and it is a time some job of this run can have taken. */
-            EXPECT((info.latency_estimate_ns > 0) && (info.latency_estimate_ns <= stats.latency_sum_ns),
+            EXPECT((info->latency_estimate_ns > 0) && (info->latency_estimate_ns <= stats->latency_sum_ns),
                    "the device says a job takes %lld ns; %llu jobs were timed and took %lld ns together",
-                   (long long)info.latency_estimate_ns, (unsigned long long)stats.jobs_timed,
-                   (long long)stats.latency_sum_ns);
+                   (long long)info->latency_estimate_ns, (unsigned long long)stats->jobs_timed,
+                   (long long)stats->latency_sum_ns);
         }
     } else {
-        EXPECT(0 == info.max_outstanding, "a rank that does not own the QPU keeps %u jobs outstanding", info.max_outstanding);
-        EXPECT(0 == info.nb_qubits, "a rank that does not own the QPU describes a backend");
+        EXPECT(0 == info->max_outstanding, "a rank that does not own the QPU keeps %u jobs outstanding", info->max_outstanding);
+        EXPECT(0 == info->nb_qubits, "a rank that does not own the QPU describes a backend");
+    }
+    return errors;
+}
+
+int qpu_test_check_device(int owner, long executed)
+{
+    const int nb = (parsec_qpu_count() > 1) ? parsec_qpu_count() : 1;
+    parsec_qpu_device_info_t info;
+    parsec_qpu_stats_t stats;
+    uint64_t *saved = NULL, done = 0, counted = 0;
+    int errors = 0, owned = 0, placeholders = 0;
+
+    parsec_qpu_service_stats(&stats);
+    /* The statistics the runtime keeps for every device, as it prints them
+     * with device_show_statistics, count the same tasks. */
+    parsec_devices_save_statistics(&saved);
+
+    /* With several QPUs, a task ran on whichever had a place: each device of
+     * this rank is checked, and the tasks are those of all of them together. */
+    for( int q = 0; q < nb; q++ ) {
+        parsec_qpu_stats_t mine = stats;
+        int found;
+
+        if( PARSEC_SUCCESS != parsec_qpu_device_info(q, &info) ) {
+            if( nb > 1 ) fprintf(stderr, "QPU device: this process has none for QPU %d\n", q);
+            else         fprintf(stderr, "QPU device: this process has none\n");
+            errors++;
+            continue;
+        }
+        if( info.device_index < 0 ) continue;         /* on another rank, and this rank has QPUs of its own */
+        if( info.is_owner ) owned++;
+        else if( placeholders++ > 0 ) continue;       /* one device stands for every QPU of a rank that owns none */
+        if( nb > 1 ) {
+            /* Its own counters; the device that stands for the QPUs of other
+             * ranks has no service, and nothing counted. */
+            const int rc = parsec_qpu_service_stats_of(q, &mine);
+
+            if( info.is_owner && (PARSEC_SUCCESS != rc) ) {
+                fprintf(stderr, "QPU service: QPU %d has none on the rank that owns it (%d)\n", q, rc);
+                errors++;
+            }
+        }
+        found = qpu_test_check_one_device(q, &info, &mine, saved, &done, &counted);
+        if( (found > 0) && (nb > 1) ) fprintf(stderr, "QPU service: that is QPU %d of %d\n", q, nb);
+        errors += found;
+    }
+    if( (0 == owned) && (0 == placeholders) ) {
+        /* Not one QPU device here, not even the one that stands for the QPUs
+         * of other ranks: nothing to check, and that is an error by itself. */
+        if( 0 == errors ) {
+            fprintf(stderr, "QPU device: this process has none\n");
+            errors++;
+        }
+        if( NULL != saved ) parsec_devices_free_statistics(&saved);
+        return errors;
+    }
+
+    EXPECT(!!owner == (owned > 0), "this rank %s the QPU, and was expected %sto",
+           (owned > 0) ? "owns" : "does not own", owner ? "" : "not ");
+    EXPECT((uint64_t)executed == done, "the device executed %llu tasks, expected %ld", (unsigned long long)done, executed);
+    EXPECT((NULL != saved) && ((uint64_t)executed == counted),
+           "the device statistics of the runtime count %llu tasks for the QPU, expected %ld",
+           (NULL != saved) ? (unsigned long long)counted : 0ULL, executed);
+    /* Every task the service gave back was counted for one QPU of this rank. */
+    EXPECT(stats.tasks_executed == stats.tasks_completed, "the service counts %llu tasks for its QPUs, and completed %llu",
+           (unsigned long long)stats.tasks_executed, (unsigned long long)stats.tasks_completed);
+    if( 0 == owned ) {
         EXPECT(0 == stats.backend_open, "a rank that does not own the QPU has a backend open");
     }
+    if( NULL != saved ) parsec_devices_free_statistics(&saved);
     return errors;
 }
 

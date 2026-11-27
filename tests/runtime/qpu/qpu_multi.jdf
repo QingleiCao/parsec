@@ -578,6 +578,12 @@ int main(int argc, char *argv[])
                q, info.device_index);
         EXPECT(0 == info.load_ns, "QPU %d still carries a load of %lld ns", q, (long long)info.load_ns);
         EXPECT(PARSEC_SUCCESS == parsec_qpu_service_stats_of(q, &stats), "QPU %d has no service on the rank that owns it", q);
+        /* What the service counted for this QPU is what its device counted:
+         * the service ran once here, and every body returned ASYNC. With
+         * the answers above, which name the QPU that ran each job, this is
+         * the count the QPU prints with device_show_statistics. */
+        EXPECT(stats.tasks_executed == info.executed_tasks, "QPU %d: its service counts %llu tasks for it, and its device %llu",
+               q, (unsigned long long)stats.tasks_executed, (unsigned long long)info.executed_tasks);
         EXPECT(stats.max_in_flight <= info.max_outstanding, "QPU %d had %u jobs outstanding at once, its limit is %u",
                q, stats.max_in_flight, info.max_outstanding);
         /* Its limits are those of its entry in the list, or of the parameters. */
