@@ -1,0 +1,180 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+/*
+ * A GPU body that returns PARSEC_HOOK_RETURN_DISABLE declines its device for
+ * this task, which must then run another incarnation, here the CPU one. Each
+ * task below is offered to a GPU, declines, and has to complete on the CPU.
+ *
+ * A task offered to a GPU again after declining it would decline forever, so
+ * the GPU body counts the offers and gives up on the second one: the test
+ * then fails instead of hanging.
+ */
+
+#include "parsec/parsec_config.h"
+#include "parsec/parsec_internal.h"
+#include "parsec/sys/atomic.h"
+#include "parsec/data_dist/matrix/two_dim_rectangle_cyclic.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#if defined(PARSEC_HAVE_MPI)
+#include <mpi.h>
+#endif
+
+#include "decline_fallback.h"
+
+#define NB_TASKS 16
+#define TILE_ELEMS 64
+
+static int32_t gpu_offers[NB_TASKS];
+static int32_t cpu_runs[NB_TASKS];
+
+/* Returns what the GPU body returns: decline the first time, give up after. */
+static int offered_to_gpu(int k)
+{
+    if( 0 == parsec_atomic_fetch_inc_int32(&gpu_offers[k]) )
+        return PARSEC_HOOK_RETURN_DISABLE;
+    fprintf(stderr, "TASK(%d) was offered to a GPU again after declining it\n", k);
+    return PARSEC_HOOK_RETURN_DONE;  /* without the work: the check fails */
+}
+
+%}
+
+dist [type = "parsec_tiled_matrix_t*"]
+
+TASK(k)
+  k = 0 .. NB_TASKS-1
+
+: dist(k, 0)
+
+RW T <- dist(k, 0)
+     -> dist(k, 0)
+
+BODY [type=CUDA]
+{
+    return offered_to_gpu(k);
+}
+END
+
+BODY [type=HIP]
+{
+    return offered_to_gpu(k);
+}
+END
+
+BODY
+{
+    int *tile = (int*)T;
+    for( int i = 0; i < TILE_ELEMS; i++ ) tile[i] += 1;
+    parsec_atomic_fetch_inc_int32(&cpu_runs[k]);
+}
+END
+
+extern "C" %{
+
+int main(int argc, char *argv[])
+{
+    parsec_context_t *parsec;
+    parsec_decline_fallback_taskpool_t *tp;
+    parsec_matrix_block_cyclic_t dist;
+    parsec_arena_datatype_t adt;
+    parsec_datatype_t dt;
+    int nb_gpus = 0, errors = 0, rc;
+
+#if defined(PARSEC_HAVE_MPI)
+    {
+        int provided;
+        MPI_Init_thread(NULL, NULL, MPI_THREAD_SERIALIZED, &provided);
+    }
+#endif
+    parsec = parsec_init(-1, &argc, &argv);
+    if( NULL == parsec ) exit(-1);
+
+    for( unsigned int i = 0; i < parsec_nb_devices; i++ ) {
+        parsec_device_module_t *dev = parsec_mca_device_get(i);
+        if( PARSEC_DEV_IS_GPU(dev->type) ) nb_gpus++;
+    }
+    if( 0 == nb_gpus ) {
+        fprintf(stderr, "Warning: test disabled because there is no GPU detected with this run\n");
+        parsec_fini(&parsec);
+#if defined(PARSEC_HAVE_MPI)
+        MPI_Finalize();
+#endif
+        return -PARSEC_ERR_DEVICE;  /* a skip, see SKIP_RETURN_CODE in tests/CMakeLists.txt */
+    }
+
+    parsec_matrix_block_cyclic_init(&dist, PARSEC_MATRIX_INTEGER, PARSEC_MATRIX_TILE,
+                                    0 /* rank */,
+                                    TILE_ELEMS, 1,
+                                    NB_TASKS * TILE_ELEMS, 1,
+                                    0, 0,
+                                    NB_TASKS * TILE_ELEMS, 1,
+                                    1, 1,
+                                    1, 1,
+                                    0, 0);
+    dist.mat = parsec_data_allocate((size_t)NB_TASKS * TILE_ELEMS * sizeof(int));
+    for( int i = 0; i < NB_TASKS * TILE_ELEMS; i++ ) ((int*)dist.mat)[i] = i;
+
+    parsec_translate_matrix_type(PARSEC_MATRIX_INTEGER, &dt);
+    PARSEC_OBJ_CONSTRUCT(&adt, parsec_arena_datatype_t);
+    parsec_matrix_adt_define_rect(&adt, dt, TILE_ELEMS, 1, TILE_ELEMS);
+
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+
+    tp = parsec_decline_fallback_new((parsec_tiled_matrix_t*)&dist);
+    assert(NULL != tp);
+    tp->arenas_datatypes[PARSEC_decline_fallback_DEFAULT_ADT_IDX] = adt;
+    PARSEC_OBJ_RETAIN(adt.arena);
+
+    rc = parsec_context_add_taskpool(parsec, (parsec_taskpool_t*)tp);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+    rc = parsec_context_wait(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+    parsec_taskpool_free(&tp->super);
+
+    /* Bring the final values back to the collection before reading them. */
+    parsec_devices_release_memory();
+
+    int offered = 0;
+    for( int k = 0; k < NB_TASKS; k++ ) {
+        if( 1 != cpu_runs[k] ) {
+            fprintf(stderr, "TASK(%d) ran %d time(s) on the CPU, expected once\n", k, cpu_runs[k]);
+            errors++;
+        }
+        if( gpu_offers[k] > 1 ) errors++;  /* reported by the GPU body */
+        if( gpu_offers[k] > 0 ) offered++;
+        for( int i = 0; i < TILE_ELEMS; i++ ) {
+            int v = ((int*)dist.mat)[k * TILE_ELEMS + i], expected = k * TILE_ELEMS + i + 1;
+            if( v != expected ) {
+                fprintf(stderr, "TASK(%d): element %d is %d, expected %d\n", k, i, v, expected);
+                errors++;
+                break;
+            }
+        }
+    }
+    if( 0 == offered ) {
+        fprintf(stderr, "No task was offered to a GPU: the fallback was not exercised\n");
+        errors++;
+    }
+
+    parsec_data_free(dist.mat);
+    parsec_tiled_matrix_destroy((parsec_tiled_matrix_t*)&dist);
+    PARSEC_OBJ_RELEASE(adt.arena);
+    parsec_matrix_arena_datatype_destruct_free_type(&adt);
+
+    parsec_fini(&parsec);
+#if defined(PARSEC_HAVE_MPI)
+    MPI_Finalize();
+#endif
+    if( errors ) fprintf(stderr, "decline_fallback: %d error(s)\n", errors);
+    else printf("decline_fallback: %d task(s) declined by a GPU and completed on the CPU\n", offered);
+    return (0 == errors) ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+%}
