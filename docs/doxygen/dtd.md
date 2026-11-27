@@ -445,6 +445,7 @@ The DTD tests are useful examples and regression anchors:
 | `dtd_test_data_flush` | Single-tile and full-collection flush behavior. |
 | `dtd_test_broadcast`, `dtd_test_reduce`, `dtd_test_allreduce` | Distributed collective-style dependency patterns. |
 | `dtd_test_pingpong`, `dtd_test_war` | Cross-rank ordering and write-after-read behavior. |
+| `dtd_test_same_tile_flows` | Tasks that pass the same tile for several of their flows. |
 | `dtd_test_task_insertion`, `dtd_test_task_inserting_task`, `dtd_test_hierarchy` | Tasks that insert tasks and use `PARSEC_HOOK_RETURN_AGAIN`. |
 | `dtd_test_tp_enqueue_dequeue` | Dynamic taskpool enqueue/dequeue and asynchronous completion patterns. |
 | `dtd_test_multiple_handle_wait` | Repeated waits on DTD taskpools. |
