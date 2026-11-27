@@ -47,6 +47,8 @@ cuda_pack_value_args(parsec_task_t *this_task, ...)
  * the completion arrays detect both lost and duplicate logical tasks.
  */
 static parsec_task_t *array_of_async_tasks[STATUS_TASKS];
+/* AGAIN tasks that stopped waiting for their ASYNC peer, see cuda_task_again() */
+static parsec_task_t *array_of_parked_again_tasks[STATUS_TASKS];
 static parsec_gpu_task_t *again_batch_tasks[STATUS_TASKS];
 static parsec_gpu_task_t *again_batch_order[STATUS_TASKS];
 static int async_completed[STATUS_TASKS];
@@ -71,13 +73,15 @@ static int stop_candidate_completed;
  * (see task-batching.md): the peer it waits for may never reach the device,
  * for instance when the thread that would submit it is the one running the GPU
  * manager. Each hook below waits at most CUDA_BATCH_MAX_RETRIES times for a
- * peer, and then proceeds with the tasks it has. The checks at the end of main
- * still require a batch to have formed, so a run where none does fails instead
- * of timing out. The counts are kept per task, as the device wrapper does not
- * persist across a change of device. The bound stays below the GPU manager's
- * default AGAIN warning threshold.
+ * peer, and then proceeds with the tasks it has; cuda_task_again(), which
+ * cannot proceed without its peer, hands its task over instead. The checks at
+ * the end of main still require a batch to have formed, so a run where none
+ * does fails instead of timing out. The counts are kept per task, as the
+ * device wrapper does not persist across a change of device. The bound stays
+ * below the GPU manager's default AGAIN warning threshold.
  */
 #define CUDA_BATCH_MAX_RETRIES 500
+static int again_retries[STATUS_TASKS];
 static int async_retries[STATUS_TASKS];
 static int again_batch_retries[STATUS_TASKS];
 static int next_retries[STATUS_TASKS];
@@ -194,6 +198,7 @@ int cuda_task_async(parsec_device_gpu_module_t *gpu_device,
         current = gpu_task;
         do {
             parsec_task_t *this_task = current->ec;
+            parsec_task_t *parked;
             int stored;
 
             parsec_dtd_unpack_args(this_task, &i, &first);
@@ -206,6 +211,13 @@ int cuda_task_async(parsec_device_gpu_module_t *gpu_device,
             assert(stored);
             if( !stored ) {
                 return PARSEC_HOOK_RETURN_ERROR;
+            }
+            /* The AGAIN task of the same index may have stopped waiting for
+             * this context: send it back to claim it. */
+            parked = array_of_parked_again_tasks[i];
+            if( (NULL != parked) &&
+                parsec_atomic_cas_ptr(&array_of_parked_again_tasks[i], parked, NULL) ) {
+                __parsec_reschedule(parsec_my_execution_stream(), parked);
             }
             current = (parsec_gpu_task_t *)current->list_item.list_next;
         } while( current != gpu_task );
@@ -226,6 +238,18 @@ int cuda_task_async(parsec_device_gpu_module_t *gpu_device,
 
 /* Wait until an ASYNC hook publishes the matching execution context, claim it
  * atomically, and return it to normal runtime scheduling exactly once.
+ *
+ * The wait is bounded. A task waiting with AGAIN keeps its event slot, so once
+ * every slot of an execution stream holds an AGAIN task whose ASYNC peer is
+ * still pending on that stream, nothing else is submitted there and the run
+ * livelocks. Whether enough AGAIN tasks reach the device before their peers
+ * depends on the order in which the scheduler hands the tasks out. Past the
+ * bound the task gives its execution context to the test with ASYNC, which
+ * frees its slot, and the ASYNC hook that publishes the peer reschedules it.
+ * The GPU manager releases the device wrapper of a task that returned ASYNC
+ * before it calls another hook, and the hooks of this test run one at a time
+ * in the manager of its only device, as the hand-over of the ASYNC contexts
+ * already assumes.
  */
 int cuda_task_again(parsec_device_gpu_module_t *gpu_device,
                     parsec_gpu_task_t *gpu_task,
@@ -233,7 +257,7 @@ int cuda_task_again(parsec_device_gpu_module_t *gpu_device,
 {
     parsec_task_t *this_task = gpu_task->ec;
     parsec_task_t *async_task;
-    int i;
+    int i, parked;
 
     (void)gpu_device; (void)gpu_stream;
     parsec_dtd_unpack_args(this_task, &i);
@@ -241,7 +265,13 @@ int cuda_task_again(parsec_device_gpu_module_t *gpu_device,
     async_task = array_of_async_tasks[i];
     if( (NULL == async_task) ||
         !parsec_atomic_cas_ptr(&array_of_async_tasks[i], async_task, NULL) ) {
-        return PARSEC_HOOK_RETURN_AGAIN;
+        if( cuda_batch_retry(again_retries, i) ) {
+            return PARSEC_HOOK_RETURN_AGAIN;
+        }
+        PARSEC_LIST_ITEM_SINGLETON(this_task);
+        parked = parsec_atomic_cas_ptr(&array_of_parked_again_tasks[i], NULL, this_task);
+        assert(parked);
+        return parked ? PARSEC_HOOK_RETURN_ASYNC : PARSEC_HOOK_RETURN_ERROR;
     }
     __parsec_reschedule(parsec_my_execution_stream(), async_task);
     return PARSEC_HOOK_RETURN_DONE;
