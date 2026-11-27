@@ -1189,7 +1189,7 @@ What it is not for: comparing A, B, C and D on hardware. Four runs would use the
 
 - The mock's latency model is a model. The replayed trace from E7 is the only link to real behaviour, and it is one day on one device.
 - The mock samples exactly. Hardware noise changes the optimizer's path and the final cut, not the runtime's behaviour; E7 reports the difference in cut without interpreting it.
-- One QPU. Nothing here supports claims about several. (Several QPUs per context are built, section 9.8, and no experiment has run on them: this stays true.)
+- One QPU. Nothing here supports claims about several. (Several QPUs per context are built, section 9.8, and three experiments ran on them on 2026-11-27, with mock QPUs on one and on two nodes: "The checks that were left, and the experiments on several QPUs" there. E1 to E6 as reported in section 9.7 are still on one QPU.)
 - Blocks of at most about 20 qubits on the mock. Larger blocks change the classical side (section 3.4) and are not evaluated.
 - The model of section 6.1 ignores classical time and runtime overhead. If measurements depart from it, the departure is itself a result to explain.
 - The mock computes its answers on the machine under test: 7 to 12 ms per job at 16 qubits (section 9.2). A job whose sampling outlasts its modelled time ends late, and the latency measured is then not the one modelled. The mock counts such jobs; a run is reported only when the count is zero, with as many helper threads as slots and cores for them that the workers do not use. (In M8 the helper threads shared the cores of rank 0, and the 11 runs of E3 that had a late job were run once more; section 9.7.)
@@ -2826,10 +2826,12 @@ Debug build with `PARSEC_DEBUG_PARANOID` and MPI (`/tmp/qcao3_qpu/build_qpu`, gc
 - **Build.** No new warning in the component or in the tests.
 - **The whole suite: 339 of 339 pass** (`ctest -j 6`, 80 s), twice. 172 of them are the QPU and QAOA tests: the 132 there were, and 40 new ones.
 - **Every test there was passes with the list left out**, so one QPU behaves as before. One of them had to change, `runtime/qpu/overlap` (below).
-- **Not run:**
+- **Not run, when M9 was committed:**
   - a Release build, a build with profiling, and a build without the component;
   - more than one node;
-  - CUDA. The job that builds with CUDA on leconte and runs the GPU tests, the others, and the application with three QPUs and the GPUs in one context is queued (Slurm job 68014): the node was taken. M9 changed no file outside the component, so what could differ is a context with several QPU devices and GPU devices together.
+  - CUDA.
+
+  All were run the day after: see "The CUDA run, and what it led to" and "The checks that were left, and the experiments on several QPUs" below.
 
 ### The tests
 
@@ -2928,6 +2930,284 @@ An independent reviewer read the change while the first deliberate-bug pass ran,
 
 The reviewer found nothing in: the load of a task on every path (retry, give-up, rejected, empty, a body that is not of the QPU type, stop); the other reads without the lock; how jobs are put together; start, stop, a second context and the statistics after a stop; the list and the modules; the mock's registry; and one QPU against M8, apart from the second finding. It found no check that cannot fail, and the collective calls of the tests are the same on every rank.
 
+### The CUDA run, and what it led to (2026-11-27)
+
+Run on leconte after M9 was committed, on the committed tree (`690eede03`): a Debug build with `PARSEC_DEBUG_PARANOID`, MPI and CUDA, on three V100 (Slurm job 68014, devices 4, 5 and 6).
+
+- **GPU tests: 66 of 66. The other tests: 365 of 365.**
+- **The application with the CUDA devices up in the same context**, one GPU per rank: its final states are the reference's with one QPU and with three, on 1 and on 3 ranks.
+- **One more check failed, and it was the test.** The job also ran `runtime/qpu/cpu_gpu_qpu` with three QPUs. That is M3's test of a quantum task between two accelerator tasks, and it was written for one QPU: it asked for exactly one QPU device, and counted the tasks of the first QPU only. It found 5 tasks where it expected 16. Every body had run (32 CUDA, 16 QPU), and no check of the data failed. On methane, without CUDA, the test failed in the same way with three QPUs.
+- **What that says about M9's tests.** None had a quantum task that reads what an accelerator task wrote, and is read by one, with several QPUs. That is the path on which M3 found the defect of `__parsec_execute`.
+- **Reading the output found a defect of M9.** The line a QPU prints with `device_show_statistics` said "0 task(s)" for every QPU, and with one QPU as well. M8 printed the count of the service. M9 printed the count of the QPU's device, and the device layer has set that back to zero by then (`parsec_mca_device_reset_statistics`, right after it prints its own table). No test read the line.
+
+**What was changed**, in six files, after the M9 commits:
+
+- **The service counts the tasks of each QPU** (`tasks_executed`, for the rank and for one QPU), at the place where it gives a task back and adds it to the count of the device. The line prints that count.
+- **The device check of the tests** (`qpu_test_check_device`) goes over every QPU of the rank. Each device is checked on its own (type, load, limits, what it says a job takes), the tasks are those of all of them together, and the count of the service for a QPU may not be above that of its device.
+- **`cpu_gpu_qpu -q N`** says how many QPU devices the context must have; without it, one at least.
+- **Three tests.** `runtime/qpu/cpu_gpu_qpu:qpus` has three QPUs, and CPU bodies where there is no CUDA device. `runtime/qpu/cpu_gpu_qpu:gpu:qpus` has three QPUs and CUDA. `runtime/qpu/cpu_gpu_qpu:statistics` reads the line of a run of 16 tasks on one QPU. The two tests there were ask for one QPU (`-q 1`), which is what they checked before.
+
+**How the changes were verified.**
+
+- **methane: 341 of 341** (`ctest -j 6`, 83 s): the 339, and the two new tests that need no CUDA.
+- **Sanitizers**, 14 runs under each: the mixed test with one QPU and with three, four runs with many tasks through the place where a task is given back, the application on three QPUs, and three runs each of `multi:fail:prompt` and `multi:wake:reask`, which the first pass had not run. All pass.
+  - **Address sanitizer:** no memory error, and the leak of section 9.1.
+  - **Thread sanitizer:** 3,083 reports. One has the QPU component in both stacks, the two pushes into one queue of "Sanitizers" above. 38 have it in one, all of the three kinds listed there. None is at the new counter.
+- **Deliberate bugs**, four, each caught:
+
+  | Deliberate bug | Tests that fail |
+  |---|---|
+  | The line prints the count of the device | 1: `cpu_gpu_qpu:statistics` |
+  | A task is not counted for its QPU | 77: every test that checks the service at its end |
+  | Every task is counted for the first QPU | 1: `cpu_gpu_qpu:qpus` |
+  | The device check reads the first QPU only | 1: `cpu_gpu_qpu:qpus` |
+
+- **leconte, CUDA again** (Slurm job 68103, devices 3, 4 and 5), on the working tree:
+  - `cpu_gpu_qpu:gpu:qpus` passes. So does the same run with the statistics on: 32 CUDA bodies, 16 QPU bodies, and the three QPUs ran 4, 4 and 8 tasks, which is what their lines say.
+  - The other tests: 365 of 365. The application: as in the first job.
+  - **GPU tests: 67 of 69.** `runtime/cuda/stress:gpu` and `runtime/cuda/ptg_pingpong:gpu` aborted, and `runtime/cuda/nvlink:gpu` was skipped. The first job had passed all three.
+- **The two failures are neither about QPUs nor from these changes.** Both tests abort on an assertion of the GPU layer, `PARSEC_DATA_COHERENCY_OWNED == gpu_copy->coherency_state` in `parsec_device_kernel_pop_task` (`device_gpu.c`). A third job (68104, devices 3 to 6) built the committed head and the working tree side by side, and ran the three tests on two sets of devices, twice each:
+
+  | Devices | Committed head | Working tree |
+  |---|---|---|
+  | 3, 4, 5 | two abort, one skipped, both times | the same, both times |
+  | 4, 5, 6 | all three pass, both times | all three pass, both times |
+
+  On leconte, GPU 3 cannot read the memory of GPUs 4 and 5 directly, and GPUs 4, 5 and 6 can all read each other's (`nvidia-smi topo -p2p r`). So the two tests abort when the GPUs of a run cannot all reach each other, with this branch's changes or without. On devices 4, 5 and 6 the GPU tests of the working tree pass, **69 of 69**.
+- **Not done.** Why the GPU layer asserts there was not looked into, and it was not reported upstream. The mixed test runs on one GPU (`device_cuda_enabled 1`), so no run here had a quantum task between tasks on two GPUs. A Release build, a build with profiling, a build without the component and more than one node were not run by these jobs; they were run in the night that followed (next subsection).
+
+The logs of the three jobs are with the harness, in `exp_qpu/checks/leconte_m9/`, outside version control.
+
+### The checks that were left, and the experiments on several QPUs (2026-11-27)
+
+Run in the night after the CUDA jobs, with the mock backend only. Nothing of it is committed. The scripts, status files and logs are with the harness, in `exp_qpu/checks/night_m9/`, and `REPORT.md` there is the longer account.
+
+**What was built.** Every job built from a fixed copy of the working tree, so that later edits could not change what a job tests:
+
+| Copy | Taken (UTC) | What it holds | sha256 of its difference to `690eede03` |
+|---|---|---|---|
+| 1 | 03:23 | The committed head and the follow-up of the CUDA run | `b287b3ed448f6146` |
+| 2 | 04:23 | And the fixes of the second review, below | `ca024c5089f750f3` |
+| 3 | 05:35 | And the two test changes after the repeated runs, below | `020fb15af7033233` |
+
+The working tree as this record is written is copy 3 and one change more, made at 07:28 after everything below had run on the copies: `multi:noidle` is marked `RUN_SERIAL` (one property and its comment in `tests/runtime/qpu/Testings.cmake`). A comment was added to the header of `dtd_qpu_chain.c` at 08:41, about the second DTD defect below. The other eight changed files are those of copy 3 byte for byte, this document apart. The difference of the ten to `690eede03` has the sha256 `2d8f027d76d31385`. As it stands, methane passes the whole suite with it: 342 of 342 (Debug, 08:58). That working tree was committed later the same day, unchanged, in the three commits that follow `690eede03`: the count of each QPU, the tests, and this record.
+
+**Build configurations, on one node.** gcc 11.5, Open MPI 5.0.5, no CUDA; the whole suite with `ctest -j 4`.
+
+| Build | Copy 1, serotonin (job 68115) | Copy 2, caffeine | Copy 3, caffeine |
+|---|---|---|---|
+| Release, shared, profiling off, component on | 341 of 341 | 342 of 342 | 342 of 342 |
+| Release, shared, profiling on, component on | 341 of 341 | 342 of 342 | 342 of 342 |
+| Release, shared, default options (the component is off) | 168 of 168 | 168 of 168 | 168 of 168 |
+| Debug, paranoid, component on | 341 of 341 | 342 of 342 | 342 of 342 |
+| Debug, paranoid, component off | 168 of 168 | 168 of 168 | 168 of 168 |
+| Debug, paranoid, profiling on, component on | 341 of 341 | 342 of 342 | 342 of 342 |
+| The two Debug builds of the upstream CI (noisier, paranoid, profiling; shared and static) | compile | compile | compile |
+
+- The first two rows are what the upstream CI tests. Its Debug builds are only compiled there, and here.
+- **No warning** from the compiler or from the PTG compiler in the QPU files, in any of the 24 builds.
+- **With the component off**, no file of it is compiled, and `libparsec.so` has no `parsec_qpu` symbol (46 with it on). The one test left with "qpu" in its name is `dsl/ptg/qpu_fallback`, which is about the PTG compiler.
+- **The 167 other tests** pass with the component on and off, in Debug and in Release, and the lists of passing tests are the same.
+- Copy 2 has one test more than copy 1 (`multi:named:statistics`, below): 175 QPU and QAOA tests of 342.
+
+**Every QPU and QAOA test again and again**, three tests at a time, each until it fails or has passed the given number of times:
+
+| Copy | Machine | Build | Times | Tests that never failed | Failed once |
+|---|---|---|---|---|---|
+| 1 | serotonin | Debug | 100 | 171 of 174 | `overlap:1worker`, `termination:dynamic:mp:4`, `chain:dtd:mp` |
+| 1 | serotonin | Release | 100 | 172 of 174 | `overlap:1worker`, `multi:noidle` |
+| 2 | caffeine | Debug | 20 | 174 of 175 | `termination:dynamic:mp:4` |
+| 2 | caffeine | Release | 20 | 175 of 175 | |
+| 3 | caffeine | Debug | 100 | 173 of 175 | `chain:dtd`, `termination:dynamic:mp:4` |
+| 3 | caffeine | Release | 50 | 175 of 175 | |
+
+What each of the five is:
+
+| Test | What happened | Whose it is | What was done |
+|---|---|---|---|
+| `runtime/qpu/chain:dtd:mp` | The quantum task on rank 1 was handed a circuit that a later task on rank 0 had already overwritten. The QPU layer refused it ("an operation is not a known one"), and the test failed cleanly | **PaRSEC's DTD, at the base commit**: the first defect below | The test overwrites the circuit only on the QPU's own rank, which is the only place where that says anything about the QPU layer |
+| `runtime/qpu/chain:dtd` | One process. The body of the quantum task found its circuit already overwritten, with the same message: `scribble`, the writer inserted after the quantum task, had run before it | **PaRSEC's DTD again, at the base commit and upstream**: the second defect below. The body was handed the right circuit and ran once | Left as it is, with the defect named in the header of the test. It can fail again, about once in a hundred runs on a busy machine, and so can `chain:dtd:mp`, whose chains on the QPU's rank are the same |
+| `runtime/qpu/termination:dynamic:mp:4` | An assertion of the dynamic termination detector, on the communication thread: a message arrived for a taskpool that this rank had not yet marked ready (`termdet_fourcounter_module.c:596`) | **PaRSEC's dynamic termination detector**: below | Left as it is, with a comment at the test that names the race. It can fail again, about once in a hundred runs beside other tests |
+| `runtime/qpu/overlap:1worker` | The run took 506.8 ms against a limit of 500. Every other check of the test passed: the classical chain did run during the job | The test. It measures time, its one worker is bound to core 0, and so are threads of the tests that run beside it. M8 saw the same under load | The two `overlap` tests are marked `RUN_SERIAL`: no test runs beside them |
+| `runtime/qpu/multi:noidle` | Not known for that run: the job had not kept the output of failing runs. Reproduced afterwards with the output kept: when other processes take the test's cores, the three QPUs ask for their first jobs 8 to 29 ms after the tasks were submitted, and the moments before that are moments with a free place beside a waiting task | The test, on a machine that is busy: below | Marked `RUN_SERIAL`, like the two `overlap` tests |
+
+**`multi:noidle` under load.** The test's command with its full output (`-v`), again and again; "off" is a moment at which a task waited beside a free place, and a run fails with more than one in ten.
+
+| Machine and build | How | Runs | Failed | Runs with a moment off |
+|---|---|---|---|---|
+| methane, Release of copy 3 | Alone | 600 | 0 | 0 |
+| | Three at a time | 1,800 | 7 | 12, all in the half minute in which a build of another tree ran on the machine |
+| | Beside the other QPU and QAOA tests, three at a time | 600 | 0 | 2 (1 and 3 moments) |
+| serotonin, Release of copy 1, as in the repeat that failed | Alone | 400 | 0 | 0 |
+| | Beside the other tests, three at a time | 3,000 | 0 | 2 (3 and 4 moments; 5 fail the test) |
+| histamine3, Release of copy 3, the test on 8 cores | Alone, before and after | 600 | 0 | 0 |
+| | 32 processes that spin, on the same 8 cores | 300 | 152 | 221 |
+| | The same 32 processes on 8 other cores | 300 | 0 | 0 |
+
+- **It is the threads waiting for a core, at the start.** The same load fails half the runs when it takes the test's cores, and leaves every moment in place when it does not.
+- **Once started, no place stays free.** In the 27 failing runs whose output was kept (7 on methane, 20 on histamine3), every moment off lies before the first job of the last QPU to start, 12 to 29 ms after the tasks were submitted; not one lies after it.
+- **What the run on serotonin shows:** the load of the test suite alone brings the test within one moment of failing, twice in 3,000 runs. That it was this that failed the one run of the repeat is likely and not shown: that output is lost.
+- With jobs of seconds a start that is 20 ms late does not matter. With the mock's jobs of 40 ms it fails this test, so the test runs alone. A machine that is busy with something else can still fail it, as it can the two `overlap` tests.
+
+**The first DTD defect, without any QPU code: a reader on another rank.** A reader on another rank, between two writers of a tile, can be sent the tile after the second writer has changed it in place. The reproducer is the upstream `dtd_test_war.c` with the readers moved to the next rank (`dtd_test_war_remote.c`, with the harness), built at `09c721868`. Per tile: a writer, a reader on the next rank, a second writer. 2 ranks, 20 runs for each size:
+
+| Tile | Runs that failed | Readers that saw the tile of the second writer |
+|---|---|---|
+| 4 bytes | 0 of 20 | 0 of 40,000 |
+| 1 KB | 0 of 20 | 0 of 40,000 |
+| 64 KB | 20 of 20 | 39,739 of 40,000 |
+| 1 MB | 20 of 20 | 3,869 of 4,000 |
+
+A small tile travels with the first message and the window is narrow, which is why the QPU test, whose tiles are small, met it once in a hundred runs under load. A tile that is sent in a second message reaches nearly every remote reader overwritten. This is wrong data without an error, in distributed DTD.
+
+- **It is in the upstream master of this day too** (`f81532dbe`, five commits after the base, one of them in DTD: `bfa2f8bfa`, "dtd: do not release a reader that was never counted"). The same reproducer there: 4 bytes and 1 KB, 0 of 20 runs; 64 KB, 20 of 20 (39,601 of 40,000 readers); 1 MB, 20 of 20 (3,940 of 4,000).
+- **Not reported upstream.** A search of the upstream issues and pull requests by keyword found no report of it. Where in DTD the remote reader is let go before the tile has left was not looked for.
+
+**The second DTD defect, without any QPU code: on one rank, a writer inserted behind a reader can run before it.** Found by reading DTD after `chain:dtd` had failed once in one process, and then shown.
+
+- **What DTD does** (`parsec/interfaces/dtd/overlap_strategies.c` and `insert_function.c`). A writer that follows readers of a tile is held back by the count of readers on the data copy: its `prepare_input` returns `AGAIN` while the count is above zero (`data_lookup_of_dtd_task`). When a task completes, the walk over its successors counts each reader. For the reader that is the last task inserted on the tile so far, it first marks the tile's last user as gone (`made_sure_nextinline_is_null`), and counts the reader a few instructions later (`parsec_dtd_data_copy_reader_retain`).
+- **The window.** A writer inserted on the tile between the two takes the path of a task whose parent is gone, is released by its own insertion, finds the count at zero, and runs before the reader. It takes the walking thread losing its core within those few instructions, which is why it showed once, on a busy node.
+- **Shown with a pause at that place.** Scratch copies of the sources, with `usleep` between the mark and the count when a variable is set. Without QPU code the test is a writer, one reader and a second writer per tile, 2,000 tiles, one process of 8 cores (`dtd_test_war_remote.c`, whose readers are on the writers' rank when there is one rank).
+
+| Sources | Test | Pause | Runs that failed | What was seen |
+|---|---|---|---|---|
+| This branch (copy 3) | `dtd_qpu_chain`, with counters per chain added to the test | none | 0 of 100 | |
+| | | 20 us | 68 of 100 | In every failing run: `scribble` ran before the body of the quantum task; the body then ran once, on the circuit `prep` had written, and found it overwritten |
+| | | 200 us | 31 of 100 | The same |
+| The base commit `09c721868`, no QPU code | Writer, reader, writer | none | 1 of 10 | 1 reader of 20,000 saw the tile of the second writer |
+| | | 20 us | 10 of 10 | 3,316 of 20,000 |
+| | | 200 us | 10 of 10 | 2,994 of 20,000 |
+| Upstream master `f81532dbe`, no QPU code | Writer, reader, writer | none | 0 of 10 | 0 of 20,000 |
+| | | 20 us | 10 of 10 | 3,374 of 20,000 |
+| | | 200 us | 10 of 10 | 3,112 of 20,000 |
+
+- **Without the pause** the base commit failed one run of ten on a quiet machine: the window is met in real runs, rarely.
+- **Upstream's own test** `dsl/dtd/dtd_test_war` has one tile per rank, so in one process it has one chance per run: 30 of 30 pass with the pause.
+- **With five readers per tile** and the pause, no run failed (0 of 100,000 readers, in both trees). This is not a case of its own; the session that made the fix (below) found why. The pause also held the inserting thread, once for each reader that follows, so the second writer always arrived after the walk had gone on. With the pause on the other threads only, it reports that five readers fail in 10 runs of 10 without the fix and in none with it.
+- **A candidate fix: count the reader before the mark** (16 lines of `overlap_strategies.c`; `dtd_war_window_candidate.patch`, with the harness). In scratch copies, with the pause still in place:
+  - writer, reader, writer: 0 of 10 runs at 20 us and at 200 us, 0 of 20,000 readers, on the base commit and on upstream master;
+  - `dtd_qpu_chain`: 0 of 100 at 20 us, at 200 us and without the pause, and the counters report nothing;
+  - every test with "dtd" in its name, without the pause: 42 of 42 on upstream master and 41 of 41 on the base commit, with the candidate and without it; ten times each on upstream master, 42 of 42 without it and 42 of 42 with it.
+- **The candidate is not in this branch**, which changes nothing in DTD, and it was run on one node only. Not reported upstream.
+- **Since then (2026-11-27, later that day): the fix is a branch of its own**, cut from upstream master, in the fork as draft pull request QingleiCao/parsec#28 (`fix/dtd-reader-count-window`: the same idea with one place that counts, and a test `dsl/dtd/war_last_reader` that holds its own threads up to meet the window). By that pull request's account the test fails 280 runs of 280 without the fix and none with it, and no build with an accelerator was run. Until the fix is in PaRSEC, `chain:dtd` can fail as described.
+- **The file is the same at both commits.** `overlap_strategies.c` is the same at the base commit and in upstream master, and the DTD commit that upstream made after the base (`bfa2f8bfa`) is about another place: with its two lines applied nothing differed.
+- **What did not reproduce it before the reading**, for the record: pauses after every insertion on a quiet methane (0 of 1,200 runs); counters behind a lock in the test, on histamine3, quiet and with 32 spinning processes on the test's cores (0 of 3,600).
+- **The two defects are not one.** For a reader on another rank no count is taken at all, and the tile is sent later; here the count is taken, a moment too late.
+
+**The detector's race, without any QPU code.** The test of that detector on the branch of ICLDisco/parsec#869 (the base commit and that fix, no QPU code), `dsl/ptg/dynamic_termdet:mp` on 4 ranks, met the same assertion once in 2,037 runs, three loops at a time on methane. On an idle methane, `termination:dynamic:mp:4` and `chain:dtd:mp` of this branch then passed 400 times out of 400 each. The detector's files are the same in the upstream master of this day, and no open pull request there is about this. Not reported upstream.
+
+**More than one node.** histamine2 and histamine3 (AMD, 16 cores each, Ethernet), a Debug build in the shared home, the ranks of every test on the two nodes in turn (`--map-by node`).
+
+- **With Open MPI's default path (UCX), 13 tests fail, and the base commit fails the same way.** 7 of the 174 QPU and QAOA tests, all of 4 ranks, and 6 of the 167 others (`collections/redistribute:mp`, `collections/redistribute_random:mp`, `collections/reshape:mp`, `collections/reshape:mp:mt`, `apps/merge_sort:mp`, `apps/stencil:mp`). The same tests fail every time. A build of `09c721868`, with no QPU code, fails the same 6 (161 of 167, job 68132). So the failures are not this branch's.
+- **Where it fails.** Inside the PMIx client of Open MPI 5.0.5 (`libpmix.so.2`), reached from the UCX layer when a rank asks for the address of a peer it contacts for the first time: `pml_ucx.c:188 Error: Failed to receive UCX worker address`, then a segmentation fault or an error of `MPI_Send`.
+- **What does not reproduce it**, all programs that use MPI only, across the two nodes: every rank sending to every other; the same from a second thread on a duplicated communicator, as PaRSEC talks; first contacts made by 1, 2 and 4 threads at the same moment, on 4, 8 and 16 ranks (20 of 20 each).
+- **What does not avoid it:** two ranks next to each other on a node (0 of 12 runs pass); `mpi_preconnect_mpi` (4 of 12); ranks started by `srun` with Slurm's PMIx (2 of 12).
+- **Over TCP the whole suite passes** (`OMPI_MCA_pml=ob1`, `OMPI_MCA_btl=tcp,self,sm` and the site's `btl_tcp_if_include`; job 68142, copy 2): the QPU and QAOA tests **175 of 175**, the others **167 of 167**; 126 of the 342 tests start through `mpiexec`. The 37 QPU and QAOA tests with ranks in their names, 10 times each: 370 runs, all pass.
+- **Not found:** what in PaRSEC's use of MPI brings out the failure on the UCX path of these nodes. It is there at the base commit.
+
+**A second independent review**, of the follow-up of the CUDA run (a reviewer that had the difference and none of the reasoning; it changed nothing). It found no defect in the runtime part: the counter, its threads, how a QPU is looked up, the reset, and the line. It found six gaps in the tests, and each was checked against the code and closed (7 files, 79 lines added, 22 removed; copy 2):
+
+| Finding | What was done | The deliberate bug that is now caught |
+|---|---|---|
+| The device check of the tests passed on a rank with no QPU device at all, also with one QPU. The follow-up had lost that check | It is an error again | The device that stands for the QPUs of other ranks is missing: 19 tests fail |
+| `cpu_gpu_qpu:statistics` ignored the exit code, as `PASS_REGULAR_EXPRESSION` does | It runs through `repeat_test.cmake`, which checks the exit code and, new, what is printed (`-DEXPECT`) | The test returns 3 after "passed": 3 tests fail |
+| No test read the count of each QPU with several QPUs | `multi:named:statistics` (two QPUs, 12 tasks each, read from the two lines), and `qpu_multi` compares the count of each QPU's service with that of its device | Every task is counted for the first QPU: 27 tests fail (1 before). A task is not counted: 105 |
+| `-q 0`, `-q x` and `-q` without a value dropped the check silently | The options are checked | Each ends with an error |
+| The device check ignored whether a QPU it owns has a service | Checked | |
+| Comments said a QPU "ran" the tasks counted for it. A task that ends without a job is counted for the QPU the device layer had picked | The comments say so | |
+
+**The test changes after the repeated runs.** In copy 3: `dtd_qpu_chain.c` and the `RUN_SERIAL` mark of the two `overlap` tests, both in the table above. On methane the suite passed with them, 342 of 342, and the four tests concerned passed 50 times each, three at a time. After copy 3: the `RUN_SERIAL` mark of `multi:noidle`. On methane, a Debug build of the working tree with it: the suite 342 of 342, and every QPU and QAOA test 10 times, three at a time, 175 of 175 (ctest runs the three marked tests with nothing beside them). No other build configuration was run with this last mark; it changes when a test runs and nothing that is compiled.
+
+**The experiments.** A Release build of copy 1, the mock backend, the checks of section 9.7 on every run (final states equal to the reference byte for byte, no late job). All 526 runs that count passed, with no late job. The model is `exp_qpu/model_multi.py`: the model of section 9.7 for several QPUs. Its self-test holds two things: with one QPU it gives the times of `model.py` to the nanosecond, and QPUs that are alike, with tasks bound when a place is free, give the times of one QPU with the places of all. Tables are in `exp_qpu/tables/` (`e9`, `e9_jobs_per_qpu`, `e5q`, `e6q`, `e6q_caffeine`, `e6q_2nodes`), plots in `exp_qpu/plots/` (`e9_binding`, `e5q_sharing`, `e6q_ranks`).
+
+| | E9 | E5 on several QPUs | E6 with QPUs on several ranks |
+|---|---|---|---|
+| Machine | caffeine: Intel Xeon E5-2660 v4, 14 cores, an exclusive Slurm allocation; no process of another user in the load log | the same | histamine3 (16 cores); caffeine; histamine3 and histamine2 over TCP |
+| Processes | 4 ranks of 3 cores | 4 ranks of 3 cores | 8 ranks: of 2 cores; of 1 core; of 4 cores, on the two nodes in turn |
+| QPUs | 2 and 4 on rank 0, of 1, 2 and 4 places | 1 and 3 on rank 0 | one on each of the first 1, 2, 4 and 8 ranks, with as many places in all as jobs can be in flight |
+| Job times | lognormal, mean 20 ms, coefficient of variation 0, 1, 2; one setting at 0.1 s | 10 ms for a job of one circuit, as in E5 | constant: 200 ms and 20 ms |
+| Instance | E3's grid: 16 blocks of 8 vertices, T 8, R 4 (1,024 jobs) | E5's: 16 blocks of 10 | rings of 16 and 64 blocks, of 12 vertices (200 ms) and 8 (20 ms); T 8, R 2 |
+| Runs | 307; 5 seeds, 3 at constant times | 75; 3 seeds | 48 on each of the three layouts; 3 seeds |
+
+**E9: what binding when a place is free is worth.** "Bound when free" is the rule of section 10.3. "In turn" lets each block name a QPU, in turn (`-Q`), so that its tasks wait for that one. "One" is one QPU with the places of all. Ratios per seed, then the median and the range.
+
+| QPUs x places | CV of the job time | Bound when free / one | In turn / bound when free | The same, model |
+|---|---|---|---|---|
+| 2 x 1 | 1 | 1.000 [1.000, 1.003] | 1.056 [1.020, 1.077] | 1.045 |
+| 2 x 1 | 2 | 1.000 [0.999, 1.006] | 1.111 [1.057, 1.155] | 1.100 |
+| 2 x 2 | 1 | 1.001 [0.999, 1.002] | 1.037 [1.020, 1.052] | 1.033 |
+| 2 x 2 | 2 | 0.998 [0.993, 1.006] | 1.072 [1.051, 1.122] | 1.048 |
+| 2 x 4 | 1 | 0.997 [0.994, 0.999] | 1.033 [1.027, 1.076] | 1.065 |
+| 2 x 4 | 2 | 0.999 [0.992, 1.009] | 1.025 [1.013, 1.042] | 1.026 |
+| 4 x 1 | 1 | 1.001 [0.998, 1.006] | 1.089 [1.066, 1.173] | 1.083 |
+| 4 x 1 | 2 | 1.002 [0.996, 1.021] | 1.163 [1.110, 1.282] | 1.143 |
+| 4 x 2 | 1 | 1.002 [0.995, 1.012] | 1.060 [1.056, 1.110] | 1.071 |
+| 4 x 2 | 2 | 1.001 [0.997, 1.008] | 1.055 [1.022, 1.113] | 1.039 |
+| 4 x 4 | 1 and 2 | 1.000 | 1.000 | 1.000 |
+| any | 0 | 1.000 | 1.000 | 1.000 |
+
+- **Several QPUs with one pool cost nothing** against one QPU with the same places: 0.3% at most in the median of any row.
+- **Naming a QPU in turn costs 3 to 16%** when job times vary and places are short, as the model says, and nothing at constant times or with a place for every task (4 x 4: 16 blocks, 16 places).
+- **Measured against the model:** within 2.5% in every row but one (4 x 4 at constant times, 3.4%: the run lasts 1.3 s, and 43 ms of it are not jobs).
+- **With jobs of 0.1 s** (4 x 2, CV 1, 3 seeds): 1.082 [1.068, 1.113], model 1.071.
+
+The first QPU slower than the others, 2 places each:
+
+| QPUs | Slower by | CV | In turn / bound when free | The same, model | Jobs on the slow QPU, of 1,024: bound when free | In turn |
+|---|---|---|---|---|---|---|
+| 2 | 2 | 0 | 1.497 | 1.497 | 342 | 512 |
+| 2 | 2 | 1 | 1.475 [1.433, 1.526] | 1.50 | 347 [331, 378] | 512 |
+| 2 | 4 | 0 | 2.485 | 2.485 | 206 | 512 |
+| 2 | 4 | 1 | 2.390 [2.337, 2.481] | 2.49 to 2.50 | 210 [185, 225] | 512 |
+| 4 | 2 | 0 | 1.727 | 1.73 to 1.74 | 148 | 256 |
+| 4 | 2 | 1 | 1.664 [1.346, 1.715] | 1.54 to 1.63 | 158 [142, 161] | 256 |
+| 4 | 4 | 0 | 3.177 | 3.18 to 3.20 | 80 | 256 |
+| 4 | 4 | 1 | 2.445 [2.217, 2.824] | 2.15 to 2.78 | 100 [97, 101] | 256 |
+
+- **With one slow QPU, naming a QPU in turn takes 1.5 to 3.2 times as long.** Every block that names the slow QPU waits for it, and its neighbours wait for the block. Bound when free, the slow QPU runs fewer jobs, in proportion to its speed.
+- The model's two values are for the two extreme orders in which QPUs with a free place are asked. In the runtime the order is that of its threads' wake-ups, which nothing fixes.
+- The job counts are read from the line each QPU prints with `device_show_statistics`, the line that the follow-up of the CUDA run fixed. At constant times they are the model's exactly.
+
+**E5 on several QPUs: tasks that share jobs.** The limit is `device_qpu_max_batch`. Gain is the time with every task its own job over the time with the limit, per seed.
+
+| Places | Limit 2 | 4 | 8 | 16 | Time at limit 1, ms |
+|---|---|---|---|---|---|
+| One QPU of 3 places (E5's "three") | 1.73 | 2.38 | 2.28 | 2.16 | 3,444 |
+| 3 QPUs of 1 place, bound when free | 1.73 | 2.63 | 2.32 | 2.25 | 3,442 |
+| 3 QPUs of 1 place, named in turn | 1.70 | 2.55 | 2.62 | 2.61 | 4,655 |
+| One QPU, one submission per 51 ms | 2.00 | 4.01 | 8.03 | 15.81 | 52,241 |
+| 3 QPUs, each one submission per 51 ms | 2.00 | 3.98 | 6.35 | 6.42 | 17,423 |
+
+- **Three QPUs of one place share jobs at least as well as one QPU of three places**: the same time at limits 1 and 2, and 2 to 10% less at 4, 8 and 16. At limit 4 they reach the model's gain (2.63 against 2.64), where one QPU of three places stays 10% below it, as in M8.
+- **Named in turn, every time is 20 to 40% longer** than bound when free, with shared jobs or without. The gains look alike because the time without sharing is longer too.
+- **With a submission interval per QPU**, three QPUs submit three times as often (17.4 s against 52.2 s), and sharing stops paying beyond 8 tasks a job, where the interval no longer limits the run.
+- **Measured against the model:** within 3.5% up to limit 4, except one QPU of three places at limit 4 (12% above). Beyond, the times lie between the model's two assumptions about how released tasks arrive.
+
+**E6 with QPUs on several ranks.** The quantum tasks of block `b` run on the owner rank `b` modulo the number of owners. With jobs of a constant time J the schedule alone gives 32 J.
+
+| Layout | J | Blocks | Time with 1, 2, 4, 8 owner ranks, ms | 8 owners / 1 owner | Per step beyond J: 1 owner, 8 owners |
+|---|---|---|---|---|---|
+| One node, 2 cores per rank | 200 ms | 16 | 6,433 / 6,432 / 6,429 / 6,413 | 0.997 | 1.0 ms, 0.4 ms |
+| | 200 ms | 64 | 6,455 / 6,449 / 6,441 / 6,421 | 0.995 | 1.7 ms, 0.7 ms |
+| | 20 ms | 16 | 670.9 / 665.7 / 669.2 / 656.7 | 0.979 | 1.0 ms, 0.5 ms |
+| | 20 ms | 64 | 672.6 / 676.4 / 673.0 / 659.9 | 0.981 | 1.0 ms, 0.6 ms |
+| Two nodes, TCP | 200 ms | 16 | 6,436 / 6,432 / 6,431 / 6,417 | 0.997 | 1.1 ms, 0.5 ms |
+| | 200 ms | 64 | 6,454 / 6,444 / 6,440 / 6,425 | 0.996 | 1.7 ms, 0.8 ms |
+| | 20 ms | 16 | 673.8 / 668.8 / 668.5 / 655.7 | 0.973 | 1.1 ms, 0.5 ms |
+| | 20 ms | 64 | 685.2 / 677.5 / 678.0 / 664.8 | 0.970 | 1.4 ms, 0.8 ms |
+
+- **The flat line that was expected.** Giving several ranks a QPU of their own changes the time by 3% at most. It gets slightly shorter with more owners: with a QPU on every rank a block's quantum tasks run on the block's own rank, and the message to the rank of the QPU and back is gone.
+- **One core per rank** (caffeine): the same, 0.975 to 0.994 with 8 owners.
+- Every QPU ran the same number of jobs in every run (16 blocks: 512, 256, 128 and 64 each).
+- **This is the run on more than one node that E6 lacked in M8** (section 9.7), on two nodes and over TCP on Ethernet. It says nothing about more nodes, or about a faster network.
+
+**What this night does not show.**
+
+- Real hardware: every QPU is the mock, and QPUs differ only in the job times they are given.
+- More than two nodes, and a network faster than Ethernet.
+- QPUs that differ in what they can run (width, shots, gates) under load: the tests of that are functional, and no experiment has them.
+- CUDA with the changes of copies 2 and 3. They touch tests and comments only, and the CUDA jobs above ran on the tree before them.
+
 ### Things found on the way
 
 - **Q-IRIS on several QPUs** (arXiv:2605.11382, read in full through a separate pass on 2026-11-26). The paper names no rule for choosing among QPUs: it says "configurable scheduling policies", and that the driver "can concurrently dispatch multiple QIR programs ... to different accelerators". It does not say when a task is bound, whether tasks wait in one queue or one per device, what happens when a QPU fails, or how many QPUs ran at once; it runs "on a single node" and lists "multi-node support" as future work. So nothing published there conflicts with the rule of section 10.3, and nothing there can be compared with it. Section 5 still needs this added.
@@ -2952,7 +3232,7 @@ The reviewer found nothing in: the load of a task on every path (retry, give-up,
 
 - **A backend sees its QPU's number** as the `device_index` of `open`, and reads its options with `parsec_qpu_list_option(number, key)`.
 - **A backend's calls may block.** `submit`, `results`, `cancel` and `abandon` are called without the pool's lock, and the other QPUs go on meanwhile.
-- **Experiments.** E5 and E6 can be run again on several QPUs, and the comparison of binding rules of section 10.6 needs a model with one queue and several groups of places.
+- **Experiments.** E5 and E6 were run again on several QPUs, and the comparison of binding rules of section 10.6 (E9) with them, on 2026-11-27: above. The model with one queue and several groups of places is `exp_qpu/model_multi.py`.
 
 ---
 
@@ -3264,11 +3544,11 @@ Assumption A4 as a backend, for NVQLink-coupled QPUs and for CUDA-Q's simulated 
 ## 10.6 What this means for the plan
 
 - **Order.** M9 comes first: it needs nothing from outside, and the three backends are worth more with it. Then M4a. M10, M4b and M11 each wait for something from outside: access to hardware, or an installation.
-- **Experiments that M9 makes possible.**
+- **Experiments that M9 makes possible.** All three were run on 2026-11-27 with mock QPUs (section 9.8, "The checks that were left, and the experiments on several QPUs").
   - E5 with several QPUs: tasks that share jobs across QPUs.
   - E6 with QPUs on several ranks.
-  - A new one: binding when a place is free against pinning in turn, at coefficients of variation of the job time of 0, 1 and 2. It measures what the rule of section 10.3 is worth, and the model of section 6.1 predicts it.
-- **Until M9 runs,** section 6.7's "One QPU. Nothing here supports claims about several" stays true. Any text about this work should present several QPUs as designed, not as measured.
+  - A new one, E9: binding when a place is free against pinning in turn, at coefficients of variation of the job time of 0, 1 and 2. It measures what the rule of section 10.3 is worth, and the model of section 6.1 predicts it.
+- **What can be said about several QPUs.** They are built and measured with mock QPUs, on one node and on two. Not measured: real hardware, more than two nodes, a network faster than Ethernet. Any text about this work should say so.
 - **Related work** (section 5) gains:
   - NVQLink, `cudaq-realtime` and Ising, below the runtime;
   - QRMI with its Slurm plugin, beside it;
