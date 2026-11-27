@@ -64,10 +64,62 @@ static int lhq_core_group(int level, const parsec_execution_stream_t *es)
     return group;
 }
 
+/**
+ * The scheduler object of a thread: the queues of the hierarchy, the queues
+ * of the other threads that this thread does not share with them, and the
+ * owner of each queue of the hierarchy.
+ *
+ * A task reaches a level that several threads share only when the queues
+ * below it are full, and the queues at the bottom of the hierarchy belong to
+ * one thread (or to the threads of one core). Without the second list, a
+ * thread that stops selecting tasks keeps the ones in its own queues from
+ * every other thread: for instance the thread that manages a GPU, which stays
+ * in the manager as long as the device has work, while the tasks that would
+ * feed the device wait in its queues.
+ */
 typedef struct {
     parsec_mca_sched_local_queues_scheduler_object_t queues;
+    int                 nb_foreign_queues;
+    int                 next_foreign_queue;  /**< the one the next visit looks at */
+    parsec_hbbuffer_t **foreign_queues;      /**< nearest thread first */
     int owner[];  /* VP worker owning each hierarchical queue. */
 } lhq_scheduler_object_t;
+
+#define LHQ_SCHEDULER_OBJECT(es) ((lhq_scheduler_object_t*)(es)->scheduler_object)
+
+/**
+ * List, for the thread at position t of vp, the queues of the other threads
+ * of vp that it does not share with them. The threads it shares the lowest
+ * level with come first, starting with the one after t, then those of the
+ * next level, and so on. A queue that several of these threads share is
+ * listed once.
+ */
+static void sched_lhq_list_foreign_queues(parsec_vp_t *vp, int t)
+{
+    lhq_scheduler_object_t *mine = LHQ_SCHEDULER_OBJECT(vp->execution_streams[t]);
+    int nb_levels = mine->queues.nb_hierarch_queues;
+    int shared, k, idx, i, n = 0;
+
+    mine->foreign_queues = (parsec_hbbuffer_t**)malloc(((size_t)vp->nb_cores * nb_levels + 1) *
+                                                       sizeof(parsec_hbbuffer_t*));
+    for(shared = 1; shared <= nb_levels; shared++) {
+        for(k = 1; k < vp->nb_cores; k++) {
+            lhq_scheduler_object_t *other = LHQ_SCHEDULER_OBJECT(vp->execution_streams[(t + k) % vp->nb_cores]);
+
+            /* The levels are nested: once two threads share a queue, they
+             * share the queues of all the levels above it too. */
+            for(idx = 0; (idx < nb_levels) &&
+                         (other->queues.hierarch_queues[idx] != mine->queues.hierarch_queues[idx]); idx++) /* nothing */;
+            if( idx != shared ) continue;
+            for(idx = 0; idx < shared; idx++) {
+                parsec_hbbuffer_t *queue = other->queues.hierarch_queues[idx];
+                for(i = 0; (i < n) && (mine->foreign_queues[i] != queue); i++) /* nothing */;
+                if( i == n ) mine->foreign_queues[n++] = queue;
+            }
+        }
+    }
+    mine->nb_foreign_queues = n;
+}
 
 static int flow_lhq_init(parsec_execution_stream_t* ces, struct parsec_barrier_t* barrier)
 {
@@ -154,6 +206,9 @@ static int flow_lhq_init(parsec_execution_stream_t* ces, struct parsec_barrier_t
             sched_obj = (parsec_mca_sched_local_queues_scheduler_object_t*)es->scheduler_object;
             sched_obj->task_queue = sched_obj->hierarch_queues[0];
         }
+        for(t = 0; t < vp->nb_cores; t++) {
+            sched_lhq_list_foreign_queues(vp, t);
+        }
 
 #if defined(PARSEC_PAPI_SDE)
         {
@@ -227,8 +282,29 @@ sched_lhq_select(parsec_execution_stream_t *es,
         PARSEC_DEBUG_VERBOSE(20, parsec_debug_output, "LQ\t: %d:%d found task %p in its system queue %p",
                              es->virtual_process->vp_id, es->th_id, task, PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es)->system_queue);
         *distance = 1 + PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es)->nb_hierarch_queues;
+        return task;
     }
-    return task;
+
+    /* Nothing is left in the queues this thread shares: take a task from the
+     * queues of another thread, which may have stopped selecting. A visit
+     * looks at one of them, and moves to the next one only when it is empty,
+     * so that a thread with nothing to do does not keep reading the queues of
+     * all the others. The distance is that of the system queue, so a task
+     * that asks to be executed again goes back to a queue that every thread
+     * can reach. */
+    lhq_scheduler_object_t *obj = LHQ_SCHEDULER_OBJECT(es);
+    if( 0 < obj->nb_foreign_queues ) {
+        parsec_hbbuffer_t *queue = obj->foreign_queues[obj->next_foreign_queue];
+        task = (parsec_task_t*)parsec_hbbuffer_pop_best(queue, parsec_execution_context_priority_comparator);
+        if( NULL != task ) {
+            PARSEC_DEBUG_VERBOSE(20, parsec_debug_output, "LQ\t: %d:%d found task %p in the queue %p of another thread",
+                                 es->virtual_process->vp_id, es->th_id, task, queue);
+            *distance = 1 + obj->queues.nb_hierarch_queues;
+            return task;
+        }
+        obj->next_foreign_queue = (obj->next_foreign_queue + 1) % obj->nb_foreign_queues;
+    }
+    return NULL;
 }
 
 static int sched_lhq_schedule(parsec_execution_stream_t* es,
@@ -274,6 +350,9 @@ static void sched_lhq_remove( parsec_context_t *master )
             sched_obj->system_queue = NULL;
             free(sched_obj->hierarch_queues);
             sched_obj->hierarch_queues = NULL;
+            free(LHQ_SCHEDULER_OBJECT(es)->foreign_queues);
+            LHQ_SCHEDULER_OBJECT(es)->foreign_queues = NULL;
+            LHQ_SCHEDULER_OBJECT(es)->nb_foreign_queues = 0;
 
             free(es->scheduler_object);
             es->scheduler_object = NULL;
