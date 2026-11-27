@@ -2591,7 +2591,24 @@ parsec_device_data_stage_in( parsec_device_gpu_module_t* gpu_device,
                                      candidate, flow->name);
             }
             if( (PARSEC_FLOW_ACCESS_WRITE & type) && (gpu_task->task_type != PARSEC_GPU_TASK_TYPE_PREFETCH) ) {
+                /* No transfer brings the write ownership along on this path,
+                 * and the copy does not always come with it: the task that
+                 * produced it may have pushed it out, which leaves it SHARED
+                 * with the host mirror while it is still what the successors
+                 * are handed, or may only have read it here. Writing it in
+                 * place makes it the one current copy again, so take the
+                 * ownership the way the transfer path does. The reservation
+                 * holds a writer back for as long as its copy is being filled,
+                 * so nothing is in flight into it.
+                 */
+                parsec_atomic_lock( &original->lock );
+                transfer_from = parsec_data_start_transfer_ownership_to_copy(original, gpu_device->super.device_index, (uint8_t)type);
+                /* This copy is the input of the flow: nothing more recent can
+                 * be waiting to be pulled into it. */
+                assert( -1 == transfer_from ); (void)transfer_from;
+                parsec_data_end_transfer_ownership_to_copy(original, gpu_device->super.device_index, (uint8_t)type);
                 candidate->version++;
+                parsec_atomic_unlock( &original->lock );
                 parsec_list_item_ring_chop((parsec_list_item_t *)candidate);
                 PARSEC_LIST_ITEM_SINGLETON(candidate);
             }
