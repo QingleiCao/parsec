@@ -1,0 +1,206 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+/* A token goes through READER(k) then WRITER(k), NB times, all on the same
+ * accelerator. READER only reads it, so the copy it hands to WRITER is the
+ * one the device staged in for reading. WRITER finds its input already on
+ * its device and writes it in place: no transfer is there to bring the write
+ * ownership along, and the copy must own the value all the same once the
+ * task has written it.
+ */
+
+#include "parsec/parsec_config.h"
+#include "parsec/utils/mca_param.h"
+#include "parsec/data_dist/matrix/two_dim_rectangle_cyclic.h"
+
+#include <assert.h>
+#if defined(PARSEC_HAVE_STRING_H)
+#include <string.h>
+#endif
+#if defined(PARSEC_HAVE_MPI)
+#include <mpi.h>
+#endif
+
+#include "ptg_read_then_write.h"
+
+#if defined(PARSEC_HAVE_DEV_CUDA_SUPPORT)
+extern void cuda_pong_kernel(int *dev_data, int idx, void *stream);
+#endif
+#if defined(PARSEC_HAVE_DEV_HIP_SUPPORT)
+extern void hip_pong_kernel(int *dev_data, int idx, void *stream);
+#endif
+
+%}
+
+dist     [type = "parsec_tiled_matrix_t*"]
+NB       [type = "int"]
+NB_ERR   [type = "int*"]
+
+INIT(k)
+  k = 0 .. 0
+
+: dist(0, 0)
+
+WRITE T <- NEW
+        -> T READER(0)
+
+BODY
+{
+    int *tile = (int*)T;
+    for(int i = 0; i < NB; i++) tile[i] = i;
+}
+END
+
+READER(k)
+  k = 0 .. NB-1
+
+: dist(0, 0)
+
+READ T <- k == 0 ? T INIT(0) : T WRITER(k-1)
+       -> T WRITER(k)
+
+BODY [type=CUDA]
+{
+    /* Nothing: all that matters is that the copy was staged in for reading. */
+}
+END
+
+BODY [type=HIP]
+{
+    /* Nothing: all that matters is that the copy was staged in for reading. */
+}
+END
+
+WRITER(k)
+  k = 0 .. NB-1
+
+: dist(0, 0)
+
+RW T <- T READER(k)
+     -> k < NB-1 ? T READER(k+1) : T CHECK(0)
+
+BODY [type=CUDA]
+{
+    cuda_pong_kernel(T, k, (void*)parsec_body.stream);
+}
+END
+
+BODY [type=HIP]
+{
+    hip_pong_kernel(T, k, (void*)parsec_body.stream);
+}
+END
+
+CHECK(k)
+  k = 0 .. 0
+
+: dist(0, 0)
+
+READ T <- T WRITER(NB-1)
+
+BODY
+{
+    int *tile = (int*)T;
+    for(int i = 0; i < NB; i++) {
+        if(tile[i] != 2*i) {
+            fprintf(stderr, "Error in element %d: expecting %d got %d\n", i, 2*i, tile[i]);
+            (*NB_ERR)++;
+        }
+    }
+}
+END
+
+extern "C" %{
+
+#define NB_STEPS 16
+
+int main( int argc, char** argv )
+{
+    parsec_ptg_read_then_write_taskpool_t* tp;
+    parsec_matrix_block_cyclic_t dist;
+    parsec_arena_datatype_t adt;
+    parsec_datatype_t dt;
+    parsec_context_t *parsec;
+    int nb_gpus = 0, nb_err = 0, rank = 0, rc;
+
+#ifdef PARSEC_HAVE_MPI
+    {
+        int provided;
+        MPI_Init_thread(NULL, NULL, MPI_THREAD_SERIALIZED, &provided);
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    }
+#endif
+
+    parsec = parsec_init(-1, &argc, &argv);
+    if( NULL == parsec ) {
+       exit(-1);
+    }
+
+    for(unsigned int i = 0; i < parsec_nb_devices; i++) {
+        parsec_device_module_t *dev = parsec_mca_device_get(i);
+        if( PARSEC_DEV_IS_GPU(dev->type) )
+            nb_gpus++;
+    }
+    if(0 == nb_gpus) {
+        if(0 == rank) {
+            fprintf(stderr, "Warning: test disabled because there is no GPU detected with this run\n");
+        }
+        parsec_fini(&parsec);
+#ifdef PARSEC_HAVE_MPI
+        MPI_Finalize();
+#endif
+        /* Report a skip rather than a pass: this run exercised nothing (see
+         * SKIP_RETURN_CODE in tests/CMakeLists.txt). */
+        return -PARSEC_ERR_DEVICE;
+    }
+
+    /* A single tile, which is only there to place the tasks. */
+    parsec_matrix_block_cyclic_init(&dist, PARSEC_MATRIX_INTEGER, PARSEC_MATRIX_TILE,
+                                    rank,
+                                    NB_STEPS, 1,
+                                    NB_STEPS, 1,
+                                    0, 0,
+                                    NB_STEPS, 1,
+                                    1, 1,
+                                    1, 1,
+                                    0, 0);
+    dist.mat = parsec_data_allocate((size_t)dist.super.nb_local_tiles *
+                                    (size_t)dist.super.bsiz *
+                                    (size_t)parsec_datadist_getsizeoftype(dist.super.mtype));
+    parsec_translate_matrix_type(PARSEC_MATRIX_INTEGER, &dt);
+    PARSEC_OBJ_CONSTRUCT(&adt, parsec_arena_datatype_t);
+    parsec_matrix_adt_define_rect(&adt, dt, dist.super.mb, dist.super.nb, dist.super.mb);
+
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+
+    tp = parsec_ptg_read_then_write_new( (parsec_tiled_matrix_t *)&dist, NB_STEPS, &nb_err );
+    assert( NULL != tp );
+    tp->arenas_datatypes[PARSEC_ptg_read_then_write_DEFAULT_ADT_IDX] = adt;
+    PARSEC_OBJ_RETAIN(adt.arena);
+
+    rc = parsec_context_add_taskpool( parsec, (parsec_taskpool_t*)tp );
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+    rc = parsec_context_wait(parsec);
+    parsec_taskpool_free(&tp->super);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+
+    parsec_data_free(dist.mat);
+    parsec_tiled_matrix_destroy((parsec_tiled_matrix_t *)&dist);
+    PARSEC_OBJ_RELEASE(adt.arena);
+    parsec_matrix_arena_datatype_destruct_free_type(&adt);
+
+    parsec_fini( &parsec);
+
+#ifdef PARSEC_HAVE_MPI
+    MPI_Finalize();
+#endif
+
+    return nb_err == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+%}
