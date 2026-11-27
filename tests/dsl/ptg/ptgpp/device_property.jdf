@@ -1,0 +1,181 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "parsec/data_dist/matrix/two_dim_rectangle_cyclic.h"
+#include "parsec/data_internal.h"
+#include "parsec/mca/device/device.h"
+#include "tests/tests_runtime.h"
+
+/**
+ * The body property device asks for one device of the type of the body:
+ * among the devices of that type enabled for the taskpool, in the order of
+ * their index, the one of rank value modulo their number, counting from 0.
+ * A negative value leaves the choice to the runtime.
+ *
+ * ON_CPU(k) has a CPU body with the property and nothing else. Its file did
+ * not compile: the function the property becomes was only generated for CUDA
+ * and HIP bodies.
+ *
+ * ON_GPU(k) has a CUDA body that asks for device k-1, and a CPU body. Every
+ * tile prefers the CPU, so without the property the runtime runs the task
+ * there. The property had no effect: the generated function always set no
+ * device. It did not compile either when the value used a parameter of the
+ * task, as here.
+ *
+ * Run with GPUs disabled, every task runs on the CPU. Run with CUDA devices,
+ * ON_GPU(0) runs on the CPU and ON_GPU(k) on the (k-1) modulo n-th of the n
+ * CUDA devices of the taskpool.
+ */
+
+static int *ran_on;  /* index of the device where ON_CPU(k), then ON_GPU(k), ran */
+
+%}
+
+descA      [type = "parsec_matrix_block_cyclic_t*"]
+NT         [type = int]
+
+ON_CPU(k)
+  k = 0 .. NT-1
+: descA(k, 0)
+
+  READ A <- descA(k, 0)
+
+BODY [device = k]
+  ran_on[k] = this_task->selected_device->device_index;
+END
+
+ON_GPU(k)
+  k = 0 .. NT-1
+: descA(NT+k, 0)
+
+  RW A <- descA(NT+k, 0)
+       -> descA(NT+k, 0)
+
+BODY [type=CUDA device=k-1]
+  ran_on[NT+k] = gpu_device->super.device_index;
+END
+
+BODY
+  ran_on[NT+k] = this_task->selected_device->device_index;
+END
+
+extern "C" %{
+
+#define NB_TASKS 9  /* ON_GPU(1 .. 8) ask for each of up to 8 devices once */
+
+static const char *device_name(int index)
+{
+    parsec_device_module_t *dev = (index < 0) ? NULL : parsec_mca_device_get(index);
+    return (NULL == dev) ? "none" : dev->name;
+}
+
+int main(int argc, char *argv[])
+{
+    parsec_context_t *parsec;
+    parsec_device_property_taskpool_t *tp;
+    parsec_matrix_block_cyclic_t descA;
+    int rc, rank, world, require_gpu = 0, nb_cuda = 0, *cuda, nb_errors = 0, total = 0;
+
+    /* The accelerator registration passes --require-gpu; take it out of the
+     * arguments that parsec_init() sees. */
+    for(int i = 1; i < argc; i++) {
+        if( 0 != strcmp(argv[i], "--require-gpu") ) continue;
+        require_gpu = 1;
+        for(int j = i; j < argc; j++) argv[j] = argv[j+1];
+        argc--;
+        break;
+    }
+
+    rc = parsec_tests_context_init(-1, PARSEC_TEST_THREAD_SERIALIZED,
+                                   &argc, &argv, &parsec, &rank, &world);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_init");
+
+    if( require_gpu && (parsec_context_query(parsec, PARSEC_CONTEXT_QUERY_DEVICES, PARSEC_DEV_CUDA) <= 0) ) {
+        parsec_warning("This run requires a CUDA device but none is present");
+        rc = parsec_tests_context_fini(&parsec);
+        PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
+        return -PARSEC_ERR_DEVICE;  /* a skip, see SKIP_RETURN_CODE in tests/CMakeLists.txt */
+    }
+
+    /* Tile (m, 0) lives on process m modulo the number of processes. ON_CPU
+     * uses the first NB_TASKS tiles, ON_GPU the next ones. */
+    parsec_matrix_block_cyclic_init(&descA, PARSEC_MATRIX_INTEGER, PARSEC_MATRIX_TILE,
+                                    rank,
+                                    1, 1,               /* Tile size */
+                                    2 * NB_TASKS, 1,    /* Global matrix size */
+                                    0, 0,               /* Starting point in the global matrix */
+                                    2 * NB_TASKS, 1,    /* Submatrix size */
+                                    world, 1,           /* process grid */
+                                    1, 1,               /* k-cyclicity */
+                                    0, 0);
+    descA.mat = parsec_data_allocate(descA.super.nb_local_tiles *
+                                     descA.super.bsiz *
+                                     parsec_datadist_getsizeoftype(PARSEC_MATRIX_INTEGER));
+    parsec_data_collection_set_key(&descA.super.super, "A");
+    ran_on = (int*)malloc(2 * NB_TASKS * sizeof(int));
+    for(int m = 0; m < 2 * NB_TASKS; m++) {
+        ran_on[m] = -1;
+        if( (int)descA.super.super.rank_of(&descA.super.super, m, 0) != rank ) continue;
+        /* Without the property, a task that may run on the CPU runs there */
+        descA.super.super.data_of(&descA.super.super, m, 0)->preferred_device = 0;
+    }
+
+    tp = parsec_device_property_new(&descA, NB_TASKS);
+    rc = parsec_context_add_taskpool(parsec, (parsec_taskpool_t*)tp);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+    rc = parsec_context_wait(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+
+    /* The CUDA devices of the taskpool, in the order of their index */
+    cuda = (int*)malloc(parsec_nb_devices * sizeof(int));
+    for(int i = 0; i < (int)parsec_nb_devices; i++) {
+        if( (tp->super.devices_index_mask & (1 << i)) &&
+            (parsec_mca_device_get(i)->type & PARSEC_DEV_CUDA) )
+            cuda[nb_cuda++] = i;
+    }
+    if( require_gpu && (0 == nb_cuda) ) {
+        fprintf(stderr, "No CUDA device is enabled for the taskpool\n");
+        nb_errors++;
+    }
+
+    for(int m = 0; m < 2 * NB_TASKS; m++) {
+        int k = m % NB_TASKS, expected = 0;
+        if( (int)descA.super.super.rank_of(&descA.super.super, m, 0) != rank ) continue;
+        if( (m >= NB_TASKS) && (nb_cuda > 0) && (k >= 1) )
+            expected = cuda[(k - 1) % nb_cuda];
+        if( ran_on[m] != expected ) {
+            fprintf(stderr, "%s(%d) ran on %s (%d) instead of %s (%d)\n",
+                    (m < NB_TASKS) ? "ON_CPU" : "ON_GPU", k,
+                    device_name(ran_on[m]), ran_on[m], device_name(expected), expected);
+            nb_errors++;
+        }
+    }
+
+    rc = parsec_tests_allreduce(parsec, &nb_errors, &total, 1,
+                                parsec_datatype_int_t, PARSEC_TESTS_REDUCE_SUM);
+    if( PARSEC_ERR_NOT_IMPLEMENTED == rc ) total = nb_errors;
+    else PARSEC_CHECK_ERROR(rc, "parsec_tests_allreduce");
+    if( (0 == rank) && (0 == total) ) {
+        printf("Every task ran on the device its property asked for (%d CUDA device(s))\n", nb_cuda);
+    }
+
+    parsec_taskpool_free((parsec_taskpool_t*)tp);
+    free(cuda);
+    free(ran_on);
+    parsec_data_free(descA.mat);
+    parsec_tiled_matrix_destroy((parsec_tiled_matrix_t*)&descA);
+
+    rc = parsec_tests_context_fini(&parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
+    return (0 == total) ? 0 : 1;
+}
+
+%}
