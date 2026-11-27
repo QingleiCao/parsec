@@ -35,6 +35,17 @@ extern size_t parsec_arena_max_allocated_memory;
  */
 extern size_t parsec_arena_max_cached_memory;
 
+/**
+ * Allocator and deallocator of the arenas constructed from now on, when both
+ * are set; otherwise parsec_data_allocate and parsec_data_free. An application
+ * can make arena memory (received data, new and temporary data, host copies of
+ * accelerator data) pinned host memory without pinning the data collections,
+ * which accelerators register themselves. Each arena keeps the pair it was
+ * constructed with.
+ */
+extern parsec_data_allocate_t parsec_arena_data_allocate;
+extern parsec_data_free_t     parsec_arena_data_free;
+
 #define PARSEC_ALIGN(x,a,t) (((x)+((t)(a)-1)) & ~(((t)(a)-1)))
 #define PARSEC_ALIGN_PTR(x,a,t) ((t)PARSEC_ALIGN((uintptr_t)x, a, uintptr_t))
 #define PARSEC_ALIGN_PAD_AMOUNT(x,s) ((~((uintptr_t)(x))+1) & ((uintptr_t)(s)-1))

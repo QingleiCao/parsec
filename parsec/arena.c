@@ -55,6 +55,8 @@ extern int arena_memory_used_key, arena_memory_unused_key;
 
 size_t parsec_arena_max_allocated_memory = SIZE_MAX;  /* unlimited */
 size_t parsec_arena_max_cached_memory    = 256*1024*1024; /* limited to 256MB */
+parsec_data_allocate_t parsec_arena_data_allocate = NULL;  /* parsec_data_allocate */
+parsec_data_free_t     parsec_arena_data_free     = NULL;  /* parsec_data_free */
 
 
 int parsec_arena_construct_ex(parsec_arena_t* arena,
@@ -82,8 +84,13 @@ int parsec_arena_construct_ex(parsec_arena_t* arena,
     arena->max_used     = (max_allocated_memory / elem_size > (size_t)INT32_MAX)? INT32_MAX: max_allocated_memory / elem_size;
     arena->released     = 0;
     arena->max_released = (max_cached_memory / elem_size > (size_t)INT32_MAX)? INT32_MAX: max_cached_memory / elem_size;
-    arena->data_malloc  = parsec_data_allocate;
-    arena->data_free    = parsec_data_free;
+    if( (NULL != parsec_arena_data_allocate) && (NULL != parsec_arena_data_free) ) {
+        arena->data_malloc  = parsec_arena_data_allocate;
+        arena->data_free    = parsec_arena_data_free;
+    } else {
+        arena->data_malloc  = parsec_data_allocate;
+        arena->data_free    = parsec_data_free;
+    }
     return PARSEC_SUCCESS;
 }
 
