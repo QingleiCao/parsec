@@ -241,6 +241,7 @@ typedef struct qpu_service_s {
     int64_t                     jobs_timed, latency_sum_ns;
     int64_t                     jobs_coalesced, tasks_coalesced, max_job_tasks;
     int64_t                     tasks_moved;
+    int64_t                     tasks_executed;
 } qpu_service_t;
 
 /* The QPUs of this rank, and what they share. */
@@ -520,8 +521,16 @@ static void qpu_hand_off(qpu_task_t *item)
      * application may read the counters or tear the taskpool down. */
     ctr_add(&pool.tasks_completed, 1);
     /* The device counts the tasks it executed itself, as an accelerator
-     * does: the scheduler counts only tasks whose hook did not return ASYNC. */
+     * does: the scheduler counts only tasks whose hook did not return ASYNC.
+     * The service counts them for that QPU as well: the device layer sets
+     * its count back to zero when it prints its statistics, which is before
+     * the QPU prints its own. */
     (void)parsec_atomic_fetch_inc_int64((int64_t*)&device->executed_tasks);
+    for( int i = 0; i < pool.nb; i++ ) {
+        if( &pool.svc[i].device->super != device ) continue;
+        ctr_add(&pool.svc[i].tasks_executed, 1);
+        break;
+    }
     free(item);
 
     /* Past the body: __parsec_task_progress() will not run the hook again,
@@ -1472,6 +1481,7 @@ static void qpu_service_reset(qpu_service_t *s)
     QPU_STORE(&s->tasks_coalesced, 0);
     QPU_STORE(&s->max_job_tasks, 0);
     QPU_STORE(&s->tasks_moved, 0);
+    QPU_STORE(&s->tasks_executed, 0);
 
     s->poll_max_ns = (int64_t)(parsec_qpu_params.poll_max_ms > 0 ? parsec_qpu_params.poll_max_ms : 1000) * 1000000LL;
     value = parsec_qpu_list_option_int(q, "submit_interval", parsec_qpu_params.submit_interval_ms);
@@ -1681,6 +1691,7 @@ static void qpu_stats_add(qpu_service_t *s, parsec_qpu_stats_t *stats)
     value = (uint32_t)ctr_get(&s->max_job_tasks);
     if( value > stats->max_job_tasks ) stats->max_job_tasks = value;
     stats->tasks_moved     += (uint64_t)ctr_get(&s->tasks_moved);
+    stats->tasks_executed  += (uint64_t)ctr_get(&s->tasks_executed);
     stats->nb_qpus++;
     if( QPU_LOAD(&s->down) ) stats->down++;
     if( NULL != QPU_LOAD(&s->backend) ) stats->backend_open = 1;

@@ -243,7 +243,7 @@ static void qpu_module_print_statistics(const parsec_device_qpu_module_t *qpu)
            "    at most %u job(s) outstanding (limit %u); "
            "%"PRIu64" job(s) carried %"PRIu64" task(s) together, at most %u in one (limit %u); ",
            qpu->number, qpu->name_buffer, qpu->owner_rank,
-           (uint64_t)qpu->super.executed_tasks, stats.jobs_submitted,
+           stats.tasks_executed, stats.jobs_submitted,
            stats.jobs_failed, stats.jobs_timed_out, stats.retries, stats.submit_deferred,
            stats.max_in_flight, qpu->max_outstanding,
            stats.jobs_coalesced, stats.tasks_coalesced, stats.max_job_tasks, qpu->max_batch);

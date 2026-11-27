@@ -171,8 +171,8 @@ PARSEC_DECLSPEC int parsec_qpu_service_fini(void);
  *  Tasks wait for the rank, not for a QPU, and some complete without a job
  *  of any QPU. So tasks_submitted, tasks_completed, empty_jobs, the three
  *  counts of tasks that failed, pending and max_pending are counted for the
- *  rank only, and are zero for one QPU; how many tasks a QPU ran is what
- *  parsec_qpu_device_info() says it executed. For the rank, max_in_flight
+ *  rank only, and are zero for one QPU; how many tasks were counted for a
+ *  QPU is tasks_executed. For the rank, max_in_flight
  *  and max_job_tasks are the largest of its QPUs, and the times of the
  *  progress threads are added up. */
 typedef struct parsec_qpu_stats_s {
@@ -217,6 +217,14 @@ typedef struct parsec_qpu_stats_s {
 
     uint64_t tasks_moved;       /**< tasks given back to wait for another QPU because this one
                                  *   took no job for too long */
+    uint64_t tasks_executed;    /**< tasks the service gave back that its QPU's device
+                                 *   counted as executed. A task that ended without a job
+                                 *   (empty, rejected, unavailable) counts for the QPU the
+                                 *   device layer had picked for it, which never ran it.
+                                 *   The device itself (parsec_qpu_device_info()) also
+                                 *   counts bodies that did not return ASYNC and earlier
+                                 *   runs of the service, until the device layer prints
+                                 *   its statistics and starts again */
     uint32_t nb_qpus;           /**< QPUs of this rank; 1 for one QPU */
     uint32_t down;              /**< of them, those that took no job for too long and are
                                  *   left alone for a while */
