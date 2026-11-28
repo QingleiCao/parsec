@@ -10,10 +10,11 @@ ones, across ranks.
 
 There are two backends. The **mock** runs in the process, samples the circuits
 exactly, and models a provider's slots, queue and job times. The **adapter**
-backend is the client of a separate program that runs the jobs; the one
-adapter that exists, `parsec_qpu_adapter_qiskit.py` in this directory, runs
-them on Qiskit Aer, a simulator. No test and no default setting can reach a
-quantum device, and nothing in this tree has code that could.
+backend is the client of a separate program that runs the jobs; the two
+adapters that exist, `parsec_qpu_adapter_qiskit.py` and
+`parsec_qpu_adapter_cudaq.py` in this directory, run them on simulators,
+Qiskit Aer and CUDA-Q's. No test and no default setting can reach a quantum
+device, and nothing in this tree has code that could.
 
 The design, the implementation log of each milestone and the evaluation are in
 [`docs/design/parsec-qpu-qaoa-plan.md`](../../docs/design/parsec-qpu-qaoa-plan.md).
@@ -130,7 +131,9 @@ A run has one QPU by default. `device_qpu_devices` lists several:
 `--mca device_qpu_backend adapter` makes a QPU the client of an **adapter**: a
 program that runs beside the application, takes circuits as OpenQASM 3 and
 gives counts back. The adapter holds everything that belongs to a provider or
-its SDK, so PaRSEC needs none of it.
+its SDK, so PaRSEC needs none of it. `tools/qpu` has two: one on Qiskit, which
+this section starts with, and one on CUDA-Q, further down. What is said of the
+socket, of adapters that go away and of hardware holds for both.
 
 ```bash
 # Once, in a Python environment of your own:
@@ -160,7 +163,7 @@ kill %1
   wanted. Two QPUs may share one adapter; each has its own jobs there.
 - **The address is a Unix-domain socket**, which only the user who started the
   adapter can open, and the client talks only to an adapter that runs as its
-  own user. Put the socket in a directory nobody else can write to: the
+  own user. An adapter does not start on a path where another one listens. Put the socket in a directory nobody else can write to: the
   client connects again by itself to whatever listens at that path. The path
   has to be shorter than 108 bytes. The adapter runs on the node of the rank
   that owns the QPU.
@@ -190,6 +193,63 @@ kill %1
 sampler). The tests with Qiskit Aer are registered only when a Python with the
 three packages is found; `-DPARSEC_QPU_ADAPTER_PYTHON=/path/to/python` names
 it.
+
+### The adapter for CUDA-Q
+
+`tools/qpu/parsec_qpu_adapter_cudaq.py` is an adapter for the same backend and
+the same protocol, which runs the jobs on a simulator of CUDA-Q.
+
+```bash
+# Once, in a Python environment of your own:
+pip install cudaq
+
+# One adapter is one QPU. Here, two QPUs that are two GPUs of the node:
+CUDA_VISIBLE_DEVICES=0 python3 tools/qpu/parsec_qpu_adapter_cudaq.py --socket /tmp/$USER-qpu/g0.sock --target nvidia &
+CUDA_VISIBLE_DEVICES=1 python3 tools/qpu/parsec_qpu_adapter_cudaq.py --socket /tmp/$USER-qpu/g1.sock --target nvidia &
+tests/apps/qaoa/testing_qaoa -c 0 -- --mca device_qpu_enabled 1 \
+    --mca device_qpu_devices "adapter address=/tmp/$USER-qpu/g0.sock|adapter address=/tmp/$USER-qpu/g1.sock"
+kill %1 %2
+```
+
+- **Simulators only.** `--target qpp-cpu`, the default, is CUDA-Q's simulator
+  on the CPU. `--target nvidia` is its simulator on a GPU; CUDA-Q asks for a
+  GPU of compute capability 7.5 or more. The program takes no other target,
+  and says that it drives no quantum device. With the CPU simulator it hides
+  the GPUs of the node from CUDA-Q, which would otherwise start on one.
+- **Threads.** The CPU simulator computes with `--threads` threads; without
+  the option, with `OMP_NUM_THREADS` of the environment, and with one thread
+  when that is not set. CUDA-Q also keeps a thread per core for compiling
+  circuits, which do nothing between two new circuits.
+- **One adapter is one QPU of CUDA-Q, and runs one job at a time.** Several
+  QPUs are several adapters, each with its socket and its entry in
+  `device_qpu_devices`, and for the GPU simulator each with a GPU of its own.
+  `--target nvidia --option mqpu --qpu K` takes QPU K of CUDA-Q's own
+  platform of several QPUs, which has one for each GPU it sees.
+- **A GPU for the adapter is a GPU PaRSEC does not use.** PaRSEC's CUDA device
+  takes 95% of the memory of every GPU it is given (`device_cuda_memory_use`),
+  so the simulator finds none there. Keep the adapters' GPUs out of the
+  application's `CUDA_VISIBLE_DEVICES`, or out of its `device_cuda_mask`.
+- **Results are reproducible**, by the same rule as with the Qiskit adapter:
+  they depend on `--seed` and on the key of an evaluation. They are the counts
+  of neither the mock nor Qiskit Aer.
+- **The circuits are read by the adapter itself**, and only as the backend
+  writes them (`parsec_qpu_qasm_write`): CUDA-Q reads no OpenQASM 3 that has
+  parameters. Another text is refused.
+- **The first job of a circuit pays for compiling it**: about 0.1 s for a
+  circuit of a hundred operations and 2 s for one of two thousand, on top of
+  the job. A circuit that is kept takes about a megabyte, and
+  `--max-prepared` circuits are kept (256 by default); an older one is asked
+  for again, and compiled again, when a job needs it.
+- **An angle that is no finite number** (a coefficient times a parameter value
+  that is too large) fails its job. CUDA-Q itself would end the process.
+
+The tests with CUDA-Q are registered only when a Python with `cudaq` is found;
+`-DPARSEC_QPU_CUDAQ_PYTHON=/path/to/python` names it. They use the CPU
+simulator. The adapter's reader is checked with any `python3`, against the
+texts the test of the component's writer keeps (`ctest -R cudaq:reader`).
+
+The two programs share `parsec_qpu_adapter_protocol.py`, which is the
+protocol's side of an adapter and has to stay beside them.
 
 ### Circuits as OpenQASM 3
 
