@@ -8,9 +8,12 @@ completed, and its successors released, when the job has ended. Its inputs
 are ordinary flows, so quantum tasks sit in the same task graph as classical
 ones, across ranks.
 
-The only backend so far is a **mock**: it runs in the process, samples the
-circuits exactly, and models a provider's slots, queue and job times. No test
-and no default setting can reach a quantum device.
+There are two backends. The **mock** runs in the process, samples the circuits
+exactly, and models a provider's slots, queue and job times. The **adapter**
+backend is the client of a separate program that runs the jobs; the one
+adapter that exists, `parsec_qpu_adapter_qiskit.py` in this directory, runs
+them on Qiskit Aer, a simulator. No test and no default setting can reach a
+quantum device, and nothing in this tree has code that could.
 
 The design, the implementation log of each milestone and the evaluation are in
 [`docs/design/parsec-qpu-qaoa-plan.md`](../../docs/design/parsec-qpu-qaoa-plan.md).
@@ -23,9 +26,10 @@ The API is documented in
 cmake -DPARSEC_DEVICE_WITH_QPU=ON ...
 ```
 
-Off by default. It needs no provider SDK and no Python. With it off, a task
-class that has a QPU body and a CPU body still builds; its QPU body is left
-out.
+Off by default. It needs no provider SDK and no Python: the adapter backend is
+plain C over a socket, and the adapter program is neither built nor installed
+with PaRSEC. With the component off, a task class that has a QPU body and a
+CPU body still builds; its QPU body is left out.
 
 ## Writing a quantum task
 
@@ -91,8 +95,10 @@ A run has one QPU by default. `device_qpu_devices` lists several:
   `submit_interval`, `job_timeout`, `max_retries`, `unavailable_timeout`. They
   default to the parameters of those names. For the mock: `slots`, `delay`,
   `queue_delay`, `job_delay`, `submit_delay`, `max_circuits`, `faults`,
-  `threads`, `max_qubits`, which default to `device_qpu_mock_<key>`. A key the mock does
-  not know is an error, and a list that cannot be read gives no QPU at all.
+  `threads`, `max_qubits`, which default to `device_qpu_mock_<key>`. For the
+  adapter: `address`, `timeout`, which default to `device_qpu_adapter_<key>`.
+  A key the backend of the entry does not know is an error, and a list that
+  cannot be read gives no QPU at all.
 - **Which QPU runs a task.** The QPUs of a rank share the tasks that wait on
   that rank. A task is given to a QPU when that QPU has a place for its job,
   not before: no place stays free while a task that could use it waits, and a
@@ -119,6 +125,118 @@ A run has one QPU by default. `device_qpu_devices` lists several:
 
 `parsec_qpu_device_info(q, &info)` describes QPU `q` from any rank.
 
+## The adapter backend, and Qiskit
+
+`--mca device_qpu_backend adapter` makes a QPU the client of an **adapter**: a
+program that runs beside the application, takes circuits as OpenQASM 3 and
+gives counts back. The adapter holds everything that belongs to a provider or
+its SDK, so PaRSEC needs none of it.
+
+```bash
+# Once, in a Python environment of your own:
+pip install qiskit qiskit-aer qiskit-qasm3-import
+
+# Start the adapter, then the application, on the node of the rank that owns the QPU.
+mkdir -m 700 -p /tmp/$USER-qpu            # a directory nobody else can write to
+python3 tools/qpu/parsec_qpu_adapter_qiskit.py --socket /tmp/$USER-qpu/a.sock &
+mpiexec -n 4 tests/apps/qaoa/testing_qaoa -c 0 -- --mca device_qpu_enabled 1 \
+    --mca device_qpu_backend adapter --mca device_qpu_adapter_address /tmp/$USER-qpu/a.sock
+kill %1
+```
+
+- **What the adapter runs the jobs on.** Qiskit Aer, on the machine it runs
+  on, with no account and no network.
+  - Without `--device`: an ideal simulator.
+  - `--device generic:N[:line|ring|full]`: the circuits are transpiled to the
+    gates and the connectivity of a device model of N qubits, and run with
+    its noise (`--no-noise`: without). The model is Qiskit's
+    `GenericBackendV2`, a made-up device, not an existing one.
+- **Results are reproducible.** What an evaluation gives depends on `--seed`
+  and on the key of the evaluation, as with the mock: not on the order of the
+  jobs, on what shares a job, or on how often a job was tried. They are not
+  the counts of the mock, which samples by its own means.
+- **Several QPUs.** Each entry of `device_qpu_devices` names its adapter:
+  `adapter address=/path/a.sock|adapter address=/path/b.sock`, beside mocks if
+  wanted. Two QPUs may share one adapter; each has its own jobs there.
+- **The address is a Unix-domain socket**, which only the user who started the
+  adapter can open, and the client talks only to an adapter that runs as its
+  own user. Put the socket in a directory nobody else can write to: the
+  client connects again by itself to whatever listens at that path. The path
+  has to be shorter than 108 bytes. The adapter runs on the node of the rank
+  that owns the QPU.
+- **When the adapter goes away.** The client connects again by itself. An
+  adapter that is the same process still has the client's jobs. One that was
+  started again does not: those jobs are reported as failed and the runtime
+  submits them again (`device_qpu_max_retries`). Jobs of an adapter that stays
+  away for `device_qpu_unavailable_timeout` are given up, and the adapter is
+  told to drop them if it comes back.
+- **When the application goes away.** A run that closes its QPUs takes its
+  jobs with it. One that ends without doing so (it crashed) leaves them at
+  the adapter, which drops them `--idle-drop` seconds (600 by default) after
+  the last connection of that client closed.
+- **A call to the adapter can take as long as `device_qpu_adapter_timeout`**
+  when the adapter is there and does not answer; a QPU's thread, and the end
+  of the run, wait that long for it at most.
+- **Hardware.** An adapter says, when a client connects, whether it drives a
+  quantum device. One that does is used only with
+  `--mca device_qpu_allow_hardware 1`, and an adapter that changes its answer
+  during a run is dropped. This adapter always says no.
+- **What crosses the socket**: circuits, parameter values, shot counts, keys
+  and tags, and counts on the way back. The client reads no variable of the
+  environment and no file.
+
+`ctest -R adapter` runs the client against an adapter written for the tests
+(`tests/runtime/qpu/qpu_adapter_loopback`, in C, which answers from the
+sampler). The tests with Qiskit Aer are registered only when a Python with the
+three packages is found; `-DPARSEC_QPU_ADAPTER_PYTHON=/path/to/python` names
+it.
+
+### Circuits as OpenQASM 3
+
+`parsec/mca/device/qpu/device_qpu_qasm.h` writes a circuit as OpenQASM 3 and
+reads one back, without any dependency.
+
+```c
+int64_t n = parsec_qpu_qasm_write(circuit, text, room);          /* length of the text */
+int rc = parsec_qpu_qasm_read(text, length, circuit, room, &info);
+int slot = parsec_qpu_qasm_param_slot(text, length, "gamma");
+```
+
+- **The reader takes what `qiskit.qasm3.dumps` writes** for a circuit of the
+  twelve gates of the circuit format and measurements: build the circuit in
+  Qiskit, write it to a file, and read it into the flow of a quantum task.
+  The k-th `input` of the text is parameter slot k (Qiskit writes its
+  parameters in the order of their names).
+- **What it refuses**, with the line and the reason: any other gate, an angle
+  that is not a number times one parameter, a qubit measured into another
+  bit, more than one register of qubits or of bits, physical qubits, and
+  everything of OpenQASM 3 that is not a gate or a measurement.
+- **rxx, ryy and rzz** are not in OpenQASM 3's standard library. The writer
+  defines the ones a circuit uses. The reader skips gate definitions and takes
+  the three names for what they say.
+
+### The protocol
+
+One line of JSON per message, over a stream socket; every request but `wake`
+has a number, `seq`, and gets one answer with the same number and `"ok"`. A
+64-bit value is a string, `"0x..."`. This is version 1.
+
+| Request | Fields | Answer |
+|---|---|---|
+| `hello` | `protocol`, `session`: a name the client makes up, under which the adapter keeps its jobs | `protocol`, `backend`, `qubits`, `max_shots`, `max_jobs`, `max_circuits`, `physical`, `resumed`: the adapter knew the session |
+| `prepare` | `circuit`: a name the client derives from the circuit; `qasm` | none. The adapter transpiles once and keeps the result |
+| `submit` | `tag`; `entries`: for each circuit of the job `circuit`, `params`, `shots`, `key`, `attempt` | `job`. Asked again with a tag it has, the adapter answers with that job |
+| `wait` | `timeout_ms`, `max` | `jobs`: those that ended and were not told yet, each `job` and `state` (`done`, `failed`, `cancelled`). Answered when there is one, when the time is up, or at `wake` |
+| `wake` | none, and no `seq` | none of its own: the `wait` that is held is answered |
+| `results` | `job` | `entries`: for each circuit `counts`, a list of `[bitstring, count]`, and `since_start_ns`, `since_end_ns`. The adapter forgets the job |
+| `cancel` | `job` | none. The adapter forgets the job, in any state |
+| `abandon` | `tag` | `found`, and `job` when there was one under that tag, which is cancelled |
+| `bye` | none | none. The adapter drops the session and what it holds |
+
+A refusal is `"ok": false` with `error` and `why`. Three errors mean something
+to the client: `busy` (ask again later), `unknown_circuit` (prepare it again)
+and `unknown_job`; any other refuses the request for good.
+
 ## Parameters
 
 All are MCA parameters (`--mca device_qpu_<name> <value>`, or
@@ -128,7 +246,7 @@ All are MCA parameters (`--mca device_qpu_<name> <value>`, or
 |---|---|---|
 | `enabled` | 0 | QPUs in the next context; with `devices`, it only has to be set |
 | `devices` | | The QPUs, when they are not all alike: see "Several QPUs" |
-| `backend` | `mock` | The backend of the QPUs that `devices` does not describe |
+| `backend` | `mock` | The backend of the QPUs that `devices` does not describe: `mock` or `adapter` |
 | `allow_hardware` | 0 | Let a backend that drives a quantum device open |
 | `owner_rank` | 0 | The rank of the QPUs for which `devices` names none (-1: the last) |
 | `max_outstanding` | 8 | Jobs at the backend of one QPU at once; the others wait, by task priority then arrival |
@@ -156,6 +274,13 @@ The mock:
 | `mock_faults` | `none` | Faults to inject: `<fault>:<rule>=<value>,...` with fault one of `fail hang unavailable lost reject noresult duplicate late cancelled`, rule one of `p first every key for` |
 | `mock_threads` | 2 | Helper threads that sample the circuits |
 | `mock_max_qubits` | 24 | Widest circuit it takes (at most 30; 2^(n+4) bytes per helper) |
+
+The adapter backend:
+
+| Parameter | Default | What it does |
+|---|---|---|
+| `adapter_address` | | Path of the Unix-domain socket the adapter listens on; a QPU of `devices` may name its own with `address=` |
+| `adapter_timeout` | 60000 | Milliseconds the client waits for the answer to one request before it takes the adapter for out of reach and connects again (`timeout=` in `devices`) |
 
 `device_show_statistics 1` prints one line per QPU (tasks, jobs, failures,
 retries, the most jobs outstanding, the jobs that carried several tasks, and
