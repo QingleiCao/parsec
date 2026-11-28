@@ -7,7 +7,7 @@
 /**
  * What an adapter keeps for a client whose connection is gone, asked by a
  * client that speaks the protocol itself: neither the adapter backend nor
- * the runtime is used, and no job is submitted. The adapter runs already
+ * the runtime is used. The adapter runs already
  * (tools/qpu/parsec_qpu_adapter_qiskit.py, started with --idle-drop).
  *
  * A session is what one client has at the adapter: its jobs, and the ends
@@ -23,6 +23,13 @@
  *   - A session nobody uses is still there for a client that comes back
  *     within the time the adapter was told, is dropped after that time, and
  *     is then a new one to whoever asks for it.
+ *
+ * And one job, said in the protocol, for what the adapter backend never
+ * asks an adapter that works: a submission whose tag the adapter has is
+ * answered with the job it has, and no second one; the results of a job are
+ * given once; a key that is not 64 bits as the protocol writes them is
+ * refused; and a request that comes while a wait is held gets its answer
+ * after the wait got its own.
  *
  * Options:
  *   -a PATH      the socket of the adapter (required)
@@ -65,17 +72,18 @@ static void pause_for(double seconds)
     while( (0 != nanosleep(&ts, &ts)) ) { /* interrupted: the rest */ }
 }
 
-/* One request and its answer, which stays in `line`. Returns 0 when the
- * answer came, has the number of the request and says ok. */
-static int call(int fd, const char *fields, char *line, size_t room, parsec_qpu_json_t *reply)
+/* One request and its answer, which stays in `line`. Returns 0 when an
+ * answer came that has the number of the request; *ok is whether it says ok. */
+static int ask(int fd, const char *fields, char *line, size_t room, parsec_qpu_json_t *reply, int *ok)
 {
-    char request[256];
+    char request[512];
     parsec_qpu_json_t member;
     const int number = next_seq++;
     const int length = snprintf(request, sizeof(request), "{\"seq\":%d,%s}\n", number, fields);
     int64_t seq = -1;
     size_t len = 0;
-    int ok = 0;
+
+    *ok = 0;
 
     if( (fd < 0) || (length >= (int)sizeof(request)) ) return -1;
     if( (ssize_t)length != send(fd, request, (size_t)length, MSG_NOSIGNAL) ) return -1;
@@ -91,8 +99,42 @@ static int call(int fd, const char *fields, char *line, size_t room, parsec_qpu_
         (PARSEC_SUCCESS != parsec_qpu_json_member(reply, "seq", &member)) ||
         (PARSEC_SUCCESS != parsec_qpu_json_int(&member, &seq)) || (seq != number) ||
         (PARSEC_SUCCESS != parsec_qpu_json_member(reply, "ok", &member)) ||
-        (PARSEC_SUCCESS != parsec_qpu_json_bool(&member, &ok)) || !ok ) return -1;
+        (PARSEC_SUCCESS != parsec_qpu_json_bool(&member, ok)) ) return -1;
     return 0;
+}
+
+/* The next line a connection sends, within five seconds, parsed: its number, and whether it says ok. 0 when one came. */
+static int next_answer(int fd, char *line, size_t room, int64_t *seq, int *ok)
+{
+    parsec_qpu_json_t reply, member;
+    size_t len = 0;
+
+    *seq = -1; *ok = 0;
+    for(;;) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        if( (len >= room - 1) || (poll(&pfd, 1, 5000) <= 0) || (1 != recv(fd, line + len, 1, 0)) ) return -1;
+        if( '\n' == line[len++] ) break;
+    }
+    if( (PARSEC_SUCCESS != parsec_qpu_json_parse(line, len, &reply)) ||
+        (PARSEC_SUCCESS != parsec_qpu_json_member(&reply, "seq", &member)) || (PARSEC_SUCCESS != parsec_qpu_json_int(&member, seq)) ||
+        (PARSEC_SUCCESS != parsec_qpu_json_member(&reply, "ok", &member)) || (PARSEC_SUCCESS != parsec_qpu_json_bool(&member, ok)) ) return -1;
+    return 0;
+}
+
+/* The same, for a request that has to be taken: 0 when the answer says ok. */
+static int call(int fd, const char *fields, char *line, size_t room, parsec_qpu_json_t *reply)
+{
+    int ok = 0;
+    return ((0 == ask(fd, fields, line, room, reply, &ok)) && ok) ? 0 : -1;
+}
+
+/* The job an answer names, as the adapter wrote it; an empty string when it names none. */
+static void job_of(const parsec_qpu_json_t *reply, char name[40])
+{
+    parsec_qpu_json_t member;
+    name[0] = '\0';
+    if( (PARSEC_SUCCESS != parsec_qpu_json_member(reply, "job", &member)) ||
+        (parsec_qpu_json_string(&member, name, 40) <= 0) ) name[0] = '\0';
 }
 
 /* A new connection that says hello for a session. Returns the connection,
@@ -184,6 +226,88 @@ int main(int argc, char *argv[])
     EXPECT(0 == call(d, "\"op\":\"bye\"", line, sizeof(line), &reply), "no answer to bye");
     if( d >= 0 ) close(d);
     EXPECT(0 == (n = sessions()), "after bye the adapter still has %ld session(s)", n);
+
+    /* ---- A job, said in the protocol. One qubit, flipped and measured, as
+     *      PaRSEC writes it: ten shots, and every one reads 1. ---- */
+    {
+        static const char *prepare = "\"op\":\"prepare\",\"circuit\":\"qpu_adapter_sessions\",\"qasm\":\"OPENQASM 3.0;\\n"
+                                     "include \\\"stdgates.inc\\\";\\nqubit[1] q;\\nbit[1] c;\\nx q[0];\\nc[0] = measure q[0];\\n\"";
+        static const char *submit = "\"op\":\"submit\",\"tag\":\"0x7a61\",\"entries\":[{\"circuit\":\"qpu_adapter_sessions\","
+                                    "\"params\":[],\"shots\":10,\"key\":\"0x1\",\"attempt\":1}]";
+        char big[4096], first[40], again[40], told[40], fields[128], bits[40];
+        parsec_qpu_json_t member, element, entry, pair;
+        const int e = hello(name, &resumed);
+        int64_t count = -1;
+        int ok = 0, ended = 0, others = 0;
+
+        EXPECT(e >= 0, "no answer to hello for the session of the job");
+        EXPECT(0 == call(e, prepare, big, sizeof(big), &reply), "a circuit as PaRSEC writes one was not taken");
+        EXPECT(0 == call(e, submit, big, sizeof(big), &reply), "a job of that circuit was not taken");
+        job_of(&reply, first);
+        EXPECT('\0' != first[0], "the answer to a submission names no job");
+        /* The same submission again, as a client does whose answer was lost. */
+        EXPECT(0 == call(e, submit, big, sizeof(big), &reply), "a submission was not taken when it was asked again");
+        job_of(&reply, again);
+        EXPECT(0 == strcmp(first, again), "a submission asked again got job %s, and the first time %s", again, first);
+        /* One job ends, and no other. */
+        give_up = parsec_qpu_now_ns() + (int64_t)60e9;
+        while( (0 == ended) && (parsec_qpu_now_ns() < give_up) &&
+               (0 == call(e, "\"op\":\"wait\",\"timeout_ms\":2000,\"max\":8", big, sizeof(big), &reply)) &&
+               (PARSEC_SUCCESS == parsec_qpu_json_member(&reply, "jobs", &member)) ) {
+            element.at = NULL;
+            while( 1 == parsec_qpu_json_next(&member, &element) ) {
+                parsec_qpu_json_t state;
+                job_of(&element, told);
+                if( (0 == strcmp(told, first)) && (PARSEC_SUCCESS == parsec_qpu_json_member(&element, "state", &state)) &&
+                    parsec_qpu_json_is(&state, "done") ) ended++;
+                else others++;
+            }
+        }
+        EXPECT((1 == ended) && (0 == others), "one job was submitted, twice: %d ended well under its name, and %d other(s) were told", ended, others);
+        /* Its results, once. */
+        snprintf(fields, sizeof(fields), "\"op\":\"results\",\"job\":\"%s\"", first);
+        bits[0] = '\0';
+        if( (0 == call(e, fields, big, sizeof(big), &reply)) && (PARSEC_SUCCESS == parsec_qpu_json_member(&reply, "entries", &member)) ) {
+            element.at = NULL;
+            if( (1 == parsec_qpu_json_next(&member, &element)) && (PARSEC_SUCCESS == parsec_qpu_json_member(&element, "counts", &entry)) ) {
+                pair.at = NULL;
+                if( 1 == parsec_qpu_json_next(&entry, &pair) ) {
+                    parsec_qpu_json_t item;
+                    item.at = NULL;
+                    if( 1 == parsec_qpu_json_next(&pair, &item) ) (void)parsec_qpu_json_string(&item, bits, sizeof(bits));
+                    if( 1 == parsec_qpu_json_next(&pair, &item) ) (void)parsec_qpu_json_int(&item, &count);
+                }
+            }
+        }
+        EXPECT((0 == strcmp(bits, "0x1")) && (10 == count), "ten shots of a qubit that was flipped: outcome '%s', %lld time(s)", bits, (long long)count);
+        EXPECT((0 == ask(e, fields, big, sizeof(big), &reply, &ok)) && !ok, "the results of a job were given a second time");
+        /* A key is "0x" and up to sixteen hexadecimal digits: a number written another way is no key. */
+        EXPECT((0 == ask(e, "\"op\":\"submit\",\"tag\":\"0x7a62\",\"entries\":[{\"circuit\":\"qpu_adapter_sessions\","
+                            "\"params\":[],\"shots\":10,\"key\":\"123\",\"attempt\":1}]", big, sizeof(big), &reply, &ok)) && !ok,
+               "a job whose key is written without 0x was taken");
+        EXPECT((0 == ask(e, "\"op\":\"submit\",\"tag\":\"0x7a63\",\"entries\":[{\"circuit\":\"qpu_adapter_sessions\","
+                            "\"params\":[],\"shots\":10,\"key\":\"0x10000000000000000\",\"attempt\":1}]", big, sizeof(big), &reply, &ok)) && !ok,
+               "a job whose key has more than 64 bits was taken");
+        /* A wait that would be held for twenty seconds, and a request behind it:
+         * both are answered at once, the wait first and well, the other refused. */
+        {
+            const int held = next_seq++, behind = next_seq++;
+            char two[160];
+            int64_t seq_a = -1, seq_b = -1;
+            int ok_a = 0, ok_b = 0;
+            const int length = snprintf(two, sizeof(two), "{\"seq\":%d,\"op\":\"wait\",\"timeout_ms\":20000,\"max\":1}\n{\"seq\":%d,\"op\":\"stats\"}\n",
+                                        held, behind);
+            EXPECT((ssize_t)length == send(e, two, (size_t)length, MSG_NOSIGNAL), "two requests could not be sent");
+            EXPECT((0 == next_answer(e, big, sizeof(big), &seq_a, &ok_a)) && (held == seq_a) && ok_a,
+                   "a wait with a request behind it: the first answer is to request %lld and says ok %d; expected the wait's, %d, and ok",
+                   (long long)seq_a, ok_a, held);
+            EXPECT((0 == next_answer(e, big, sizeof(big), &seq_b, &ok_b)) && (behind == seq_b) && !ok_b,
+                   "the request behind a wait: the second answer is to request %lld and says ok %d; expected %d, refused",
+                   (long long)seq_b, ok_b, behind);
+        }
+        EXPECT(0 == call(e, "\"op\":\"bye\"", big, sizeof(big), &reply), "no answer to bye after the job");
+        if( e >= 0 ) close(e);
+    }
 
     if( nb_errors ) {
         fprintf(stderr, "qpu_adapter_sessions: %d error(s)\n", nb_errors);

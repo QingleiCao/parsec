@@ -21,6 +21,14 @@
  *   - Sizes: a text read for its size only, a buffer that is too small.
  *
  * Every random number comes from a fixed seed.
+ *
+ * With -o DIR the texts are kept as well, for a reader that is not this one
+ * (the adapter of tools/qpu for CUDA-Q has one, in Python): cNNN.qasm is a
+ * text the writer wrote and cNNN.ops the circuit it stands for; rNNN.qasm is
+ * a text the reader here refuses; and oNNN.qasm is a text the reader here
+ * takes that the writer does not write for its circuit, which a reader of
+ * the writer's texts alone has to refuse. The directory is made if it is not
+ * there, and what an earlier run kept in it is removed.
  */
 
 #include "parsec/parsec_config.h"
@@ -28,13 +36,19 @@
 #include "parsec/mca/device/qpu/device_qpu_internal.h"
 #include "parsec/mca/device/qpu/device_qpu_qasm.h"
 
+#include <dirent.h>
+#include <errno.h>
 #include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static int nb_errors = 0;
+static const char *keep_dir = NULL;     /* -o: where the texts are kept */
+static int nb_kept = 0, nb_kept_refused = 0, nb_kept_other = 0;
 
 #define EXPECT(COND, ...)                                                   \
     do {                                                                    \
@@ -68,6 +82,8 @@ static char *write_text(const parsec_qpu_circuit_t *circuit, size_t *length)
     return text;
 }
 
+static void keep_text_as(const char *text, const parsec_qpu_circuit_t *circuit, char kind);
+
 /* Read a text into memory of the right size; NULL when it is refused. */
 static parsec_qpu_circuit_t *read_text(const char *text, parsec_qpu_qasm_info_t *info)
 {
@@ -78,6 +94,12 @@ static parsec_qpu_circuit_t *read_text(const char *text, parsec_qpu_qasm_info_t 
     if( PARSEC_SUCCESS != parsec_qpu_qasm_read(text, strlen(text), NULL, 0, info) ) return NULL;
     circuit = (parsec_qpu_circuit_t*)calloc(1, info->size);
     if( PARSEC_SUCCESS != parsec_qpu_qasm_read(text, strlen(text), circuit, info->size, info) ) { free(circuit); return NULL; }
+    if( NULL != keep_dir ) {
+        /* -o: a text that was read, and is not what the writer writes for the circuit it gave. */
+        char *written = write_text(circuit, NULL);
+        if( (NULL != written) && (0 != strcmp(written, text)) ) keep_text_as(text, NULL, 'o');
+        free(written);
+    }
     return circuit;
 }
 
@@ -85,6 +107,61 @@ static int same_circuit(const parsec_qpu_circuit_t *a, const parsec_qpu_circuit_
 {
     return (parsec_qpu_circuit_size(a) == parsec_qpu_circuit_size(b)) &&
            (0 == memcmp(a, b, parsec_qpu_circuit_size(a)));
+}
+
+/* -o: a text, and for one the writer wrote, the circuit it stands for: a line
+ * with the qubits, the inputs and the operations, then a line per operation
+ * with the opcode, the two qubits, the parameter slot and the angle by its bits. */
+static void keep_text_as(const char *text, const parsec_qpu_circuit_t *circuit, char kind)
+{
+    char path[1024];
+    FILE *f;
+
+    if( NULL == keep_dir ) return;
+    snprintf(path, sizeof(path), "%s/%c%03d.qasm", keep_dir, kind,
+             ('c' == kind) ? nb_kept : ('r' == kind) ? nb_kept_refused : nb_kept_other);
+    f = fopen(path, "wb");
+    EXPECT(NULL != f, "cannot write %s", path);
+    if( NULL == f ) return;
+    fwrite(text, 1, strlen(text), f);
+    fclose(f);
+    if( 'r' == kind ) { nb_kept_refused++; return; }
+    if( 'o' == kind ) { nb_kept_other++; return; }
+    snprintf(path, sizeof(path), "%s/c%03d.ops", keep_dir, nb_kept++);
+    f = fopen(path, "w");
+    EXPECT(NULL != f, "cannot write %s", path);
+    if( NULL == f ) return;
+    fprintf(f, "%u %u %u\n", circuit->nb_qubits, circuit->nb_params, circuit->nb_ops);
+    for( uint32_t i = 0; i < circuit->nb_ops; i++ ) {
+        const parsec_qpu_op_t *op = &parsec_qpu_circuit_ops(circuit)[i];
+        fprintf(f, "%d %d %d %d %a\n", (int)op->opcode, (int)op->q0, (int)op->q1,
+                (PARSEC_QPU_NO_PARAM == op->param) ? -1 : (int)op->param, op->angle);
+    }
+    fclose(f);
+}
+
+static void keep_text(const char *text, const parsec_qpu_circuit_t *circuit)
+{
+    keep_text_as(text, circuit, (NULL != circuit) ? 'c' : 'r');
+}
+
+/* -o: the texts of an earlier run, which may be of an earlier version of this test, are not kept. */
+static void forget_kept_texts(void)
+{
+    DIR *dir = opendir(keep_dir);
+    struct dirent *entry;
+    char path[1024];
+
+    if( NULL == dir ) return;
+    while( NULL != (entry = readdir(dir)) ) {
+        const size_t n = strlen(entry->d_name);
+        const int ours = (NULL != strchr("cro", entry->d_name[0])) &&
+                         (((n > 5) && (0 == strcmp(entry->d_name + n - 5, ".qasm"))) || ((n > 4) && (0 == strcmp(entry->d_name + n - 4, ".ops"))));
+        if( !ours ) continue;
+        snprintf(path, sizeof(path), "%s/%s", keep_dir, entry->d_name);
+        (void)unlink(path);
+    }
+    closedir(dir);
 }
 
 /* Written, read back: the same bytes. */
@@ -99,6 +176,7 @@ static void round_trip(const parsec_qpu_circuit_t *circuit, const char *what)
     back = read_text(text, &info);
     EXPECT(NULL != back, "%s: what was written is not read back: line %d, %s\n%s", what, info.line, info.why, text);
     if( NULL != back ) {
+        keep_text(text, back);
         EXPECT(same_circuit(circuit, back), "%s: what is read back is not what was written\n%s", what, text);
         EXPECT((info.nb_ops == circuit->nb_ops) && (info.nb_qubits == circuit->nb_qubits) &&
                (info.nb_params == circuit->nb_params) && (info.size == parsec_qpu_circuit_size(circuit)),
@@ -608,6 +686,7 @@ static void expect_refused(const char *text, int line, const char *word)
 
     EXPECT(PARSEC_ERR_BAD_PARAM == rc, "this text was not refused (%d):\n%s", rc, text);
     if( PARSEC_ERR_BAD_PARAM != rc ) return;
+    keep_text(text, NULL);
     EXPECT(line == info.line, "refused on line %d, expected line %d (%s):\n%s", info.line, line, info.why, text);
     EXPECT(NULL != strstr(info.why, word), "refused for \"%s\", expected a reason with \"%s\":\n%s", info.why, word, text);
     EXPECT(0 == info.size, "a refused text has a size, %zu", info.size);
@@ -649,6 +728,8 @@ static void test_refusals(void)
     expect_refused(HEAD "c[0] = measure q[0]; cx q[1], q[0];", 2, "follows the measurement");
     expect_refused(HEAD "c[0] = measure q[0]; measure q[0] -> c[0];", 2, "follows the measurement");
     expect_refused(HEAD "h q[0];\n", 3, "measures nothing");
+    /* The same in every word as the writer would write it, were such a circuit one. */
+    expect_refused("OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[2] q;\nbit[2] c;\nx q[0];\nh q[1];\n", 7, "measures nothing");
     expect_refused("OPENQASM 3; qubit[2] q; bit[3] c; c = measure q;", 1, "of another size");
     expect_refused("OPENQASM 3; qubit[2] q; c[0] = measure q[0];", 1, "'c' is not in the part");
     expect_refused("OPENQASM 3; qubit[2] q; measure q[0] -> c[0];", 1, "before the register of bits");
@@ -705,6 +786,84 @@ static void test_other_forms(void)
            (0x2 == parsec_qpu_circuit_measured(circuit)), "more bits than qubits: %s", info.why);
     free(circuit);
     free(bell);
+
+    /* What the writer writes, with one thing spelt another way: a number
+     * with a digit more, with an exponent, without its point, with fewer
+     * digits than the writer gives it; a definition that is not used. Each
+     * is the same circuit to the reader. (And each is kept with -o: a reader
+     * of the writer's texts alone, which could take them for what they look
+     * like, has to refuse them.) */
+    {
+        static const char *spelt[][2] = {
+            { "(0.5)", "(0.50)" }, { "(0.5)", "(5e-1)" }, { "(2.0 * p0)", "(2 * p0)" }, { "(0.10000000000000001)", "(0.1)" },
+            { "qubit[2] q;", "gate rzz(theta) a, b { cx a, b; rz(theta) b; cx a, b; }\nqubit[2] q;" }
+        };
+        parsec_qpu_circuit_t *c = circuit_new(2, 1, 6), *back;
+        char *text, other[1024];
+
+        add_op(c, ROOM(6), PARSEC_QPU_OP_RX, 0, 0, PARSEC_QPU_NO_PARAM, 0.5);
+        add_op(c, ROOM(6), PARSEC_QPU_OP_RY, 1, 0, 0, 2.0);
+        add_op(c, ROOM(6), PARSEC_QPU_OP_RZ, 0, 0, PARSEC_QPU_NO_PARAM, 0.1);
+        add_op(c, ROOM(6), PARSEC_QPU_OP_CX, 0, 1, PARSEC_QPU_NO_PARAM, 0.0);
+        parsec_qpu_circuit_measure_all(c, ROOM(6));
+        text = write_text(c, NULL);
+        EXPECT(NULL != text, "the circuit of the spellings could not be written");
+        for( size_t i = 0; (NULL != text) && (i < sizeof(spelt) / sizeof(spelt[0])); i++ ) {
+            const char *at = strstr(text, spelt[i][0]);
+            EXPECT((NULL != at) && (NULL == strstr(at + 1, spelt[i][0])), "the writer did not write '%s' once:\n%s", spelt[i][0], text);
+            if( NULL == at ) continue;
+            snprintf(other, sizeof(other), "%.*s%s%s", (int)(at - text), text, spelt[i][1], at + strlen(spelt[i][0]));
+            back = read_text(other, &info);
+            EXPECT((NULL != back) && same_circuit(c, back), "'%s' written as '%s' is not the same circuit: %s", spelt[i][0], spelt[i][1], info.why);
+            free(back);
+        }
+        free(text);
+        free(c);
+    }
+
+    /* The writer's text again, with one thing wrong: each is no circuit, and
+     * is refused, or is another text for the same circuit, and is taken.
+     * (Kept with -o as well. A reader of the writer's texts alone has to
+     * refuse every one of them, and nothing but the one thing is in its way:
+     * the rest of the text is as the writer writes it.) */
+    {
+        static const struct { const char *from, *to; int refused; } wrong[] = {
+            { "rx(0.5) q[0];", "rx(0.5) q[2];", 1 },                                /* a qubit the circuit does not have */
+            { "cx q[0], q[1];", "cx q[1], q[1];", 1 },                              /* one qubit twice */
+            { "(2.0 * p0)", "(2.0 * p1)", 1 },                                      /* an input that is not declared */
+            { "c[1] = measure q[1];", "c[0] = measure q[1];", 1 },                  /* a qubit measured into another bit */
+            { "c[0] = measure q[0];\n", "c[0] = measure q[0];\nx q[0];\n", 1 },    /* an operation after the measurement of its qubit */
+            { "rx(0.5)", "rx(1e999)", 1 },                                          /* an angle that is no finite number */
+            { "qubit[2] q;\nbit[2] c;", "qubit[65] q;\nbit[65] c;", 1 },           /* more qubits than a circuit has */
+            { "gate rzz(theta) a, b { cx a, b; rz(theta) b; cx a, b; }\n", "", 0 }, /* rzz without its definition: the name says it */
+            { "rz(theta) b; cx a, b; }", "rz(theta) a; cx a, b; }", 0 }             /* another definition: the reader skips it */
+        };
+        parsec_qpu_circuit_t *c = circuit_new(2, 1, 6), *back;
+        char *text, other[1024];
+
+        add_op(c, ROOM(6), PARSEC_QPU_OP_RX, 0, 0, PARSEC_QPU_NO_PARAM, 0.5);
+        add_op(c, ROOM(6), PARSEC_QPU_OP_RZZ, 0, 1, 0, 2.0);
+        add_op(c, ROOM(6), PARSEC_QPU_OP_CX, 0, 1, PARSEC_QPU_NO_PARAM, 0.0);
+        parsec_qpu_circuit_measure_all(c, ROOM(6));
+        text = write_text(c, NULL);
+        EXPECT(NULL != text, "the circuit of the texts with one thing wrong could not be written");
+        for( size_t i = 0; (NULL != text) && (i < sizeof(wrong) / sizeof(wrong[0])); i++ ) {
+            const char *at = strstr(text, wrong[i].from);
+            EXPECT((NULL != at) && (NULL == strstr(at + 1, wrong[i].from)), "the writer did not write '%s' once:\n%s", wrong[i].from, text);
+            if( NULL == at ) continue;
+            snprintf(other, sizeof(other), "%.*s%s%s", (int)(at - text), text, wrong[i].to, at + strlen(wrong[i].from));
+            back = read_text(other, &info);
+            if( wrong[i].refused ) {
+                EXPECT(NULL == back, "'%s' in place of '%s' was read", wrong[i].to, wrong[i].from);
+                if( NULL == back ) keep_text(other, NULL);
+            } else {
+                EXPECT((NULL != back) && same_circuit(c, back), "'%s' in place of '%s' is not the same circuit: %s", wrong[i].to, wrong[i].from, info.why);
+            }
+            free(back);
+        }
+        free(text);
+        free(c);
+    }
 }
 
 static void test_sizes(void)
@@ -732,7 +891,17 @@ static void test_sizes(void)
 
 int main(int argc, char *argv[])
 {
-    (void)argc; (void)argv;
+    if( (3 == argc) && (0 == strcmp(argv[1], "-o")) ) {
+        keep_dir = argv[2];
+        if( (0 != mkdir(keep_dir, 0777)) && (EEXIST != errno) ) {
+            fprintf(stderr, "%s: cannot make the directory %s\n", argv[0], keep_dir);
+            return 2;
+        }
+        forget_kept_texts();
+    } else if( 1 != argc ) {
+        fprintf(stderr, "usage: %s [-o <directory to keep the texts in>]\n", argv[0]);
+        return 2;
+    }
     test_written_text();
     test_round_trips();
     test_definitions();
@@ -745,6 +914,8 @@ int main(int argc, char *argv[])
         fprintf(stderr, "qpu_qasm_test: %d error(s)\n", nb_errors);
         return 1;
     }
+    if( NULL != keep_dir ) printf("qpu_qasm_test: %d texts and their circuits, %d refused texts and %d texts of other forms are in %s\n",
+                                  nb_kept, nb_kept_refused, nb_kept_other, keep_dir);
     printf("qpu_qasm_test: passed\n");
     return 0;
 }

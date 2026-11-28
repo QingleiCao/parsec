@@ -105,7 +105,10 @@ if(PARSEC_HAVE_QPU)
   qpu_addtest(runtime/qpu/sampler ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_sampler_test)
   qpu_addtest(runtime/qpu/mock ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_mock_test)
   # Circuits as OpenQASM 3 text: written and read back, and read as Qiskit writes them.
-  qpu_addtest(runtime/qpu/qasm ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_qasm_test)
+  # The texts are kept (-o) for a reader that is not the component's: the
+  # adapter of tools/qpu for CUDA-Q has one, checked against them below.
+  qpu_addtest(runtime/qpu/qasm ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_qasm_test -o runtime/qpu/qasm_texts)
+  set_tests_properties(runtime/qpu/qasm PROPERTIES FIXTURES_SETUP qpu_qasm_texts)
 
   # Submission, asynchronous completion, dependency release. Every fifth job
   # is empty.
@@ -610,12 +613,112 @@ if(PARSEC_HAVE_QPU)
     # seconds after the last one left, and no longer. No job is submitted.
     qpu_addtest(runtime/qpu/adapter:aer:sessions ${SHM_TEST_CMD_LIST} ${_qpu_aer} --idle-drop 2
                 -- runtime/qpu/qpu_adapter_sessions -a runtime/qpu/a_aer.sock -i 2)
-    # The four share a socket, and a Python that starts takes a few seconds: one at a time.
+    # What the counts follow: three adapters, two started alike and one with
+    # another seed. An evaluation gives the same counts at the two, in two
+    # processes, and other counts at the third.
+    qpu_addtest(runtime/qpu/adapter:aer:seed ${SHM_TEST_CMD_LIST} ${_qpu_aer}
+                -- runtime/qpu/qpu_adapter_run -w 180 -s runtime/qpu/a_aer_b.sock
+                "${_qpu_python}" ${PROJECT_SOURCE_DIR}/tools/qpu/parsec_qpu_adapter_qiskit.py --socket runtime/qpu/a_aer_b.sock --backend aer
+                -- runtime/qpu/qpu_adapter_run -w 180 -s runtime/qpu/a_aer_c.sock
+                "${_qpu_python}" ${PROJECT_SOURCE_DIR}/tools/qpu/parsec_qpu_adapter_qiskit.py --socket runtime/qpu/a_aer_c.sock --backend aer --seed 2
+                -- runtime/qpu/qpu_adapter_stat -a runtime/qpu/a_aer.sock -b runtime/qpu/a_aer_b.sock -B runtime/qpu/a_aer_c.sock)
+    # The five share a socket, and a Python that starts takes a few seconds: one at a time.
     set_tests_properties(runtime/qpu/adapter:aer runtime/qpu/adapter:aer:device runtime/qpu/adapter:aer:noise
-                         runtime/qpu/adapter:aer:sessions
+                         runtime/qpu/adapter:aer:sessions runtime/qpu/adapter:aer:seed
                          PROPERTIES RESOURCE_LOCK qpu_aer_socket TIMEOUT 600)
   else()
     message(STATUS "QPU adapter: no Python with qiskit, qiskit-aer and qiskit-qasm3-import; the optional tests with Qiskit Aer are not registered (PARSEC_QPU_ADAPTER_PYTHON)")
+  endif()
+
+  # ---- Optional: the adapter of tools/qpu for CUDA-Q, with its CPU simulator ----
+  #
+  # PARSEC_QPU_CUDAQ_PYTHON names a Python that has cudaq; without it, python3
+  # of the path is tried. Nothing is built with it, and no other test needs it.
+  # The adapter is started with --target qpp-cpu, the simulator of CUDA-Q that
+  # runs on the CPU: on this machine, with no network and no quantum device.
+  # It takes that target and the GPU simulator, and no other
+  # (no_hardware_in_tests reads these lines too).
+  set(PARSEC_QPU_CUDAQ_PYTHON "" CACHE FILEPATH
+      "Python interpreter with cudaq, for the optional tests of the QPU adapter with CUDA-Q")
+  set(_qpu_cudaq_python "${PARSEC_QPU_CUDAQ_PYTHON}")
+  if(NOT _qpu_cudaq_python)
+    find_program(PARSEC_QPU_ADAPTER_PYTHON3 NAMES python3)
+    mark_as_advanced(PARSEC_QPU_ADAPTER_PYTHON3)
+    set(_qpu_cudaq_python "${PARSEC_QPU_ADAPTER_PYTHON3}")
+  endif()
+  set(PARSEC_QPU_HAVE_CUDAQ_ADAPTER FALSE)
+  if(_qpu_cudaq_python)
+    execute_process(COMMAND "${_qpu_cudaq_python}" -c "import sys; sys.exit(0 if sys.version_info >= (3, 6) else 1)"
+                    RESULT_VARIABLE _qpu_python_rc OUTPUT_QUIET ERROR_QUIET)
+    if(NOT _qpu_python_rc EQUAL 0)
+      set(_qpu_cudaq_python "")       # not a Python that can run the adapter: nothing below is registered
+    endif()
+  endif()
+  if(_qpu_cudaq_python)
+    # The adapter reads the circuits itself, in Python, and its reader needs
+    # no CUDA-Q: so it is checked with any Python, against every text the
+    # test of the component's writer wrote (runtime/qpu/qasm, which runs
+    # first). Each has to be read as the circuit that was written, and the
+    # texts the component's reader refuses have to be refused.
+    qpu_addtest(runtime/qpu/adapter:cudaq:reader ${SHM_TEST_CMD_LIST}
+                "${_qpu_cudaq_python}" ${PROJECT_SOURCE_DIR}/tools/qpu/parsec_qpu_adapter_cudaq.py --check-reader runtime/qpu/qasm_texts)
+    set_tests_properties(runtime/qpu/adapter:cudaq:reader PROPERTIES FIXTURES_REQUIRED qpu_qasm_texts)
+    # The targets the adapter takes are its two simulators, and no third: its
+    # own help says which. (A test that gave it another target to see it
+    # refused would be a test definition that names one.)
+    qpu_addtest(runtime/qpu/adapter:cudaq:targets ${SHM_TEST_CMD_LIST}
+                "${_qpu_cudaq_python}" ${PROJECT_SOURCE_DIR}/tools/qpu/parsec_qpu_adapter_cudaq.py --help)
+    set_tests_properties(runtime/qpu/adapter:cudaq:targets PROPERTIES PASS_REGULAR_EXPRESSION "{nvidia,qpp-cpu}")
+    # Two things it says before it loads or starts anything. An option written
+    # short is no option: what reads these definitions for their targets reads
+    # the whole word. And a target takes the options its table has, no other.
+    qpu_addtest(runtime/qpu/adapter:cudaq:short_option ${SHM_TEST_CMD_LIST}
+                "${_qpu_cudaq_python}" ${PROJECT_SOURCE_DIR}/tools/qpu/parsec_qpu_adapter_cudaq.py --socket runtime/qpu/a_none.sock --targ qpp-cpu)
+    set_tests_properties(runtime/qpu/adapter:cudaq:short_option PROPERTIES PASS_REGULAR_EXPRESSION "unrecognized arguments: --targ" TIMEOUT 60)
+    qpu_addtest(runtime/qpu/adapter:cudaq:option ${SHM_TEST_CMD_LIST}
+                "${_qpu_cudaq_python}" ${PROJECT_SOURCE_DIR}/tools/qpu/parsec_qpu_adapter_cudaq.py --socket runtime/qpu/a_none.sock --target qpp-cpu --option mqpu)
+    set_tests_properties(runtime/qpu/adapter:cudaq:option PROPERTIES PASS_REGULAR_EXPRESSION "the target qpp-cpu takes no option" TIMEOUT 60)
+    # Whether cudaq is there, without loading it: loaded, it starts on a GPU if it sees one.
+    execute_process(COMMAND "${_qpu_cudaq_python}" -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('cudaq') else 1)"
+                    RESULT_VARIABLE _qpu_python_rc OUTPUT_QUIET ERROR_QUIET)
+    if(_qpu_python_rc EQUAL 0)
+      set(PARSEC_QPU_HAVE_CUDAQ_ADAPTER TRUE)
+    endif()
+  endif()
+  if(PARSEC_QPU_HAVE_CUDAQ_ADAPTER)
+    message(STATUS "QPU adapter: tests with CUDA-Q are registered (${_qpu_cudaq_python})")
+    set(_qpu_cudaq runtime/qpu/qpu_adapter_run -w 180 -s runtime/qpu/a_cudaq.sock
+        "${_qpu_cudaq_python}" ${PROJECT_SOURCE_DIR}/tools/qpu/parsec_qpu_adapter_cudaq.py --socket runtime/qpu/a_cudaq.sock --target qpp-cpu)
+    # What a circuit PaRSEC wrote means to this adapter and to CUDA-Q: bit
+    # order, parameter slots, every operation against the exact
+    # probabilities, the same counts for the same key.
+    qpu_addtest(runtime/qpu/adapter:cudaq ${SHM_TEST_CMD_LIST} ${_qpu_cudaq}
+                -- runtime/qpu/qpu_adapter_stat -a runtime/qpu/a_cudaq.sock -w 25)
+    # The sessions are the protocol half the two adapter programs share.
+    qpu_addtest(runtime/qpu/adapter:cudaq:sessions ${SHM_TEST_CMD_LIST} ${_qpu_cudaq} --idle-drop 2
+                -- runtime/qpu/qpu_adapter_sessions -a runtime/qpu/a_cudaq.sock -i 2)
+    # What the counts follow: the seed the adapter was started with and the
+    # key, in another process as in this one, and no seed gives the counts of
+    # another. CUDA-Q has one seed for a process, which the adapter sets for
+    # every evaluation.
+    qpu_addtest(runtime/qpu/adapter:cudaq:seed ${SHM_TEST_CMD_LIST} ${_qpu_cudaq}
+                -- runtime/qpu/qpu_adapter_run -w 180 -s runtime/qpu/a_cudaq_b.sock
+                "${_qpu_cudaq_python}" ${PROJECT_SOURCE_DIR}/tools/qpu/parsec_qpu_adapter_cudaq.py --socket runtime/qpu/a_cudaq_b.sock --target qpp-cpu
+                -- runtime/qpu/qpu_adapter_run -w 180 -s runtime/qpu/a_cudaq_c.sock
+                "${_qpu_cudaq_python}" ${PROJECT_SOURCE_DIR}/tools/qpu/parsec_qpu_adapter_cudaq.py --socket runtime/qpu/a_cudaq_c.sock --target qpp-cpu --seed 2
+                -- runtime/qpu/qpu_adapter_stat -a runtime/qpu/a_cudaq.sock -b runtime/qpu/a_cudaq_b.sock -B runtime/qpu/a_cudaq_c.sock)
+    # An adapter does not start on a path where another one listens: started
+    # beside the first, on its socket, a second one says so and ends. (The
+    # protocol half does this, for both programs.)
+    qpu_addtest(runtime/qpu/adapter:cudaq:taken ${SHM_TEST_CMD_LIST} ${_qpu_cudaq}
+                -- "${_qpu_cudaq_python}" ${PROJECT_SOURCE_DIR}/tools/qpu/parsec_qpu_adapter_cudaq.py --socket runtime/qpu/a_cudaq.sock --target qpp-cpu)
+    set_tests_properties(runtime/qpu/adapter:cudaq:taken PROPERTIES PASS_REGULAR_EXPRESSION "an adapter listens at runtime/qpu/a_cudaq.sock already")
+    # The four share a socket: one at a time.
+    set_tests_properties(runtime/qpu/adapter:cudaq runtime/qpu/adapter:cudaq:sessions runtime/qpu/adapter:cudaq:seed
+                         runtime/qpu/adapter:cudaq:taken
+                         PROPERTIES RESOURCE_LOCK qpu_cudaq_socket TIMEOUT 600)
+  else()
+    message(STATUS "QPU adapter: no Python with cudaq; the optional tests with CUDA-Q are not registered (PARSEC_QPU_CUDAQ_PYTHON)")
   endif()
 
   if( MPI_C_FOUND )

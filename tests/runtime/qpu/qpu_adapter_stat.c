@@ -13,14 +13,24 @@
  * here is compared count for count. What is checked is that the circuit
  * PaRSEC wrote means, to the other side, what it means here:
  *
- *   - Bit order, the meaning of a parameter slot, and a qubit that is not
- *     measured, on circuits with one possible outcome.
+ *   - Bit order, the meaning of a parameter slot, qubits that are not
+ *     measured, and a qubit measured before the others are done with, on
+ *     circuits with one possible outcome.
  *   - Every operation of the circuit format, the definitions of rxx, ryy and
  *     rzz included: the frequencies of the outcomes against the exact
  *     probabilities PaRSEC computes, by their total variation distance.
  *   - What the adapter promises: the same counts for the same key, also in a
- *     job of several circuits; other counts for another key.
+ *     job of several circuits, and with other jobs in flight at the adapter;
+ *     other counts for another key.
  *   - A result cut to its buffer, and a circuit too wide for the adapter.
+ *   - A parameter that makes an angle infinite: that job is refused or
+ *     fails, and the adapter is there for the next one.
+ *
+ * With -b or -B the adapter is compared with another one, and nothing of the
+ * above is done: an evaluation gives the same counts at an adapter that was
+ * started with the same seed (-b), since they depend on the seed and the key
+ * and on nothing else, and other counts at one started with another seed
+ * (-B).
  *
  * The adapter draws from a seed, so the verdict is the same every time.
  *
@@ -39,6 +49,8 @@
  *   -n        the adapter simulates noise: outcomes that are certain without
  *             it only have to come out in three shots of four
  *   -w N      a circuit of N qubits has to be refused as too wide (default 0: not tried)
+ *   -b PATH   the socket of an adapter started as the one of -a: the same counts
+ *   -B PATH   the socket of an adapter started with another seed: other counts
  */
 
 #include "parsec/parsec_config.h"
@@ -342,9 +354,12 @@ int main(int argc, char *argv[])
     parsec_qpu_circuit_t *c;
     parsec_qpu_caps_t caps;
     int opt, wide = 0, circuits_only = 0, verbose = 0;
+    char *same_seed = NULL, *other_seed = NULL;
 
-    while( -1 != (opt = getopt(argc, argv, "a:t:nw:Sv")) ) {
+    while( -1 != (opt = getopt(argc, argv, "a:b:B:t:nw:Sv")) ) {
         if( 'a' == opt ) parsec_qpu_params.adapter_address = optarg;
+        else if( 'b' == opt ) same_seed = optarg;
+        else if( 'B' == opt ) other_seed = optarg;
         else if( 't' == opt ) max_tv = atof(optarg);
         else if( 'n' == opt ) noisy = 1;
         else if( 'w' == opt ) wide = atoi(optarg);
@@ -362,8 +377,50 @@ int main(int argc, char *argv[])
         return 0;
     }
     if( NULL == parsec_qpu_params.adapter_address ) {
-        fprintf(stderr, "usage: %s -a <socket of the adapter> [-t <distance>] [-n] [-w <qubits>] [-v], or -S\n", argv[0]);
+        fprintf(stderr, "usage: %s -a <socket of the adapter> [-t <distance>] [-n] [-w <qubits>] [-v], or -S, "
+                        "or -a <socket> [-b <socket>] [-B <socket>]\n", argv[0]);
         return 2;
+    }
+    if( (NULL != same_seed) || (NULL != other_seed) ) {
+        /* ---- two or three adapters: what the seed they were started with decides ---- */
+        char *sockets[3] = { parsec_qpu_params.adapter_address, same_seed, other_seed };
+        parsec_qpu_result_t *counts[3][2] = { { NULL, NULL }, { NULL, NULL }, { NULL, NULL } };
+        parsec_qpu_circuit_t *c4 = make_circuit(4, 1);
+
+        for( int a = 0; a < 3; a++ ) {
+            if( NULL == sockets[a] ) continue;
+            parsec_qpu_params.adapter_address = sockets[a];
+            backend = NULL;
+            if( (PARSEC_SUCCESS != ops->open(&backend, 0)) || (NULL == backend) ) {
+                fprintf(stderr, "qpu_adapter_stat: no adapter at %s\n", sockets[a]);
+                return 1;
+            }
+            for( int k = 0; k < 2; k++ ) {
+                parsec_qpu_request_t r = request_of(c4, params, 1000, 1000, 0x400 + (uint64_t)k);
+                if( 0 != run(&r, 1, &counts[a][k], "an evaluation at one of several adapters") ) { free(counts[a][k]); counts[a][k] = NULL; }
+            }
+            EXPECT(PARSEC_SUCCESS == ops->close(backend), "close");
+        }
+        for( int k = 0; k < 2; k++ ) {
+            EXPECT(NULL != counts[0][k], "no counts from the first adapter");
+            if( NULL == counts[0][k] ) continue;
+            if( NULL != same_seed ) {
+                EXPECT((NULL != counts[1][k]) && same_counts(counts[0][k], counts[1][k]),
+                       "evaluation %d gave other counts at another adapter that was started with the same seed", k);
+            }
+            if( NULL != other_seed ) {
+                EXPECT((NULL != counts[2][k]) && !same_counts(counts[0][k], counts[2][k]),
+                       "evaluation %d gave the same counts at an adapter that was started with another seed", k);
+            }
+        }
+        for( int a = 0; a < 3; a++ ) { free(counts[a][0]); free(counts[a][1]); }
+        free(c4);
+        if( nb_errors ) {
+            fprintf(stderr, "qpu_adapter_stat: %d error(s)\n", nb_errors);
+            return 1;
+        }
+        printf("qpu_adapter_stat: the counts follow the seed an adapter was started with: passed\n");
+        return 0;
     }
     if( (PARSEC_SUCCESS != ops->open(&backend, 0)) || (NULL == backend) ) {
         fprintf(stderr, "qpu_adapter_stat: no adapter at %s\n", parsec_qpu_params.adapter_address);
@@ -385,6 +442,18 @@ int main(int argc, char *argv[])
     parsec_qpu_circuit_add(c, ROOM(8), PARSEC_QPU_OP_X, 1, 0, PARSEC_QPU_NO_PARAM, 0.0);
     parsec_qpu_circuit_add(c, ROOM(8), PARSEC_QPU_OP_MEASURE, 2, 0, PARSEC_QPU_NO_PARAM, 0.0);
     expect_outcome(c, NULL, 0x4, "a qubit that is not measured reads 0");
+    free(c);
+    /* Three of four qubits measured, not in the order of their numbers, the
+     * first of them before the operations on the others; the fourth is
+     * flipped and not measured. */
+    c = circuit_new(4, 0, 8);
+    parsec_qpu_circuit_add(c, ROOM(8), PARSEC_QPU_OP_X, 0, 0, PARSEC_QPU_NO_PARAM, 0.0);
+    parsec_qpu_circuit_add(c, ROOM(8), PARSEC_QPU_OP_MEASURE, 0, 0, PARSEC_QPU_NO_PARAM, 0.0);
+    parsec_qpu_circuit_add(c, ROOM(8), PARSEC_QPU_OP_X, 1, 0, PARSEC_QPU_NO_PARAM, 0.0);
+    parsec_qpu_circuit_add(c, ROOM(8), PARSEC_QPU_OP_X, 2, 0, PARSEC_QPU_NO_PARAM, 0.0);
+    parsec_qpu_circuit_add(c, ROOM(8), PARSEC_QPU_OP_MEASURE, 3, 0, PARSEC_QPU_NO_PARAM, 0.0);
+    parsec_qpu_circuit_add(c, ROOM(8), PARSEC_QPU_OP_MEASURE, 2, 0, PARSEC_QPU_NO_PARAM, 0.0);
+    expect_outcome(c, NULL, 0x5, "qubits 0, 3 and 2 measured in that order, qubit 1 flipped and not measured");
     free(c);
     c = circuit_new(3, 0, 8);
     parsec_qpu_circuit_add(c, ROOM(8), PARSEC_QPU_OP_X, 1, 0, PARSEC_QPU_NO_PARAM, 0.0);
@@ -464,6 +533,67 @@ int main(int argc, char *argv[])
         }
         free(a); free(b); free(d);
         for( int i = 0; i < 3; i++ ) free(three[i]);
+        free(c3); free(c4);
+    }
+
+    /* ---- a parameter that makes an angle infinite: no job of it ends well, and the adapter goes on ---- */
+    {
+        static const double huge[1] = { 1e308 };
+        const int64_t give_up = parsec_qpu_now_ns() + 60000 * MS;
+        parsec_qpu_request_t r;
+        parsec_qpu_job_id_t id = 0;
+        parsec_qpu_event_t event;
+        int rc, n = 0;
+
+        c = circuit_new(1, 1, 4);
+        parsec_qpu_circuit_add(c, ROOM(4), PARSEC_QPU_OP_RX, 0, 0, 0, 2.0);
+        parsec_qpu_circuit_measure_all(c, ROOM(4));
+        r = request_of(c, huge, 100, 100, 0x280);
+        rc = ops->submit(backend, &r, 1, next_tag++, &id);
+        if( PARSEC_SUCCESS == rc ) {
+            while( (0 == n) && (parsec_qpu_now_ns() < give_up) ) n = ops->wait(backend, 1000 * MS, &event, 1);
+            EXPECT((1 == n) && (event.id == id) && (PARSEC_QPU_JOB_FAILED == event.state),
+                   "a job whose angle is 2 times 1e308: %d event(s), state %d; expected one job, failed", n, (1 == n) ? event.state : -1);
+        } else {
+            EXPECT(PARSEC_ERR_OUT_OF_RESOURCE != rc, "a job whose angle is 2 times 1e308 was neither taken nor refused for good (%d)", rc);
+        }
+        free(c);
+        /* What follows needs the adapter, and the count of connections at the end says whether it was the same one. */
+    }
+
+    /* ---- ... and with other jobs in flight: eight jobs at once, then each of them alone ---- */
+    {
+        enum { NB = 8 };
+        parsec_qpu_circuit_t *c3 = make_circuit(3, 0), *c4 = make_circuit(4, 1);
+        const int64_t give_up = parsec_qpu_now_ns() + 120000 * MS;
+        parsec_qpu_request_t r[NB];
+        parsec_qpu_result_t *together[NB], *alone[NB];
+        parsec_qpu_job_id_t ids[NB];
+        int submitted = 0, ended = 0, well = 1;
+
+        for( int i = 0; i < NB; i++ ) {
+            r[i] = request_of((i & 1) ? c3 : c4, (i & 2) ? other : params, 1000, 1000, 0x210 + (uint64_t)i);
+            together[i] = (parsec_qpu_result_t*)calloc(1, parsec_qpu_result_size(1000));
+            alone[i] = NULL;
+            if( PARSEC_SUCCESS == ops->submit(backend, &r[i], 1, next_tag++, &ids[i]) ) submitted++;
+        }
+        EXPECT(NB == submitted, "%d of %d jobs submitted at once were taken", submitted, NB);
+        while( (NB == submitted) && (ended < NB) && (parsec_qpu_now_ns() < give_up) ) {
+            parsec_qpu_event_t events[NB];
+            const int n = ops->wait(backend, 1000 * MS, events, NB);
+            if( n < 0 ) break;
+            for( int e = 0; e < n; e++ ) well = well && (PARSEC_QPU_JOB_DONE == events[e].state);
+            ended += n;
+        }
+        EXPECT((NB == ended) && well, "of %d jobs in flight at once, %d ended, %s", NB, ended, well ? "all well" : "not all well");
+        for( int i = 0; (NB == ended) && well && (i < NB); i++ ) {
+            int rc = ops->results(backend, ids[i], &together[i], 1);
+            EXPECT(PARSEC_SUCCESS == rc, "the results of job %d of %d that were in flight at once: %d", i, NB, rc);
+            if( (PARSEC_SUCCESS == rc) && (0 == run(&r[i], 1, &alone[i], "an evaluation alone, after it ran among others")) ) {
+                EXPECT(same_counts(together[i], alone[i]), "evaluation %d gave other counts with other jobs in flight than alone", i);
+            }
+        }
+        for( int i = 0; i < NB; i++ ) { free(together[i]); free(alone[i]); }
         free(c3); free(c4);
     }
 
