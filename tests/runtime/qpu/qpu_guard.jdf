@@ -28,6 +28,10 @@ extern "C" %{
  *   guard_late      the same; the backend was opened once, asked what it
  *                   is, and closed; it received no job
  *   guard_missing   (a name no backend has) the same, and nothing was opened
+ *   adapter         with an adapter that says it drives a quantum device (the
+ *                   test's own, which drives nothing): the same as guard_late.
+ *                   With -A before "--", nothing listens where the adapter is
+ *                   said to be: the same again, and no refusal is counted
  *   mock            the control: there is a QPU device, both tasks submit and
  *                   get their results, so the refusals above are the guard's
  *                   doing
@@ -312,6 +316,31 @@ int main(int argc, char *argv[])
             EXPECT(1 == fake_capabilities, "it was asked for its capabilities %d time(s), expected once", fake_capabilities);
             EXPECT(1 == fake_closes, "it was closed %d time(s) after it said what it is, expected once", fake_closes);
             EXPECT(1 == stats.refused_hardware, "%llu refusal(s) counted, expected 1", (unsigned long long)stats.refused_hardware);
+        } else if( 0 == strcmp(name, "adapter") ) {
+            /* The client of an adapter that says it drives a quantum device
+             * (the test's own adapter says so, and drives nothing): opened,
+             * heard, closed, and given no job, which the adapter checks. */
+            parsec_qpu_adapter_stats_t adapter;
+            int absent = 0;
+            for( int i = 1; i < test_argc; i++ ) {
+                if( 0 == strcmp(argv[i], "-A") ) absent = 1;
+            }
+            /* That it was given no job is the adapter's to say: the client
+             * that was refused is closed, and its counters with it. The
+             * adapter of the tests is started with -N and fails the test if
+             * a job reaches it. */
+            parsec_qpu_adapter_stats(&adapter);
+            EXPECT(0 == fake_opens, "a backend of the test was opened %d time(s) when the adapter was asked for", fake_opens);
+            if( absent ) {
+                /* -A: nothing listens where the adapter is said to be. The
+                 * client does not open, and that is no refusal of hardware. */
+                EXPECT(0 == adapter.opens, "the client of an adapter that is not there opened %llu time(s)", (unsigned long long)adapter.opens);
+                EXPECT(0 == stats.refused_hardware, "%llu refusal(s) counted for an adapter that is not there",
+                       (unsigned long long)stats.refused_hardware);
+            } else {
+                EXPECT(1 == adapter.opens, "the client of the adapter was opened %llu time(s), expected once", (unsigned long long)adapter.opens);
+                EXPECT(1 == stats.refused_hardware, "%llu refusal(s) counted, expected 1", (unsigned long long)stats.refused_hardware);
+            }
         } else {
             EXPECT(0 == fake_opens, "a backend of the test was opened %d time(s) for an unknown name", fake_opens);
             EXPECT(0 == stats.refused_hardware, "%llu refusal(s) counted for a backend that does not exist",

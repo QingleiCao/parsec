@@ -78,6 +78,25 @@ if(PARSEC_HAVE_QPU)
   target_link_libraries(qpu_sampler_test PRIVATE m)
   qpu_addtest_executable(qpu_mock_test SOURCES qpu_mock_test.c)
   target_link_libraries(qpu_mock_test PRIVATE m)
+  # Circuits as OpenQASM 3 text, in both directions.
+  qpu_addtest_executable(qpu_qasm_test SOURCES qpu_qasm_test.c)
+  target_link_libraries(qpu_qasm_test PRIVATE m)
+
+  # The adapter backend. qpu_adapter_loopback is an adapter for tests, which
+  # answers from the sampler; qpu_adapter_test drives the backend against it
+  # without the runtime; qpu_adapter_run starts an adapter beside a command.
+  qpu_addtest_executable(qpu_adapter_loopback SOURCES qpu_adapter_loopback.c)
+  target_link_libraries(qpu_adapter_loopback PRIVATE m)
+  qpu_addtest_executable(qpu_adapter_test SOURCES qpu_adapter_test.c qpu_adapter_spawn.c)
+  target_link_libraries(qpu_adapter_test PRIVATE m)
+  qpu_addtest_executable(qpu_adapter_run SOURCES qpu_adapter_run.c qpu_adapter_spawn.c)
+  # The client against an adapter that simulates by its own means: only run
+  # when Python and Qiskit Aer are there (Testings.cmake), built always.
+  qpu_addtest_executable(qpu_adapter_stat SOURCES qpu_adapter_stat.c)
+  target_link_libraries(qpu_adapter_stat PRIVATE m)
+  # ... and what that adapter keeps for a client whose connection is gone,
+  # asked by a client that speaks the protocol itself.
+  qpu_addtest_executable(qpu_adapter_sessions SOURCES qpu_adapter_sessions.c qpu_adapter_spawn.c)
 
   qpu_addtest_executable(qpu_failure)
   target_ptg_sources(qpu_failure PRIVATE "qpu_failure.jdf")

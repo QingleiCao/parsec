@@ -4,7 +4,8 @@
 #                         reserved.
 #
 # Every test here opts in to the QPU layer with device_qpu_enabled and runs on
-# the mock backend, or on a backend of its own that drives nothing. Delays are
+# the mock backend, on a backend of its own that drives nothing, or on the
+# adapter backend with the adapter of the tests beside it. Delays are
 # kept at or below 100 ms, except where a test is about a job that outlasts
 # something else.
 
@@ -21,6 +22,11 @@ if(PARSEC_HAVE_QPU)
   add_test(NAME runtime/qpu/no_hardware_in_tests
            COMMAND ${CMAKE_COMMAND} -DTESTS_DIR=${PROJECT_SOURCE_DIR}/tests
                    -P ${PROJECT_SOURCE_DIR}/tests/runtime/qpu/check_no_hardware.cmake)
+  # That script, given definitions that break its rules: it has to refuse each.
+  add_test(NAME runtime/qpu/no_hardware_in_tests:itself
+           COMMAND ${CMAKE_COMMAND} -DSCRIPT=${PROJECT_SOURCE_DIR}/tests/runtime/qpu/check_no_hardware.cmake
+                   -DWORK=${PROJECT_BINARY_DIR}/tests/runtime/qpu/no_hardware_selftest
+                   -P ${PROJECT_SOURCE_DIR}/tests/runtime/qpu/check_no_hardware_selftest.cmake)
 
   # A backend that drives, or says it drives, a quantum device is refused;
   # one that does not exist is not replaced by another; and the same task
@@ -98,6 +104,8 @@ if(PARSEC_HAVE_QPU)
   # The sampler and the mock backend, without the runtime.
   qpu_addtest(runtime/qpu/sampler ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_sampler_test)
   qpu_addtest(runtime/qpu/mock ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_mock_test)
+  # Circuits as OpenQASM 3 text: written and read back, and read as Qiskit writes them.
+  qpu_addtest(runtime/qpu/qasm ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_qasm_test)
 
   # Submission, asynchronous completion, dependency release. Every fifth job
   # is empty.
@@ -471,5 +479,149 @@ if(PARSEC_HAVE_QPU)
     # The QPU and the quantum tasks on the last rank, the tasks that read their status elsewhere.
     qpu_addtest(runtime/qpu/failure:mp ${MPI_TEST_CMD_LIST} 2 runtime/qpu/qpu_failure -n 40 -m mixed -q 99
                 ${_qpu_fail} --mca device_qpu_owner_rank -1)
+  endif( MPI_C_FOUND )
+
+  # ---- The adapter backend: the client of a separate program that runs the jobs ----
+  #
+  # No test here reaches anything but the test's own adapter, qpu_adapter_loopback,
+  # which answers from the exact sampler over a Unix-domain socket in the
+  # build directory. Sockets are named relative to the directory the tests run
+  # in, so their paths stay short wherever the build is.
+  #
+  # The client alone, as the progress thread would drive it, against adapters
+  # that lose answers, fail jobs, forget everything or go away.
+  qpu_addtest(runtime/qpu/adapter ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_adapter_test
+              -L runtime/qpu/qpu_adapter_loopback -d runtime/qpu)
+
+  # Tests of the runtime with the adapter backend: qpu_adapter_run starts the
+  # loopback, runs the test and stops the loopback, and fails when the loopback
+  # saw its client break the protocol. The tests compare their counts with the
+  # sampler's, as they do with the mock: they are the same only if every
+  # circuit that crossed the socket as OpenQASM 3 was read back as it was.
+  # qpu_adapter_addtest(<name> <socket> [<option of the loopback> ...] RUN <command> [<argument> ...])
+  # adds the three parameters that name the adapter at the end of the command,
+  # which therefore has to end with the parameters of the runtime.
+  function(qpu_adapter_addtest name socket)
+    set(_loopback)
+    set(_command)
+    set(_in_command FALSE)
+    foreach(_arg ${ARGN})
+      if(_in_command)
+        list(APPEND _command "${_arg}")
+      elseif(_arg STREQUAL "RUN")
+        set(_in_command TRUE)
+      else()
+        list(APPEND _loopback "${_arg}")
+      endif()
+    endforeach()
+    qpu_addtest(${name} ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_adapter_run -s runtime/qpu/${socket}.sock
+                runtime/qpu/qpu_adapter_loopback -s runtime/qpu/${socket}.sock ${_loopback}
+                -- ${_command} --mca device_qpu_enabled 1 --mca device_qpu_backend adapter
+                --mca device_qpu_adapter_address runtime/qpu/${socket}.sock)
+  endfunction(qpu_adapter_addtest)
+
+  qpu_adapter_addtest(runtime/qpu/adapter:chain a_chain RUN runtime/qpu/qpu_chain -n 32 -l 3 --)
+  qpu_adapter_addtest(runtime/qpu/adapter:chain:dtd a_dtd RUN runtime/qpu/dtd_qpu_chain -n 32 --)
+  # Jobs that carry the circuits of several tasks.
+  qpu_adapter_addtest(runtime/qpu/adapter:chain:shared a_shared RUN runtime/qpu/qpu_chain -n 32 -l 3 --
+                      --mca device_qpu_max_outstanding 2 --mca device_qpu_max_batch 4)
+  # ... and an adapter that takes fewer circuits in a job than the runtime would give it.
+  qpu_adapter_addtest(runtime/qpu/adapter:chain:shared:cap a_cap -c 2 RUN runtime/qpu/qpu_chain -n 32 -l 3 --
+                      --mca device_qpu_max_outstanding 2 --mca device_qpu_max_batch 4)
+  # Jobs that take longer than the runtime waits in one go for its adapter.
+  qpu_adapter_addtest(runtime/qpu/adapter:chain:slow a_slow -d 150000 RUN runtime/qpu/qpu_chain -n 8 -l 2 --
+                      --mca device_qpu_poll_max 20)
+  # An adapter beside two mocks, and two QPUs on one adapter: each is its own
+  # client there, with jobs of its own.
+  qpu_addtest(runtime/qpu/adapter:multi ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_adapter_run -s runtime/qpu/a_multi.sock
+              runtime/qpu/qpu_adapter_loopback -s runtime/qpu/a_multi.sock
+              -- runtime/qpu/qpu_multi -n 12 -l 2 -- --mca device_qpu_enabled 1
+              --mca device_qpu_devices "mock|adapter address=runtime/qpu/a_multi.sock|mock")
+  qpu_addtest(runtime/qpu/adapter:multi:two ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_adapter_run -s runtime/qpu/a_two.sock
+              runtime/qpu/qpu_adapter_loopback -s runtime/qpu/a_two.sock
+              -- runtime/qpu/qpu_multi -n 12 -l 2 -- --mca device_qpu_enabled 1
+              --mca device_qpu_devices "adapter address=runtime/qpu/a_two.sock|adapter address=runtime/qpu/a_two.sock")
+  # The adapter is started again while it has jobs, or loses an answer: the
+  # jobs that were lost are run again, and the counts are those of the sampler
+  # all the same. QPU_TEST_ADAPTER_UNSTEADY tells the checks of the tests that
+  # requests without an answer and lost jobs are what is meant to happen.
+  qpu_adapter_addtest(runtime/qpu/adapter:restart a_restart -d 20000 -F forget:20 RUN runtime/qpu/qpu_chain -n 32 -l 3 --
+                      --mca device_qpu_retry_backoff 30)
+  qpu_adapter_addtest(runtime/qpu/adapter:lost_answer a_lost -F drop_submit:7 RUN runtime/qpu/qpu_chain -n 32 -l 3 --
+                      --mca device_qpu_retry_backoff 30)
+  set_property(TEST runtime/qpu/adapter:restart runtime/qpu/adapter:lost_answer
+               APPEND PROPERTY ENVIRONMENT "QPU_TEST_ADAPTER_UNSTEADY=1")
+  # The hardware guard: an adapter that says it drives a quantum device (the
+  # loopback with -P, which drives nothing) is closed as soon as it has said
+  # so. With -N the loopback fails the test if it is given a job.
+  qpu_adapter_addtest(runtime/qpu/adapter:guard a_guard -P -N RUN runtime/qpu/qpu_guard --)
+  # No adapter where one is said to be: no QPU device, and the same answers as
+  # for a backend that may not be used.
+  qpu_addtest(runtime/qpu/adapter:absent ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_guard -A
+              ${_qpu} --mca device_qpu_backend adapter --mca device_qpu_adapter_address runtime/qpu/a_nobody.sock)
+  # A key the adapter backend does not know is a list that cannot be read, as for the mock: no QPU at all.
+  qpu_addtest(runtime/qpu/adapter:badlist ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_discovery -x
+              -- --mca device_qpu_enabled 1 --mca device_qpu_devices "mock|adapter adress=runtime/qpu/a_nobody.sock")
+  # The circuits the tests with a simulator of its own use (below) tell the
+  # operations of the circuit format apart: taking one for another moves their
+  # outcomes far more than sampling does. This needs no adapter.
+  qpu_addtest(runtime/qpu/adapter:stat:circuits ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_adapter_stat -S)
+
+  # ---- Optional: the adapter of tools/qpu with Qiskit Aer, a simulator ----
+  #
+  # Registered only when a Python is found that has qiskit, qiskit-aer and
+  # qiskit-qasm3-import; nothing is built with it, and no other test needs it.
+  # PARSEC_QPU_ADAPTER_PYTHON names the interpreter; without it, python3 of
+  # the path is tried. The adapter is started with --backend aer, the only
+  # backend it has: it runs on this machine and reaches no network and no
+  # quantum device (no_hardware_in_tests reads these lines too).
+  set(PARSEC_QPU_ADAPTER_PYTHON "" CACHE FILEPATH
+      "Python interpreter with qiskit, qiskit-aer and qiskit-qasm3-import, for the optional tests of the QPU adapter with Qiskit Aer")
+  set(_qpu_python "${PARSEC_QPU_ADAPTER_PYTHON}")
+  if(NOT _qpu_python)
+    find_program(PARSEC_QPU_ADAPTER_PYTHON3 NAMES python3)
+    mark_as_advanced(PARSEC_QPU_ADAPTER_PYTHON3)
+    set(_qpu_python "${PARSEC_QPU_ADAPTER_PYTHON3}")
+  endif()
+  set(PARSEC_QPU_HAVE_AER_ADAPTER FALSE)
+  if(_qpu_python)
+    execute_process(COMMAND "${_qpu_python}" -c "import qiskit, qiskit_aer, qiskit_qasm3_import"
+                    RESULT_VARIABLE _qpu_python_rc OUTPUT_QUIET ERROR_QUIET)
+    if(_qpu_python_rc EQUAL 0)
+      set(PARSEC_QPU_HAVE_AER_ADAPTER TRUE)
+    endif()
+  endif()
+  if(PARSEC_QPU_HAVE_AER_ADAPTER)
+    message(STATUS "QPU adapter: tests with Qiskit Aer are registered (${_qpu_python})")
+    set(_qpu_aer runtime/qpu/qpu_adapter_run -w 180 -s runtime/qpu/a_aer.sock
+        "${_qpu_python}" ${PROJECT_SOURCE_DIR}/tools/qpu/parsec_qpu_adapter_qiskit.py --socket runtime/qpu/a_aer.sock --backend aer)
+    # What a circuit PaRSEC wrote means to Qiskit: bit order, parameter slots,
+    # every operation against the exact probabilities, the same counts for the
+    # same key. An ideal simulator; the gates and the connectivity of a device
+    # model, 5 qubits in a line; and that model with its noise.
+    qpu_addtest(runtime/qpu/adapter:aer ${SHM_TEST_CMD_LIST} ${_qpu_aer}
+                -- runtime/qpu/qpu_adapter_stat -a runtime/qpu/a_aer.sock -w 25)
+    qpu_addtest(runtime/qpu/adapter:aer:device ${SHM_TEST_CMD_LIST} ${_qpu_aer} --device generic:5:line --no-noise
+                -- runtime/qpu/qpu_adapter_stat -a runtime/qpu/a_aer.sock -w 6)
+    qpu_addtest(runtime/qpu/adapter:aer:noise ${SHM_TEST_CMD_LIST} ${_qpu_aer} --device generic:5:line
+                -- runtime/qpu/qpu_adapter_stat -a runtime/qpu/a_aer.sock -n -t 0.2 -w 6)
+    # What the adapter keeps for a client whose connection is gone: the
+    # session, for as long as another connection uses it, for --idle-drop
+    # seconds after the last one left, and no longer. No job is submitted.
+    qpu_addtest(runtime/qpu/adapter:aer:sessions ${SHM_TEST_CMD_LIST} ${_qpu_aer} --idle-drop 2
+                -- runtime/qpu/qpu_adapter_sessions -a runtime/qpu/a_aer.sock -i 2)
+    # The four share a socket, and a Python that starts takes a few seconds: one at a time.
+    set_tests_properties(runtime/qpu/adapter:aer runtime/qpu/adapter:aer:device runtime/qpu/adapter:aer:noise
+                         runtime/qpu/adapter:aer:sessions
+                         PROPERTIES RESOURCE_LOCK qpu_aer_socket TIMEOUT 600)
+  else()
+    message(STATUS "QPU adapter: no Python with qiskit, qiskit-aer and qiskit-qasm3-import; the optional tests with Qiskit Aer are not registered (PARSEC_QPU_ADAPTER_PYTHON)")
+  endif()
+
+  if( MPI_C_FOUND )
+    # The QPU on rank 0 and on the last rank, tasks on every rank.
+    qpu_adapter_addtest(runtime/qpu/adapter:chain:mp a_mp RUN ${MPI_TEST_CMD_LIST} 4 runtime/qpu/qpu_chain -n 24 -l 3 --)
+    qpu_adapter_addtest(runtime/qpu/adapter:chain:mp:last a_mplast RUN ${MPI_TEST_CMD_LIST} 4 runtime/qpu/qpu_chain -n 24 -l 3 -q 99 --
+                        --mca device_qpu_owner_rank -1)
   endif( MPI_C_FOUND )
 endif(PARSEC_HAVE_QPU)

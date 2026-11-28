@@ -368,7 +368,9 @@ int qpu_test_check_result(const void *vresult, const void *vcircuit, const void 
 
     CHECK(PARSEC_QPU_RESULT_MOCK & result->flags, "the result is not flagged as mock");
     CHECK(0 == (PARSEC_QPU_RESULT_TRUNCATED & result->flags), "the result is flagged as truncated");
-    CHECK(1 == result->attempts, "%u attempts", (unsigned)result->attempts);
+    /* One job, unless the test's adapter loses jobs on purpose: then a task may have needed more. */
+    CHECK((1 == result->attempts) || ((result->attempts > 1) && (NULL != getenv("QPU_TEST_ADAPTER_UNSTEADY"))),
+          "%u attempts", (unsigned)result->attempts);
     CHECK((uint32_t)shots == result->shots_returned, "%u shots returned, expected %d", result->shots_returned, shots);
     CHECK(result->t_submit <= result->t_start, "started before it was submitted");
     CHECK(result->t_start <= result->t_end, "ended before it started");
@@ -526,10 +528,12 @@ int qpu_test_check_invariants(long tasks, int verbose)
 {
     parsec_qpu_stats_t stats;
     parsec_qpu_mock_stats_t mock;
+    parsec_qpu_adapter_stats_t adapter;
     int errors = 0;
 
     parsec_qpu_service_stats(&stats);
     parsec_qpu_mock_stats(&mock);
+    parsec_qpu_adapter_stats(&adapter);
 
     EXPECT((uint64_t)tasks == stats.tasks_submitted, "%llu tasks submitted, expected %ld",
            (unsigned long long)stats.tasks_submitted, tasks);
@@ -539,11 +543,36 @@ int qpu_test_check_invariants(long tasks, int verbose)
     EXPECT(0 == stats.in_flight, "%u jobs still in flight", stats.in_flight);
     EXPECT(stats.max_in_flight <= (uint32_t)parsec_qpu_params.max_outstanding,
            "%u jobs were outstanding at once, the limit is %d", stats.max_in_flight, parsec_qpu_params.max_outstanding);
-    /* What the backend saw has to agree with what the service believes. */
-    EXPECT(stats.jobs_submitted + mock.abandoned == mock.submits,
-           "the backend created %llu jobs; the service counts %llu, and gave up on the submission of %llu",
-           (unsigned long long)mock.submits, (unsigned long long)stats.jobs_submitted,
-           (unsigned long long)mock.abandoned);
+    /* What the backend saw has to agree with what the service believes. A
+     * run on the adapter backend has no mock to ask, and asks the adapter's
+     * client; a run with both kinds of QPU is not compared here. */
+    if( 0 == adapter.opens ) {
+        EXPECT(stats.jobs_submitted + mock.abandoned == mock.submits,
+               "the backend created %llu jobs; the service counts %llu, and gave up on the submission of %llu",
+               (unsigned long long)mock.submits, (unsigned long long)stats.jobs_submitted,
+               (unsigned long long)mock.abandoned);
+    } else if( 0 == mock.opens ) {
+        EXPECT(stats.jobs_submitted == adapter.submits, "the adapter took %llu jobs; the service counts %llu",
+               (unsigned long long)adapter.submits, (unsigned long long)stats.jobs_submitted);
+        /* A test whose adapter goes away on purpose says so in its environment. */
+        if( NULL == getenv("QPU_TEST_ADAPTER_UNSTEADY") ) {
+            EXPECT((0 == adapter.lost_jobs) && (0 == adapter.unanswered),
+                   "with an adapter that is there all along: %llu jobs lost, %llu requests without an answer",
+                   (unsigned long long)adapter.lost_jobs, (unsigned long long)adapter.unanswered);
+        } else {
+            EXPECT(adapter.lost_jobs + adapter.unanswered > 0,
+                   "the adapter was meant to go away or to lose an answer, and the client saw nothing of it");
+        }
+        EXPECT((0 == adapter.bad_results) && (0 == adapter.unsettled),
+               "%llu results that were none, %llu cancellations the adapter has not heard",
+               (unsigned long long)adapter.bad_results, (unsigned long long)adapter.unsettled);
+        if( (0 == stats.jobs_failed) && (0 == stats.jobs_timed_out) ) {
+            EXPECT(adapter.results == stats.jobs_submitted - stats.jobs_coalesced + stats.tasks_coalesced,
+                   "the adapter gave %llu results; the service counts %llu jobs, of which %llu carried %llu tasks",
+                   (unsigned long long)adapter.results, (unsigned long long)stats.jobs_submitted,
+                   (unsigned long long)stats.jobs_coalesced, (unsigned long long)stats.tasks_coalesced);
+        }
+    }
     EXPECT(0 == mock.unknown_jobs, "the backend holds %u job(s) nobody knows of", mock.unknown_jobs);
     EXPECT(mock.max_held <= (uint32_t)parsec_qpu_params.max_outstanding,
            "the backend held %u jobs at once, the limit is %d", mock.max_held, parsec_qpu_params.max_outstanding);
@@ -572,7 +601,7 @@ int qpu_test_check_invariants(long tasks, int verbose)
            (unsigned long long)stats.tasks_coalesced, stats.max_job_tasks);
     EXPECT(mock.circuits >= mock.submits, "the backend created %llu jobs with %llu circuits in all",
            (unsigned long long)mock.submits, (unsigned long long)mock.circuits);
-    if( 0 == mock.abandoned ) {
+    if( (0 == mock.abandoned) && (0 == adapter.opens) ) {
         EXPECT(mock.circuits == stats.jobs_submitted - stats.jobs_coalesced + stats.tasks_coalesced,
                "the backend was given %llu circuits; the service counts %llu jobs, of which %llu carried %llu tasks",
                (unsigned long long)mock.circuits, (unsigned long long)stats.jobs_submitted,
@@ -640,6 +669,23 @@ int qpu_test_check_service(int ran_quantum_tasks, long tasks, long empty, int ve
 
     EXPECT((uint64_t)empty == stats.empty_jobs, "%llu empty jobs, expected %ld",
            (unsigned long long)stats.empty_jobs, empty);
+    if( NULL != getenv("QPU_TEST_ADAPTER_UNSTEADY") ) {
+        /* The test's adapter goes away or loses an answer on purpose: jobs
+         * fail or are asked for again, and every task has its result all the
+         * same, which the caller checked. What is left to check here is that
+         * no task ended without one, and that the jobs add up. */
+        EXPECT(0 == stats.tasks_failed, "%llu tasks completed without a result", (unsigned long long)stats.tasks_failed);
+        EXPECT(0 == stats.stray_events, "%llu stray events", (unsigned long long)stats.stray_events);
+        EXPECT(stats.jobs_failed + stats.jobs_timed_out == stats.retries, "%llu jobs failed and %llu timed out, and %llu were asked for again",
+               (unsigned long long)stats.jobs_failed, (unsigned long long)stats.jobs_timed_out, (unsigned long long)stats.retries);
+        if( qpu_test_max_batch() <= 1 ) {
+            EXPECT((uint64_t)(tasks - empty) + stats.retries == stats.jobs_submitted,
+                   "%llu jobs submitted for %ld tasks and %llu retries", (unsigned long long)stats.jobs_submitted,
+                   tasks - empty, (unsigned long long)stats.retries);
+        }
+        EXPECT(stats.jobs_failed + stats.submit_deferred > 0, "the adapter was meant to lose something, and the service saw nothing of it");
+        return errors;
+    }
     /* Every task that needed a job was in exactly one, alone or not. */
     EXPECT((uint64_t)(tasks - empty) == stats.jobs_submitted - stats.jobs_coalesced + stats.tasks_coalesced,
            "%llu jobs submitted, of which %llu carried %llu tasks: that makes %llu tasks, expected %ld",
