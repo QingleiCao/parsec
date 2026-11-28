@@ -63,7 +63,9 @@ parsec_qpu_params_t parsec_qpu_params = {
     .mock_submit_delay      = 0,
     .mock_faults            = NULL,
     .mock_threads           = 2,
-    .mock_max_qubits        = 24
+    .mock_max_qubits        = 24,
+    .adapter_address        = NULL,
+    .adapter_timeout_ms     = 60000
 };
 
 int parsec_qpu_output_stream = -1;
@@ -114,14 +116,16 @@ void parsec_qpu_register_params(void)
                                            "submit_interval, job_timeout, max_retries, unavailable_timeout, which "
                                            "default to the parameters of those names; and for the mock: slots, "
                                            "delay, queue_delay, job_delay, submit_delay, max_circuits, faults, "
-                                           "threads, max_qubits, which default to device_qpu_mock_<key>. Without a list "
+                                           "threads, max_qubits, which default to device_qpu_mock_<key>; for the "
+                                           "adapter: address, timeout, which default to device_qpu_adapter_<key>. Without a list "
                                            "there are device_qpu_enabled QPUs of device_qpu_backend",
                                            false, false, "", &parsec_qpu_params.devices);
     (void)parsec_mca_param_reg_string_name("device_qpu", "backend",
                                            "Backend that runs the quantum jobs of the QPUs that "
-                                           "device_qpu_devices does not describe. The only one so far is the "
-                                           "mock, which runs in the process, samples the circuits exactly and "
-                                           "reaches no quantum device",
+                                           "device_qpu_devices does not describe: mock, which runs in the "
+                                           "process, samples the circuits exactly and reaches no quantum device; "
+                                           "or adapter, the client of a separate program that runs the jobs "
+                                           "(device_qpu_adapter_address)",
                                            false, false, "mock", &parsec_qpu_params.backend);
     (void)parsec_mca_param_reg_int_name("device_qpu", "allow_hardware",
                                         "Allow a backend that drives a physical quantum device. Without it such "
@@ -225,6 +229,18 @@ void parsec_qpu_register_params(void)
                                         "Widest circuit the mock backend takes, at most 30; sampling n qubits "
                                         "takes 2^(n+4) bytes per helper thread",
                                         false, false, 24, &parsec_qpu_params.mock_max_qubits);
+    (void)parsec_mca_param_reg_string_name("device_qpu", "adapter_address",
+                                           "Where the adapter backend finds its adapter, the separate program that "
+                                           "runs the jobs: the path of the Unix-domain socket it listens on "
+                                           "(tools/qpu/README.md). A QPU of device_qpu_devices may name its own "
+                                           "with address=",
+                                           false, false, "", &parsec_qpu_params.adapter_address);
+    (void)parsec_mca_param_reg_int_name("device_qpu", "adapter_timeout",
+                                        "Longest the adapter backend waits for the answer to one request, in "
+                                        "milliseconds, before it takes the adapter for out of reach and connects "
+                                        "again. Preparing a circuit is one request, and may take the adapter the "
+                                        "time of a transpilation",
+                                        false, false, 60000, &parsec_qpu_params.adapter_timeout_ms);
 }
 
 static int device_qpu_component_register(void)

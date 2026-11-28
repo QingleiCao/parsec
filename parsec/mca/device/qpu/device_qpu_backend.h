@@ -151,7 +151,7 @@ struct parsec_qpu_backend_s {
     const parsec_qpu_backend_ops_t *ops;
 };
 
-/** Backends by name. The mock is always there. */
+/** Backends by name. The mock and the adapter client are always there. */
 PARSEC_DECLSPEC const parsec_qpu_backend_ops_t *parsec_qpu_backend_find(const char *name);
 
 /** Add a backend. To be called before parsec_init(), from the thread that
@@ -160,6 +160,7 @@ PARSEC_DECLSPEC const parsec_qpu_backend_ops_t *parsec_qpu_backend_find(const ch
 PARSEC_DECLSPEC int parsec_qpu_backend_register(const parsec_qpu_backend_ops_t *ops);
 
 extern const parsec_qpu_backend_ops_t parsec_qpu_backend_mock_ops;
+extern const parsec_qpu_backend_ops_t parsec_qpu_backend_adapter_ops;
 
 END_C_DECLS
 

@@ -228,7 +228,8 @@ typedef enum parsec_qpu_status_e {
  * Such a result has no entry and shots_returned is 0. The task completes
  * normally all the same, and its successors run. */
 
-/** The result came from the mock backend, not from a quantum device. */
+/** The result came from a simulation, not from a quantum device: from the
+ *  mock backend, or from an adapter that says it drives no device. */
 #define PARSEC_QPU_RESULT_MOCK      0x1u
 /** The buffer had room for fewer entries than the job produced: the most
  *  frequent bitstrings were kept, and shots_returned counts only those. */

@@ -298,6 +298,7 @@ static inline void    ctr_max(int64_t *c, int64_t v)
 
 static const parsec_qpu_backend_ops_t *qpu_backends[QPU_MAX_BACKENDS + 1] = {
     &parsec_qpu_backend_mock_ops,
+    &parsec_qpu_backend_adapter_ops,
     NULL
 };
 

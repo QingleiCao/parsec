@@ -7,7 +7,7 @@ if( PARSEC_HAVE_QPU )
   set(MCA_${COMPONENT}_${MODULE}_CONSTRUCTOR "${COMPONENT}_${MODULE}_static_component")
   set_property(TARGET parsec
                APPEND PROPERTY
-                      PUBLIC_HEADER_H mca/device/qpu/device_qpu.h)
+                      PUBLIC_HEADER_H mca/device/qpu/device_qpu.h mca/device/qpu/device_qpu_qasm.h)
 else( PARSEC_HAVE_QPU )
   message(STATUS "Module ${MODULE} not selectable: QPU support was not requested (PARSEC_DEVICE_WITH_QPU)")
   set(MCA_${COMPONENT}_${MODULE} OFF)

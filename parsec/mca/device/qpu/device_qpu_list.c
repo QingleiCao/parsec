@@ -23,7 +23,7 @@
  * optional '@' and the rank that owns the QPU, and any number of key=value
  * pairs, separated by blanks:
  *
- *     mock@0 slots=4; mock@0 slots=2 delay=exp:20000; qrmi@3 resource=name
+ *     mock@0 slots=4; mock@0 slots=2 delay=exp:20000; adapter@3 address=/path/of/its/socket
  *
  * The position of an entry is the number of its QPU, the same on every
  * rank, which is why the list has to be the same on every rank. A rank of -1
@@ -31,8 +31,9 @@
  *
  * A key is one of the limits the runtime keeps per QPU (they default to the
  * MCA parameter of the same name), or one the backend reads when it is
- * opened. For the mock every key is checked here, so that a misspelt one is
- * not silently ignored; another backend is given whatever its entry holds.
+ * opened. For the mock and for the adapter every key is checked here, so
+ * that a misspelt one is not silently ignored; another backend is given
+ * whatever its entry holds.
  *
  * With no list there are device_qpu_enabled QPUs, all of the backend
  * device_qpu_backend and all on device_qpu_owner_rank.
@@ -57,6 +58,9 @@ static const char *qpu_generic_keys[] = {
 };
 static const char *qpu_mock_keys[] = {
     "slots", "delay", "queue_delay", "job_delay", "submit_delay", "max_circuits", "faults", "threads", "max_qubits", NULL
+};
+static const char *qpu_adapter_keys[] = {
+    "address", "timeout", NULL
 };
 
 static int qpu_key_in(const char *key, const char **keys)
@@ -127,6 +131,10 @@ static int qpu_list_entry(char *text, const char **why)
         if( !qpu_key_in(token, qpu_generic_keys) &&
             (0 == strcmp(entry->backend, "mock")) && !qpu_key_in(token, qpu_mock_keys) ) {
             return qpu_list_fail(why, "'%s' is not a key of the mock backend", token);
+        }
+        if( !qpu_key_in(token, qpu_generic_keys) &&
+            (0 == strcmp(entry->backend, "adapter")) && !qpu_key_in(token, qpu_adapter_keys) ) {
+            return qpu_list_fail(why, "'%s' is not a key of the adapter backend", token);
         }
         if( QPU_LIST_MAX_OPTIONS == entry->nb_options ) {
             return qpu_list_fail(why, "too many keys for one QPU, at '%s'", token);

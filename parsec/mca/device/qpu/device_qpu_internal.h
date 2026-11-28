@@ -63,6 +63,8 @@ typedef struct parsec_qpu_params_s {
     char *mock_faults;            /**< device_qpu_mock_faults */
     int   mock_threads;           /**< device_qpu_mock_threads */
     int   mock_max_qubits;        /**< device_qpu_mock_max_qubits */
+    char *adapter_address;        /**< device_qpu_adapter_address */
+    int   adapter_timeout_ms;     /**< device_qpu_adapter_timeout */
 } parsec_qpu_params_t;
 
 PARSEC_DECLSPEC extern parsec_qpu_params_t parsec_qpu_params;
@@ -414,6 +416,89 @@ PARSEC_DECLSPEC void parsec_qpu_mock_stats(parsec_qpu_mock_stats_t *stats);
 /** The same for the mock that was opened for one QPU, named by its number
  *  in the list. PARSEC_ERR_NOT_FOUND when no mock is open for it here. */
 PARSEC_DECLSPEC int parsec_qpu_mock_stats_of(int qpu, parsec_qpu_mock_stats_t *stats);
+
+/* ------------------------------------------------------------------------
+ * The adapter backend (device_qpu_backend_adapter.c): a client of a
+ * separate program, the adapter, which runs the jobs. The two talk over a
+ * stream socket, one line of JSON per message; tools/qpu/README.md has the
+ * protocol.
+ * --------------------------------------------------------------------- */
+
+/** The version of the protocol this client speaks. */
+#define PARSEC_QPU_ADAPTER_PROTOCOL  1
+
+/** Counters of the adapter clients that are open in this process together
+ *  (parsec_qpu_adapter_stats), or of the one of a QPU. */
+typedef struct parsec_qpu_adapter_stats_s {
+    uint64_t opens;           /**< backends opened by this process since it started */
+    /* The rest is about the backends that are open, if any. */
+    uint64_t connects;        /**< connections made, the first one included */
+    uint64_t requests;        /**< requests sent */
+    uint64_t unanswered;      /**< of them, those that got no answer that could be read: the
+                               *   connection is closed after each */
+    uint64_t prepares;        /**< circuits given to the adapter */
+    uint64_t submits;         /**< jobs the adapter took */
+    uint64_t circuits;        /**< circuits those jobs carried */
+    uint64_t lost_jobs;       /**< jobs reported as failed because the adapter that had them
+                               *   was gone */
+    uint64_t results;         /**< results taken, one per circuit */
+    uint64_t bad_results;     /**< answers that were not the result of the job asked for */
+    uint64_t unsettled;       /**< cancellations the adapter has not heard yet */
+} parsec_qpu_adapter_stats_t;
+PARSEC_DECLSPEC void parsec_qpu_adapter_stats(parsec_qpu_adapter_stats_t *stats);
+PARSEC_DECLSPEC int  parsec_qpu_adapter_stats_of(int qpu, parsec_qpu_adapter_stats_t *stats);
+
+/** How a client names a circuit to its adapter: from the bytes of the
+ *  circuit. `check` receives a second value from the same bytes, by which a
+ *  client tells apart two circuits that happen to share a name. */
+PARSEC_DECLSPEC uint64_t parsec_qpu_adapter_circuit_id(const parsec_qpu_circuit_t *circuit, uint64_t *check);
+
+/* ------------------------------------------------------------------------
+ * JSON, as much as the adapter protocol needs (device_qpu_json.c). A value
+ * is the extent of its text: nothing is copied to read a message.
+ * --------------------------------------------------------------------- */
+
+typedef struct parsec_qpu_json_s {
+    const char *at, *end;
+} parsec_qpu_json_t;
+
+/** Take a text for one value and nothing else. PARSEC_ERR_BAD_PARAM when it is not. */
+PARSEC_DECLSPEC int parsec_qpu_json_parse(const char *text, size_t length, parsec_qpu_json_t *value);
+/** 'o' for an object, 'a' array, 's' string, 'n' number, 't' true, 'f' false, 'z' null; 0 for no value. */
+PARSEC_DECLSPEC int parsec_qpu_json_kind(const parsec_qpu_json_t *value);
+/** The member of an object by its key. PARSEC_ERR_NOT_FOUND when there is none. */
+PARSEC_DECLSPEC int parsec_qpu_json_member(const parsec_qpu_json_t *object, const char *key, parsec_qpu_json_t *value);
+/** The elements of an array in turn: start with element->at at NULL. 1 while there is one, then 0. */
+PARSEC_DECLSPEC int parsec_qpu_json_next(const parsec_qpu_json_t *array, parsec_qpu_json_t *element);
+/** A string without its escapes, as far as it fits, with a final 0. Returns its
+ *  whole length, or a negative error when the value is not a string. */
+PARSEC_DECLSPEC int64_t parsec_qpu_json_string(const parsec_qpu_json_t *value, char *buffer, size_t room);
+PARSEC_DECLSPEC int parsec_qpu_json_double(const parsec_qpu_json_t *value, double *number);
+/** A number written without a fraction or an exponent. */
+PARSEC_DECLSPEC int parsec_qpu_json_int(const parsec_qpu_json_t *value, int64_t *number);
+/** 64 bits, which the protocol writes as a string: "0x" and hexadecimal digits. */
+PARSEC_DECLSPEC int parsec_qpu_json_u64(const parsec_qpu_json_t *value, uint64_t *number);
+PARSEC_DECLSPEC int parsec_qpu_json_bool(const parsec_qpu_json_t *value, int *truth);
+/** Whether a value is this string; for the words of the protocol, which need no escape. */
+PARSEC_DECLSPEC int parsec_qpu_json_is(const parsec_qpu_json_t *value, const char *text);
+
+/** A double as a decimal number that reads back as the same double, with a
+ *  point whatever the locale of the process; and such a number read. */
+PARSEC_DECLSPEC const char *parsec_qpu_number_format(char buffer[40], double value);
+PARSEC_DECLSPEC double parsec_qpu_number_parse(const char *text);
+
+/** A text that grows as it is written. Start with all fields at zero. */
+typedef struct parsec_qpu_text_s {
+    char  *text;
+    size_t length, room;
+    int    failed;            /**< memory ran out: what is there is not the whole text */
+} parsec_qpu_text_t;
+
+PARSEC_DECLSPEC void parsec_qpu_text_reset(parsec_qpu_text_t *text);
+PARSEC_DECLSPEC void parsec_qpu_text_fini(parsec_qpu_text_t *text);
+PARSEC_DECLSPEC void parsec_qpu_text_add(parsec_qpu_text_t *text, const char *format, ...);
+/** A JSON string, with its quotes and escapes. */
+PARSEC_DECLSPEC void parsec_qpu_text_add_string(parsec_qpu_text_t *text, const char *string, size_t length);
 
 /* ------------------------------------------------------------------------
  * Small helpers shared by the files of the component.
