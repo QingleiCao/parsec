@@ -1,0 +1,685 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+/**
+ * Several QPUs in one run (device_qpu_devices).
+ *
+ * The task graph is the one of qpu_chain: chains of
+ *   PREP(k, l)   writes a circuit and its parameters      on rank k mod P
+ *   QEXEC(k, l)  submits them and returns ASYNC            on a rank that owns a QPU
+ *   CHECK(k, l)  verifies the result                       on rank k mod P
+ * Chain k has its quantum tasks on the k-th of the ranks that own a QPU, in
+ * turn, and each quantum task names a QPU of that rank or none (-P).
+ *
+ * What every run checks: each CHECK ran once, after its result was written;
+ * a result that is an answer holds the counts the sampler gives for the same
+ * inputs and key, whichever QPU ran the job; it names a QPU of the rank its
+ * task ran on, and the one the task named when it named one; no QPU ever
+ * held more jobs than its own limit, nor its mock more than its slots; and
+ * at the end nothing waits, no QPU carries a load, and each quantum task was
+ * counted by exactly one QPU device.
+ *
+ * Options, before "--":
+ *   -n NT       number of chains (default 16)
+ *   -l LEN      links per chain (default 2)
+ *   -s SHOTS    shots per job (default 100)
+ *   -P MODE     which QPU a quantum task names:
+ *                 none   no QPU: whichever of its rank has a place (default)
+ *                 turn   the QPUs of its rank in turn
+ *                 half   every other chain as "turn", the others as "none"
+ *                 Q      a number: every task names QPU Q, and runs on its rank
+ *   -f Q        QPU Q never gives an answer (its entry in the list says how):
+ *               no answer may come from it, a task that named it completes
+ *               without one, and every other task completes with one
+ *   -a N        with -f Q: the backend of QPU Q was asked for a job at most N
+ *               times in the whole run. A QPU that takes nothing is given up
+ *               on and then left alone, but for one job now and then that
+ *               tells whether it is back; it is not handed every task in turn
+ *   -u Q        QPU Q takes no job for a while and then does again: every task
+ *               completes with an answer, some were given to another QPU, and
+ *               at the end QPU Q is up and has run tasks again
+ *   -R          no QPU of the run can run the circuits: every task completes
+ *               as rejected, without a job
+ *   -O Q        only QPU Q can run the circuits: every answer comes from it
+ *   -M Q        QPU Q is the faster one: more than half of the answers come
+ *               from it
+ *   -E R,R,...  the rank each QPU has to be on, in the order of the list (-1
+ *               for the last rank): what the list says, said again, so that
+ *               a run that put them somewhere else does not pass
+ *   -c          enough tasks wait for every QPU to reach its own limit of
+ *               jobs outstanding: each has to
+ *   -X Q        the backend of QPU Q cannot be opened: it has no device, and
+ *               the other QPUs of its rank run the tasks
+ *   -W          no place stays free while a task waits (one rank, no task
+ *               names a QPU): at the middle of the time a task waited, every
+ *               QPU held as many jobs as it may. Read from the times in the
+ *               results; a place counts as taken from 2 ms before its job to
+ *               2 ms after, and one moment in ten may be off before the run
+ *               fails, since the machine may have other things to do
+ *   -G          a task that is submitted while its QPU is asked again for a
+ *               job it did not take at first, and that has a place the
+ *               moment the job is taken, runs at once. Two tasks, one QPU of
+ *               two places. The mock is steered: it does not take the first
+ *               job, and while it is asked again it holds the thread until
+ *               the second task has been submitted. The second task then
+ *               found no place shown and woke nobody, and its job has to be
+ *               asked for all the same within half the time the first job
+ *               takes; left on the way, it waits for the first job to end.
+ *               (It takes a fraction of a millisecond. Half a job is what a
+ *               machine with too much to do is allowed.)
+ *   -t MS       the taskpool is done within MS milliseconds. With a long
+ *               device_qpu_poll_max, for a wake-up that must not be missed:
+ *               a thread that is not woken then sleeps for that long
+ *   -S          as -W, and not one moment may be off. For QPUs of one place
+ *               each and a mock that takes its time to answer a submission
+ *               (submit_delay): a QPU that sleeps while another one is held
+ *               in its backend then shows for as long as that call lasts
+ *   -v          verbose
+ */
+
+#include "qpu_test_common.h"
+#include "parsec/sys/atomic.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+enum { PIN_NONE, PIN_TURN, PIN_HALF, PIN_ONE };
+
+/* What CHECK kept of the result of a quantum task. */
+typedef struct {
+    int32_t done;
+    uint8_t status, qpu, attempts;
+    int64_t t_hook, t_submit, t_retrieve;
+} multi_rec_t;
+
+static int verbose = 0;
+static int32_t nb_errors = 0;
+static int nb_qpus = 0;                             /* of the run */
+static int qpu_rank[PARSEC_QPU_MAX_QPUS];           /* the rank that owns each */
+static int nb_owners = 0;                           /* the ranks that own one, each once */
+static int owners[PARSEC_QPU_MAX_QPUS];
+static int pin_mode = PIN_NONE, pin_arg = -1;
+static int faulty = -1, comes_back = -1, expect_rejected = 0, not_open = -1, asked_at_most = -1;
+static multi_rec_t *recs = NULL;
+static int32_t answers_of[PARSEC_QPU_MAX_QPUS];     /* answers each QPU gave, as the CHECKs of this rank saw them */
+/* -G: the mock is being asked again for the first job; the second task has been submitted. */
+static int gated = 0;
+static int32_t gate_asked_again = 0, gate_submitted = 0;
+
+/* Steers the mock for -G: the first submission is not taken; the second one,
+ * which asks again for the same job, is held until the other task has been
+ * submitted (for two seconds at most), and taken. */
+static parsec_qpu_mock_fault_t gate_fault(uint64_t tag, const parsec_qpu_request_t *request, uint64_t call, void *arg)
+{
+    (void)tag; (void)request; (void)arg;
+    if( 1 == call ) return PARSEC_QPU_MOCK_UNAVAILABLE;
+    if( 2 == call ) {
+        struct timespec nap = { 0, 200000 };
+
+        (void)parsec_atomic_fetch_add_int32(&gate_asked_again, 1);
+        for( int i = 0; (i < 10000) && (0 == parsec_atomic_fetch_add_int32(&gate_submitted, 0)); i++ ) nanosleep(&nap, NULL);
+    }
+    return PARSEC_QPU_MOCK_OK;
+}
+
+/* The rank the quantum tasks of chain k run on. */
+static inline int multi_rank_of(int k) { return owners[k % nb_owners]; }
+
+/* The QPU the quantum task (k, l) names. */
+static int multi_pin_of(int k, int l)
+{
+    const int rank = multi_rank_of(k), chain = k / nb_owners;
+    int mine[PARSEC_QPU_MAX_QPUS], n = 0;
+
+    if( PIN_NONE == pin_mode ) return PARSEC_QPU_ANY;
+    if( PIN_ONE == pin_mode )  return pin_arg;
+    if( (PIN_HALF == pin_mode) && (chain % 2) ) return PARSEC_QPU_ANY;
+    for( int q = 0; q < nb_qpus; q++ ) {
+        if( qpu_rank[q] == rank ) mine[n++] = q;
+    }
+    return mine[(chain + l) % n];
+}
+
+#define MULTI_CHECK(COND, ...)                                                \
+    do { if( !(COND) ) {                                                      \
+        fprintf(stderr, "CHECK(%d, %d): ", k, l);                             \
+        fprintf(stderr, __VA_ARGS__);                                         \
+        fprintf(stderr, "\n");                                                \
+        errors++;                                                             \
+    } } while(0)
+
+/* What CHECK(k, l) does with its result. */
+static int multi_check(const void *vres, const void *circuit, const void *params, int shots, int k, int l, int len)
+{
+    const parsec_qpu_result_t *res = (const parsec_qpu_result_t*)vres;
+    const int pin = multi_pin_of(k, l), rank = multi_rank_of(k);
+    multi_rec_t *rec = &recs[k * len + l];
+    int errors = 0;
+
+    MULTI_CHECK(PARSEC_QPU_RESULT_VERSION == res->version, "result version is %u", (unsigned)res->version);
+    if( expect_rejected ) {
+        MULTI_CHECK(PARSEC_QPU_STATUS_REJECTED == res->status, "status is %u, expected rejected", (unsigned)res->status);
+        MULTI_CHECK(PARSEC_QPU_NONE == res->qpu, "it names QPU %u, and no QPU had a job for it", (unsigned)res->qpu);
+        MULTI_CHECK(0 == res->attempts, "%u job(s) for a task no QPU can run", (unsigned)res->attempts);
+    } else if( (faulty >= 0) && (pin == faulty) ) {
+        MULTI_CHECK(PARSEC_QPU_STATUS_OK != res->status, "it named QPU %d, which gives no answer, and has one", faulty);
+        MULTI_CHECK(0 == res->nb_entries, "a result without an answer has %u entries", res->nb_entries);
+    } else {
+        MULTI_CHECK(PARSEC_QPU_STATUS_OK == res->status, "status is %u", (unsigned)res->status);
+        if( PARSEC_QPU_STATUS_OK == res->status ) {
+            MULTI_CHECK(res->attempts >= 1, "an answer without a job");
+            MULTI_CHECK((res->qpu < nb_qpus) && (qpu_rank[res->qpu] == rank),
+                        "its answer is from QPU %u, which is not a QPU of rank %d", (unsigned)res->qpu, rank);
+            if( PARSEC_QPU_ANY != pin ) {
+                MULTI_CHECK(res->qpu == pin, "it named QPU %d and its answer is from QPU %u", pin, (unsigned)res->qpu);
+            }
+            MULTI_CHECK((faulty < 0) || (res->qpu != faulty), "its answer is from QPU %d, which gives none", faulty);
+            MULTI_CHECK((uint32_t)shots == res->shots_returned, "%u shots returned, expected %d", res->shots_returned, shots);
+            MULTI_CHECK((res->t_hook <= res->t_submit) && (res->t_submit <= res->t_start) &&
+                        (res->t_start <= res->t_end) && (res->t_end <= res->t_retrieve), "its times are out of order");
+            errors += qpu_test_check_counts(vres, circuit, params, shots, qpu_test_key(k, l), "CHECK", k, l);
+            if( res->qpu < nb_qpus ) (void)parsec_atomic_fetch_inc_int32(&answers_of[res->qpu]);
+        }
+    }
+    rec->status     = res->status;
+    rec->qpu        = res->qpu;
+    rec->attempts   = res->attempts;
+    rec->t_hook     = res->t_hook;
+    rec->t_submit   = res->t_submit;
+    rec->t_retrieve = res->t_retrieve;
+    (void)parsec_atomic_fetch_inc_int32(&rec->done);
+    return errors;
+}
+%}
+
+W            [ type = "parsec_data_collection_t*" ]
+Q            [ type = "parsec_data_collection_t*" ]
+NT           [ type = int ]
+LEN          [ type = int ]
+SHOTS        [ type = int ]
+
+PREP(k, l)
+
+k = 0 .. NT-1
+l = 0 .. LEN-1
+
+: W(k)
+
+WRITE C  -> C  QEXEC(k, l)
+         -> C  CHECK(k, l)
+WRITE TH -> TH QEXEC(k, l)
+         -> TH CHECK(k, l)
+CTL   X  <- (l > 0) ? X CHECK(k, l-1)
+
+BODY
+{
+    /* -G: the second task is made, and so submitted, only once the mock is
+     * being asked again for the job of the first. */
+    if( gated && (1 == k) && (0 == parsec_atomic_fetch_add_int32(&gate_asked_again, 0)) ) {
+        return PARSEC_HOOK_RETURN_AGAIN;
+    }
+    qpu_test_make_circuit(C, k, l, 0);
+    qpu_test_make_params(TH, k, l);
+}
+END
+
+QEXEC(k, l)
+
+k = 0 .. NT-1
+l = 0 .. LEN-1
+
+: Q(k)
+
+READ  C   <- C  PREP(k, l)
+READ  TH  <- TH PREP(k, l)
+WRITE RES -> RES CHECK(k, l)
+
+BODY [type=QPU]
+{
+    /* Mark the result, so that a successor released too early shows. */
+    memset(RES, 0xff, QPU_TEST_BLOCK);
+    if( gated && (1 == k) ) {
+        /* Say that it is submitted, once it is: the mock lets the thread go
+         * then. The task itself is not touched again. */
+        parsec_hook_return_t rc = PARSEC_QPU_SUBMIT_ON(multi_pin_of(k, l), C, TH, RES, SHOTS, qpu_test_key(k, l));
+        (void)parsec_atomic_fetch_add_int32(&gate_submitted, 1);
+        return rc;
+    }
+    return PARSEC_QPU_SUBMIT_ON(multi_pin_of(k, l), C, TH, RES, SHOTS, qpu_test_key(k, l));
+}
+END
+
+CHECK(k, l)
+
+k = 0 .. NT-1
+l = 0 .. LEN-1
+
+: W(k)
+
+READ C   <- C   PREP(k, l)
+READ TH  <- TH  PREP(k, l)
+READ RES <- RES QEXEC(k, l)
+CTL  X   -> (l < LEN-1) ? X PREP(k, l+1)
+
+BODY
+{
+    int errors = multi_check(RES, C, TH, SHOTS, k, l, LEN);
+    if( errors > 0 ) (void)parsec_atomic_fetch_add_int32(&nb_errors, errors);
+    if( verbose ) {
+        printf("CHECK(%d, %d) on rank %d: status %u from QPU %u after %u job(s)\n", k, l,
+               es->virtual_process->parsec_context->my_rank, (unsigned)((const parsec_qpu_result_t*)RES)->status,
+               (unsigned)((const parsec_qpu_result_t*)RES)->qpu, (unsigned)((const parsec_qpu_result_t*)RES)->attempts);
+    }
+}
+END
+
+extern "C" %{
+
+#define EXPECT(COND, ...)                                                     \
+    do { if( !(COND) ) {                                                      \
+        fprintf(stderr, "rank %d: ", rank);                                   \
+        fprintf(stderr, __VA_ARGS__);                                         \
+        fprintf(stderr, "\n");                                                \
+        errors++;                                                             \
+    } } while(0)
+
+/* No place stays free while a task waits: see -W at the top. Returns the
+ * number of problems. */
+static int multi_check_no_free_place(int rank, int tasks, int strict)
+{
+    const int64_t margin = 2000000, waited_enough = 10000000;
+    int errors = 0, looked = 0, off = 0;
+
+    for( int i = 0; i < tasks; i++ ) {
+        const int64_t when = recs[i].t_hook + (recs[i].t_submit - recs[i].t_hook) / 2;
+
+        if( (PARSEC_QPU_STATUS_OK != recs[i].status) || ((recs[i].t_submit - recs[i].t_hook) < waited_enough) ) continue;
+        looked++;
+        for( int q = 0; q < nb_qpus; q++ ) {
+            parsec_qpu_device_info_t info;
+            uint32_t held = 0;
+
+            if( (PARSEC_SUCCESS != parsec_qpu_device_info(q, &info)) || !info.is_owner ) continue;
+            /* What is counted are tasks, and a place holds a job: the two
+             * are the same only when every task is its own job. */
+            if( 1 != info.max_batch ) {
+                EXPECT(0 == i, "QPU %d puts up to %u tasks into a job: -W and -S need one task per job", q, info.max_batch);
+                continue;
+            }
+            for( int j = 0; j < tasks; j++ ) {
+                if( (recs[j].qpu == q) && (recs[j].t_submit - margin <= when) && (when < recs[j].t_retrieve + margin) ) held++;
+            }
+            if( held < info.max_outstanding ) {
+                if( verbose ) {
+                    printf("task %d waited from %.3f to %.3f ms, and at %.3f ms QPU %d held %u job(s) of %u\n", i,
+                           recs[i].t_hook * 1e-6, recs[i].t_submit * 1e-6, when * 1e-6, q, held, info.max_outstanding);
+                }
+                off++;
+                break;
+            }
+        }
+    }
+    if( verbose && (off > 0) ) {
+        int64_t first = INT64_MAX;
+
+        for( int i = 0; i < tasks; i++ ) if( recs[i].t_hook < first ) first = recs[i].t_hook;
+        for( int i = 0; i < tasks; i++ ) {
+            printf("  task %2d on QPU %u: submitted by its body at %8.3f ms, its job asked for at %8.3f ms, "
+                   "its result there at %8.3f ms\n", i, (unsigned)recs[i].qpu, (recs[i].t_hook - first) * 1e-6,
+                   (recs[i].t_submit - first) * 1e-6, (recs[i].t_retrieve - first) * 1e-6);
+        }
+    }
+    EXPECT(looked >= tasks / 4, "only %d of %d tasks waited for 10 ms or more: too few to tell whether a place "
+           "stays free while a task waits", looked, tasks);
+    EXPECT((strict ? 0 : looked) >= 10 * off, "at %d of the %d moments looked at, a task waited while a QPU had a free place",
+           off, looked);
+    if( verbose || (off > 0) ) {
+        printf("no free place while a task waits: %d moment(s) looked at, %d with a free place\n", looked, off);
+    }
+    return errors;
+}
+
+int main(int argc, char *argv[])
+{
+    parsec_context_t *parsec;
+    parsec_qpu_multi_taskpool_t *tp;
+    parsec_data_collection_t *W, *Q;
+    int nt = 16, len = 2, shots = 100, only = -1, majority = -1, no_free_place = 0, reach_limit = 0, at_most_ms = -1;
+    int64_t t_begin, t_end;
+    const char *pin = "none", *expected_ranks = NULL;
+    int rank = 0, world = 1, rc, test_argc, pargc, errors = 0, here = 0, owns = 0;
+    char **pargv;
+    long total, all, executed = 0;
+
+    qpu_test_split_args(argc, argv, &test_argc, &pargc, &pargv);
+    for( int i = 1; i < test_argc; i++ ) {
+        if( 0 == strcmp(argv[i], "-v") ) { verbose = 1; continue; }
+        if( 0 == strcmp(argv[i], "-R") ) { expect_rejected = 1; continue; }
+        if( 0 == strcmp(argv[i], "-W") ) { no_free_place = 1; continue; }
+        if( 0 == strcmp(argv[i], "-S") ) { no_free_place = 2; continue; }
+        if( 0 == strcmp(argv[i], "-G") ) { gated = 1; continue; }
+        if( 0 == strcmp(argv[i], "-c") ) { reach_limit = 1; continue; }
+        if( i + 1 >= test_argc ) break;
+        if( 0 == strcmp(argv[i], "-n") ) nt = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-l") ) len = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-s") ) shots = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-P") ) pin = argv[++i];
+        else if( 0 == strcmp(argv[i], "-f") ) faulty = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-u") ) comes_back = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-X") ) not_open = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-E") ) expected_ranks = argv[++i];
+        else if( 0 == strcmp(argv[i], "-a") ) asked_at_most = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-t") ) at_most_ms = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-O") ) only = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-M") ) majority = atoi(argv[++i]);
+    }
+    if( (nt <= 0) || (len <= 0) || (shots <= 0) ) {
+        fprintf(stderr, "qpu_multi: -n, -l and -s must be positive\n");
+        return 1;
+    }
+
+    rc = parsec_tests_context_init(-1, PARSEC_TEST_THREAD_SERIALIZED, &pargc, &pargv, &parsec, &rank, &world);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_init");
+
+    /* The QPUs of the run, and who owns them: the same on every rank. */
+    nb_qpus = parsec_qpu_count();
+    if( nb_qpus <= 0 ) {
+        if( 0 == rank ) fprintf(stderr, "qpu_multi: this run has no QPU\n");
+        parsec_tests_abort(parsec, 1);
+    }
+    if( NULL != expected_ranks ) {
+        /* Where the list of the run puts its QPUs, against what the runtime says. */
+        const char *c = expected_ranks;
+        int q = 0;
+
+        for( ; '\0' != *c; q++ ) {
+            char *end = NULL;
+            long r = strtol(c, &end, 10);
+
+            if( r < 0 ) r = world - 1;
+            EXPECT((q < nb_qpus) && (parsec_qpu_rank_of(q) == (int)r), "QPU %d is on rank %d, and the list puts it on rank %ld",
+                   q, (q < nb_qpus) ? parsec_qpu_rank_of(q) : -1, r);
+            c = ('\0' != *end) ? end + 1 : end;
+        }
+        EXPECT(q == nb_qpus, "the run has %d QPU(s), and the list has %d", nb_qpus, q);
+    }
+    if(      0 == strcmp(pin, "none") ) pin_mode = PIN_NONE;
+    else if( 0 == strcmp(pin, "turn") ) pin_mode = PIN_TURN;
+    else if( 0 == strcmp(pin, "half") ) pin_mode = PIN_HALF;
+    else { pin_mode = PIN_ONE; pin_arg = atoi(pin); }
+    for( int q = 0; q < nb_qpus; q++ ) {
+        int known = 0;
+
+        qpu_rank[q] = parsec_qpu_rank_of(q);
+        if( qpu_rank[q] < 0 ) {
+            if( 0 == rank ) fprintf(stderr, "qpu_multi: no rank owns QPU %d\n", q);
+            parsec_tests_abort(parsec, 1);
+        }
+        if( (qpu_rank[q] == rank) && (q != not_open) ) owns++;
+        if( (PIN_ONE == pin_mode) && (q != pin_arg) ) continue;      /* every chain goes to the rank of that one */
+        for( int i = 0; i < nb_owners; i++ ) known |= (owners[i] == qpu_rank[q]);
+        if( !known ) owners[nb_owners++] = qpu_rank[q];
+    }
+    if( 0 == nb_owners ) {
+        if( 0 == rank ) fprintf(stderr, "qpu_multi: -P %s names no QPU of this run, which has %d\n", pin, nb_qpus);
+        parsec_tests_abort(parsec, 1);
+    }
+    if( no_free_place && ((1 != world) || (PIN_NONE != pin_mode)) ) {
+        if( 0 == rank ) fprintf(stderr, "qpu_multi: -W and -S need one rank and -P none\n");
+        parsec_tests_abort(parsec, 1);
+    }
+
+    if( gated ) {
+        if( (1 != world) || (1 != nb_qpus) ) {
+            if( 0 == rank ) fprintf(stderr, "qpu_multi: -G needs one rank and one QPU\n");
+            parsec_tests_abort(parsec, 1);
+        }
+        nt = 2; len = 1;
+        comes_back = 0;             /* its first submission is not taken: that much goes wrong, by design */
+        parsec_qpu_mock_set_fault_fn(gate_fault, NULL);
+    }
+    recs = (multi_rec_t*)calloc((size_t)nt * len, sizeof(multi_rec_t));
+    W = qpu_test_placement_new(rank, world, -1);
+    Q = qpu_test_placement_list_new(rank, world, owners, nb_owners);
+
+    tp = parsec_qpu_multi_new(W, Q, nt, len, shots);
+    qpu_test_block_type_set(&tp->arenas_datatypes[PARSEC_qpu_multi_DEFAULT_ADT_IDX]);
+
+    t_begin = parsec_qpu_now_ns();
+    rc = parsec_context_add_taskpool(parsec, (parsec_taskpool_t*)tp);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+    rc = parsec_context_wait(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+    t_end = parsec_qpu_now_ns();
+    if( at_most_ms >= 0 ) {
+        EXPECT((t_end - t_begin) <= (int64_t)at_most_ms * 1000000LL, "the taskpool took %.0f ms, and has to be done in %d ms",
+               (t_end - t_begin) * 1e-6, at_most_ms);
+    }
+
+    /* Every CHECK ran once, on the rank that owns it; and how many quantum
+     * tasks ran here. */
+    total = 0;
+    for( int k = 0; k < nt; k++ ) {
+        for( int l = 0; l < len; l++ ) {
+            const int expected = ((int)W->rank_of(W, k) == rank) ? 1 : 0;
+
+            EXPECT(expected == recs[k * len + l].done, "CHECK(%d, %d) ran %d time(s), expected %d",
+                   k, l, recs[k * len + l].done, expected);
+            total += recs[k * len + l].done;
+            if( multi_rank_of(k) == rank ) here++;
+        }
+    }
+
+    if( 0 == owns ) {
+        /* A rank that owns no QPU: a device that stands for them, and nothing behind it. */
+        EXPECT(0 == here, "%d quantum task(s) were placed on a rank that owns no QPU", here);
+        errors += qpu_test_check_service(0, 0, 0, 0);
+    } else {
+        parsec_qpu_stats_t stats;
+
+        parsec_qpu_service_stats(&stats);
+        EXPECT((uint64_t)here == stats.tasks_submitted, "%llu tasks submitted, expected %d",
+               (unsigned long long)stats.tasks_submitted, here);
+        EXPECT((uint64_t)here == stats.tasks_completed, "%llu tasks completed, expected %d",
+               (unsigned long long)stats.tasks_completed, here);
+        EXPECT(0 == stats.pending, "%u tasks still wait", stats.pending);
+        EXPECT(0 == stats.in_flight, "%u jobs still in flight", stats.in_flight);
+        EXPECT((uint32_t)owns == stats.nb_qpus, "the service has %u QPU(s) on this rank, and the list gives it %d",
+               stats.nb_qpus, owns);
+        EXPECT(0 == stats.empty_jobs, "%llu tasks completed without a job, and none is empty",
+               (unsigned long long)stats.empty_jobs);
+        if( expect_rejected ) {
+            EXPECT(((uint64_t)here == stats.tasks_rejected) && (0 == stats.jobs_submitted),
+                   "%llu tasks rejected and %llu jobs submitted, expected %d and none",
+                   (unsigned long long)stats.tasks_rejected, (unsigned long long)stats.jobs_submitted, here);
+        }
+        if( (faulty < 0) && (comes_back < 0) && !expect_rejected ) {
+            /* Nothing was made to go wrong, so nothing may have. */
+            EXPECT((0 == stats.jobs_failed) && (0 == stats.jobs_timed_out) && (0 == stats.retries) &&
+                   (0 == stats.submit_deferred) && (0 == stats.tasks_failed) && (0 == stats.tasks_moved) && (0 == stats.down),
+                   "%llu jobs failed, %llu timed out, %llu retries, %llu submissions deferred, %llu tasks without "
+                   "an answer, %llu given to another QPU, %u QPU(s) down: expected none of these",
+                   (unsigned long long)stats.jobs_failed, (unsigned long long)stats.jobs_timed_out,
+                   (unsigned long long)stats.retries, (unsigned long long)stats.submit_deferred,
+                   (unsigned long long)stats.tasks_failed, (unsigned long long)stats.tasks_moved, stats.down);
+            EXPECT((uint64_t)here == stats.jobs_submitted - stats.jobs_coalesced + stats.tasks_coalesced,
+                   "the jobs carried %llu tasks, expected %d",
+                   (unsigned long long)(stats.jobs_submitted - stats.jobs_coalesced + stats.tasks_coalesced), here);
+        }
+        if( (comes_back >= 0) && !gated ) {
+            EXPECT(stats.tasks_moved >= 1, "no task was given to another QPU while QPU %d took no job", comes_back);
+            EXPECT(0 == stats.tasks_failed, "%llu tasks completed without an answer", (unsigned long long)stats.tasks_failed);
+        }
+        if( verbose ) {
+            printf("rank %d: %llu tasks, %llu jobs, %llu failed, %llu retries, %llu deferred, %llu moved, "
+                   "at most %u waiting\n", rank, (unsigned long long)stats.tasks_completed,
+                   (unsigned long long)stats.jobs_submitted, (unsigned long long)stats.jobs_failed,
+                   (unsigned long long)stats.retries, (unsigned long long)stats.submit_deferred,
+                   (unsigned long long)stats.tasks_moved, stats.max_pending);
+        }
+    }
+
+    /* Each QPU, on the rank that owns it. */
+    for( int q = 0; q < nb_qpus; q++ ) {
+        parsec_qpu_device_info_t info;
+        parsec_qpu_stats_t stats;
+        parsec_qpu_mock_stats_t mock;
+        parsec_device_module_t *device;
+        long answers;
+
+        rc = parsec_qpu_device_info(q, &info);
+        if( (q == not_open) && (qpu_rank[q] == rank) ) {
+            /* Its backend did not open: no device here, no service, no answer. */
+            answers = qpu_test_sum(parsec, answers_of[q]);
+            all     = qpu_test_sum(parsec, 0);
+            EXPECT(PARSEC_ERR_NOT_FOUND == rc, "QPU %d, whose backend cannot be opened, is described (%d)", q, rc);
+            EXPECT(PARSEC_ERR_NOT_FOUND == parsec_qpu_service_stats_of(q, &stats), "QPU %d has a service", q);
+            EXPECT(0 == answers, "QPU %d, whose backend cannot be opened, gave %ld answers", q, answers);
+            continue;
+        }
+        /* What its answers say and what its device counted are the same
+         * tasks, when every task had one job and it was a good one. Every
+         * rank takes part in the sums, whatever it knows of this QPU. */
+        answers = qpu_test_sum(parsec, answers_of[q]);
+        all     = qpu_test_sum(parsec, ((PARSEC_SUCCESS == rc) && info.is_owner) ? (long)info.executed_tasks : 0);
+        EXPECT(PARSEC_SUCCESS == rc, "QPU %d cannot be described (%d)", q, rc);
+        if( PARSEC_SUCCESS != rc ) continue;
+        EXPECT(info.owner_rank == qpu_rank[q], "QPU %d is described as on rank %d, and is on rank %d",
+               q, info.owner_rank, qpu_rank[q]);
+        EXPECT(!!info.is_owner == (qpu_rank[q] == rank), "QPU %d: this rank %s it", q, info.is_owner ? "owns" : "does not own");
+        if( (faulty < 0) && (comes_back < 0) && !expect_rejected ) {
+            EXPECT(answers == all, "QPU %d gave %ld answers, and its device counts %ld tasks", q, answers, all);
+        }
+        if( only >= 0 ) {
+            EXPECT((q == only) || (0 == answers), "QPU %d gave %ld answers, and only QPU %d can run the circuits",
+                   q, answers, only);
+        }
+        if( q == majority ) {
+            EXPECT(2 * answers > (long)nt * len, "QPU %d, the faster one, gave %ld of the %ld answers",
+                   q, answers, (long)nt * len);
+        }
+        if( verbose && (0 == rank) ) printf("QPU %d on rank %d: %ld answers, %ld tasks\n", q, qpu_rank[q], answers, all);
+        if( !info.is_owner ) {
+            EXPECT(PARSEC_ERR_NOT_FOUND == parsec_qpu_service_stats_of(q, &stats),
+                   "this rank has a service for QPU %d, which it does not own", q);
+            continue;
+        }
+
+        executed += (long)info.executed_tasks;
+        device = parsec_mca_device_get((uint32_t)info.device_index);
+        EXPECT((NULL != device) && (PARSEC_DEV_QPU == device->type), "QPU %d: device %d is not of the QPU type",
+               q, info.device_index);
+        EXPECT(0 == info.load_ns, "QPU %d still carries a load of %lld ns", q, (long long)info.load_ns);
+        EXPECT(PARSEC_SUCCESS == parsec_qpu_service_stats_of(q, &stats), "QPU %d has no service on the rank that owns it", q);
+        /* What the service counted for this QPU is what its device counted:
+         * the service ran once here, and every body returned ASYNC. With
+         * the answers above, which name the QPU that ran each job, this is
+         * the count the QPU prints with device_show_statistics. */
+        EXPECT(stats.tasks_executed == info.executed_tasks, "QPU %d: its service counts %llu tasks for it, and its device %llu",
+               q, (unsigned long long)stats.tasks_executed, (unsigned long long)info.executed_tasks);
+        EXPECT(stats.max_in_flight <= info.max_outstanding, "QPU %d had %u jobs outstanding at once, its limit is %u",
+               q, stats.max_in_flight, info.max_outstanding);
+        /* Its limits are those of its entry in the list, or of the parameters. */
+        EXPECT((int)info.max_outstanding == parsec_qpu_list_option_int(q, "max_outstanding", parsec_qpu_params.max_outstanding),
+               "QPU %d keeps at most %u jobs outstanding, and was given a limit of %d", q, info.max_outstanding,
+               parsec_qpu_list_option_int(q, "max_outstanding", parsec_qpu_params.max_outstanding));
+        if( reach_limit ) {
+            EXPECT(stats.max_in_flight == info.max_outstanding, "QPU %d had at most %u jobs outstanding, and never reached "
+                   "its limit of %u", q, stats.max_in_flight, info.max_outstanding);
+        }
+        EXPECT(stats.max_job_tasks <= info.max_batch, "a job of QPU %d carried %u tasks, its limit is %u",
+               q, stats.max_job_tasks, info.max_batch);
+        if( q == faulty ) {
+            EXPECT(0 == stats.jobs_timed, "QPU %d, which gives no answer, had %llu job(s) that ended well",
+                   q, (unsigned long long)stats.jobs_timed);
+        }
+        if( q == comes_back ) {
+            EXPECT(0 == stats.down, "QPU %d is still taken for down at the end", q);
+            EXPECT(stats.submit_deferred >= 1, "QPU %d was never asked in vain", q);
+            EXPECT(stats.jobs_timed >= 1, "QPU %d ran no job once it took jobs again", q);
+        }
+        if( (NULL != info.backend) && (0 == strcmp(info.backend, "mock")) ) {
+            const int slots = parsec_qpu_list_option_int(q, "slots", parsec_qpu_params.mock_slots);
+
+            EXPECT(PARSEC_SUCCESS == parsec_qpu_mock_stats_of(q, &mock), "no mock is open for QPU %d", q);
+            EXPECT(mock.max_held <= info.max_outstanding, "the mock of QPU %d held %u jobs at once, the limit is %u",
+                   q, mock.max_held, info.max_outstanding);
+            if( (q == faulty) && (asked_at_most >= 0) ) {
+                EXPECT(mock.submit_calls <= (uint64_t)asked_at_most, "QPU %d, which takes no job, was asked for one %llu "
+                       "times; left alone once it was given up on, it is asked at most %d times",
+                       q, (unsigned long long)mock.submit_calls, asked_at_most);
+                EXPECT(mock.submit_calls >= 2, "QPU %d was asked for a job %llu time(s): it was never tried again",
+                       q, (unsigned long long)mock.submit_calls);
+            }
+            EXPECT(mock.max_running <= (uint32_t)slots, "the mock of QPU %d ran %u jobs at once on %d slots",
+                   q, mock.max_running, slots);
+            EXPECT(stats.jobs_submitted + mock.abandoned == mock.submits,
+                   "the mock of QPU %d created %llu jobs; its service counts %llu, and gave up on the submission of %llu",
+                   q, (unsigned long long)mock.submits, (unsigned long long)stats.jobs_submitted,
+                   (unsigned long long)mock.abandoned);
+            EXPECT((0 == mock.unknown_jobs) && (0 == mock.duplicate_tags) && (0 == mock.key_overlaps) &&
+                   (0 == mock.inputs_changed) && (0 == mock.mixed_shots) && (0 == mock.changed_jobs),
+                   "the mock of QPU %d: %u job(s) nobody knows of, %llu tags used twice, %llu evaluations held twice, "
+                   "%llu inputs changed under a job, %llu jobs of mixed shots, %llu jobs asked again with other circuits",
+                   q, mock.unknown_jobs, (unsigned long long)mock.duplicate_tags, (unsigned long long)mock.key_overlaps,
+                   (unsigned long long)mock.inputs_changed, (unsigned long long)mock.mixed_shots,
+                   (unsigned long long)mock.changed_jobs);
+            if( verbose ) {
+                printf("rank %d, QPU %d: %llu jobs, at most %u outstanding of %u, %llu failed, %llu deferred, "
+                       "%llu moved; mock: %llu submissions, at most %u running on %d slots\n", rank, q,
+                       (unsigned long long)stats.jobs_submitted, stats.max_in_flight, info.max_outstanding,
+                       (unsigned long long)stats.jobs_failed, (unsigned long long)stats.submit_deferred,
+                       (unsigned long long)stats.tasks_moved, (unsigned long long)mock.submit_calls, mock.max_running, slots);
+            }
+        }
+    }
+    /* Each quantum task of this rank was counted by one of its QPUs. */
+    EXPECT(executed == here, "the QPU devices of this rank count %ld tasks, and %d quantum tasks ran here", executed, here);
+
+    if( no_free_place && (owns > 0) ) errors += multi_check_no_free_place(rank, nt * len, 2 == no_free_place);
+    if( gated ) {
+        const int64_t waited = recs[1].t_submit - recs[1].t_hook, job = recs[0].t_retrieve - recs[0].t_submit;
+
+        parsec_qpu_mock_set_fault_fn(NULL, NULL);
+        EXPECT(1 == gate_asked_again, "the mock was asked again for the first job %d time(s), expected once", gate_asked_again);
+        EXPECT(recs[1].t_hook < recs[0].t_retrieve, "the second task was submitted after the first job had ended: "
+               "the two did not meet as this test needs them to");
+        EXPECT(2 * waited <= job, "the second task was submitted while its QPU was asked again for the first job, which "
+               "took %.0f ms, and its own job was asked for %.0f ms later: it was left on the way beside a free place",
+               job * 1e-6, waited * 1e-6);
+        if( verbose ) printf("the second task waited %.3f ms for its job to be asked for\n", waited * 1e-6);
+    }
+
+    errors += nb_errors;
+    all   = qpu_test_sum(parsec, errors);
+    total = qpu_test_sum(parsec, total);
+    if( total != (long)nt * len ) {
+        if( 0 == rank ) fprintf(stderr, "%ld CHECK tasks ran in total, expected %ld\n", total, (long)nt * len);
+        all++;
+    }
+
+    qpu_test_block_type_unset(&tp->arenas_datatypes[PARSEC_qpu_multi_DEFAULT_ADT_IDX]);
+    PARSEC_OBJ_DESTRUCT(&tp->arenas_datatypes[PARSEC_qpu_multi_DEFAULT_ADT_IDX]);
+    parsec_taskpool_free((parsec_taskpool_t*)tp);
+    qpu_test_placement_free(W);
+    qpu_test_placement_free(Q);
+    free(recs);
+
+    rc = parsec_tests_context_fini(&parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
+
+    if( 0 == rank ) {
+        printf("qpu_multi: %d chains of %d on %d rank(s), %d QPU(s) on %d rank(s), -P %s: %s\n",
+               nt, len, world, nb_qpus, nb_owners, pin, all ? "FAILED" : "passed");
+    }
+    return all ? 1 : 0;
+}
+
+%}

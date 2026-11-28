@@ -1,0 +1,235 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+/**
+ * A task class with a body of type QPU and a CPU body.
+ *
+ * EVAL(k) has both. Which one runs is the runtime's choice, and depends on
+ * nothing in this file:
+ *   - built without QPU support, the QPU body is not even compiled, and the
+ *     CPU body runs;
+ *   - built with it, in a context that has no QPU device (the default: the
+ *     device is asked for with --mca device_qpu_enabled 1), the QPU
+ *     incarnation is dropped when the taskpool starts, and the CPU body runs;
+ *   - in a context that has a QPU device, the QPU body runs.
+ *
+ * The QPU body submits a one-qubit circuit and the task completes when the
+ * job is over; the CPU body leaves a mark in the same tile. After the run the
+ * tiles say which body each task ran, and the test compares that with what
+ * it was told to expect.
+ *
+ * Options, before "--":
+ *   -x cpu|qpu   the body every task is expected to run (default cpu)
+ *   -n NT        tasks (default 8)
+ *   -v           verbose
+ */
+
+#include "parsec/parsec_internal.h"
+#include "parsec/data_dist/matrix/two_dim_rectangle_cyclic.h"
+#include "parsec/mca/device/device.h"
+#include "tests/tests_runtime.h"
+#if defined(PARSEC_HAVE_QPU)
+#include "parsec/mca/device/qpu/device_qpu.h"
+#endif
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* A tile, and every flow, is this many doubles: room for the circuit, and
+ * for a result with the two outcomes one qubit has. */
+#define TILE_DOUBLES   32
+#define TILE_BYTES     (TILE_DOUBLES * sizeof(double))
+#define SHOTS          64
+#define CPU_MARK       0x43505521
+
+static int verbose = 0;
+
+%}
+
+A          [type = "parsec_data_collection_t*"]
+NT         [type = int]
+
+PREP(k)
+  k = 0 .. NT-1
+: A(0, k)
+
+  WRITE C -> C EVAL(k)
+
+BODY
+  if( NULL == C ) return PARSEC_HOOK_RETURN_ERROR;   /* a flow that is written always has a copy */
+  memset(C, 0, TILE_BYTES);
+#if defined(PARSEC_HAVE_QPU)
+  /* One qubit in an equal superposition, measured. */
+  parsec_qpu_circuit_init((parsec_qpu_circuit_t*)C, 1, 0);
+  (void)parsec_qpu_circuit_add((parsec_qpu_circuit_t*)C, TILE_BYTES, PARSEC_QPU_OP_H, 0, 0, PARSEC_QPU_NO_PARAM, 0.0);
+  (void)parsec_qpu_circuit_measure_all((parsec_qpu_circuit_t*)C, TILE_BYTES);
+#endif
+END
+
+EVAL(k)
+  k = 0 .. NT-1
+: A(0, k)
+
+  READ C <- C PREP(k)
+  RW   R <- A(0, k)
+         -> A(0, k)
+
+BODY [type=QPU]
+  if(verbose) printf("EVAL(%d): the QPU body\n", k);
+  memset(R, 0xff, TILE_BYTES);
+  return parsec_qpu_submit(es, (parsec_task_t*)this_task, _f_C, NULL, _f_R, SHOTS, PARSEC_QPU_KEY_AUTO);
+END
+
+BODY
+  if(verbose) printf("EVAL(%d): the CPU body\n", k);
+  memset(R, 0, TILE_BYTES);
+  ((int*)R)[0] = CPU_MARK;
+END
+
+extern "C" %{
+
+static parsec_matrix_block_cyclic_t descA;
+
+/* 1 when the tile holds the result of a job of SHOTS shots on one qubit. */
+static int is_qpu_result(const void *tile)
+{
+#if defined(PARSEC_HAVE_QPU)
+    const parsec_qpu_result_t *result = (const parsec_qpu_result_t*)tile;
+    uint64_t bits, shots = 0;
+    uint32_t count;
+
+    if( (PARSEC_QPU_RESULT_VERSION != result->version) || (PARSEC_QPU_STATUS_OK != result->status) ) return 0;
+    if( (1 != result->nb_qubits) || (SHOTS != result->shots_requested) || (SHOTS != result->shots_returned) ) return 0;
+    if( (result->nb_entries < 1) || (result->nb_entries > 2) ) return 0;
+    for( uint32_t i = 0; i < result->nb_entries; i++ ) {
+        parsec_qpu_result_get_entry(result, i, &bits, &count);
+        if( bits > 1 ) return 0;
+        shots += count;
+    }
+    return SHOTS == shots;
+#else
+    (void)tile;
+    return 0;
+#endif
+}
+
+int main(int argc, char *argv[])
+{
+    parsec_qpu_fallback_taskpool_t *tp;
+    parsec_context_t *parsec;
+    const char *expect = "cpu";
+    int nt = 8, rc, rank = 0, np = 1, nb_qpus, nb_cpu = 0, nb_qpu = 0, nb_other = 0, errors = 0, eval_has_qpu = -1;
+    int pargc = 0; char **pargv = NULL;
+
+    for( int i = 1; i < argc; i++ ) {
+        if( 0 == strcmp(argv[i], "--") ) {
+            pargc = argc - i;
+            pargv = argv + i;
+            break;
+        }
+        if( 0 == strcmp(argv[i], "-v") ) { verbose = 1; continue; }
+        if( i + 1 >= argc ) break;
+        if( 0 == strcmp(argv[i], "-x") ) expect = argv[++i];
+        else if( 0 == strcmp(argv[i], "-n") ) nt = atoi(argv[++i]);
+    }
+    if( nt <= 0 ) nt = 8;
+    if( (0 != strcmp(expect, "cpu")) && (0 != strcmp(expect, "qpu")) ) {
+        fprintf(stderr, "qpu_fallback: -x takes cpu or qpu\n");
+        return 1;
+    }
+
+    rc = parsec_tests_context_init(-1, PARSEC_TEST_THREAD_SERIALIZED, &pargc, &pargv, &parsec, &rank, &np);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_init");
+    if( 1 != np ) {
+        fprintf(stderr, "qpu_fallback runs on one rank\n");
+        parsec_tests_abort(parsec, 1);
+    }
+    nb_qpus = parsec_context_query(parsec, PARSEC_CONTEXT_QUERY_DEVICES, PARSEC_DEV_QPU);
+
+    /* NT tiles in a row, all on this rank. */
+    parsec_matrix_block_cyclic_init(&descA, PARSEC_MATRIX_DOUBLE, PARSEC_MATRIX_TILE,
+                                    rank,
+                                    1, TILE_DOUBLES, 1, nt * TILE_DOUBLES,
+                                    0, 0, 1, nt * TILE_DOUBLES, 1, 1, 1, 1, 0, 0);
+    descA.mat = parsec_data_allocate((size_t)nt * TILE_BYTES);
+    memset(descA.mat, 0x5a, (size_t)nt * TILE_BYTES);
+
+    tp = parsec_qpu_fallback_new((parsec_data_collection_t*)&descA, nt);
+    /* One rank, so the datatype of the arena is never used. */
+    parsec_arena_datatype_set_type(&tp->arenas_datatypes[PARSEC_qpu_fallback_DEFAULT_ADT_IDX],
+                                   TILE_BYTES, PARSEC_ARENA_ALIGNMENT_SSE, PARSEC_DATATYPE_NULL);
+
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+    rc = parsec_context_add_taskpool(parsec, (parsec_taskpool_t*)tp);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+    rc = parsec_context_wait(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+
+    /* What the taskpool kept of the incarnations of EVAL when it started. */
+    for( uint32_t i = 0; i < tp->super.nb_task_classes; i++ ) {
+        const parsec_task_class_t *tc = tp->super.task_classes_array[i];
+        if( (NULL != tc) && (0 == strcmp(tc->name, "EVAL")) ) {
+            eval_has_qpu = (0 != (PARSEC_DEV_QPU & parsec_task_class_device_types(tc)));
+        }
+    }
+
+    for( int k = 0; k < nt; k++ ) {
+        const void *tile = (const char*)descA.mat + (size_t)k * TILE_BYTES;
+        if( CPU_MARK == ((const int*)tile)[0] ) nb_cpu++;
+        else if( is_qpu_result(tile) ) nb_qpu++;
+        else {
+            nb_other++;
+            fprintf(stderr, "qpu_fallback: tile %d holds neither the mark of the CPU body nor a result\n", k);
+        }
+    }
+
+    if( 0 == strcmp(expect, "qpu") ) {
+        if( 1 != nb_qpus ) {
+            fprintf(stderr, "qpu_fallback: the context has %d QPU device(s), expected 1\n", nb_qpus);
+            errors++;
+        }
+        if( nt != nb_qpu ) {
+            fprintf(stderr, "qpu_fallback: %d of %d tasks ran the QPU body (%d ran the CPU body)\n", nb_qpu, nt, nb_cpu);
+            errors++;
+        }
+        if( 1 != eval_has_qpu ) {
+            fprintf(stderr, "qpu_fallback: the task class lost its QPU incarnation in a context with a QPU device\n");
+            errors++;
+        }
+    } else {
+        if( 0 != nb_qpus ) {
+            fprintf(stderr, "qpu_fallback: the context has %d QPU device(s), expected none\n", nb_qpus);
+            errors++;
+        }
+        if( nt != nb_cpu ) {
+            fprintf(stderr, "qpu_fallback: %d of %d tasks ran the CPU body (%d ran the QPU body)\n", nb_cpu, nt, nb_qpu);
+            errors++;
+        }
+        /* Not kept and passed over: dropped when the taskpool started. */
+        if( 0 != eval_has_qpu ) {
+            fprintf(stderr, "qpu_fallback: the task class still has a QPU incarnation in a context without a QPU device\n");
+            errors++;
+        }
+    }
+    errors += nb_other;
+
+    PARSEC_OBJ_DESTRUCT(&tp->arenas_datatypes[PARSEC_qpu_fallback_DEFAULT_ADT_IDX]);
+    parsec_taskpool_free((parsec_taskpool_t*)tp);
+    parsec_data_free(descA.mat);
+    parsec_tiled_matrix_destroy((parsec_tiled_matrix_t*)&descA);
+
+    rc = parsec_tests_context_fini(&parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
+
+    printf("qpu_fallback: %d tasks, %d ran the CPU body and %d the QPU body, %s expected: %s\n",
+           nt, nb_cpu, nb_qpu, expect, errors ? "FAILED" : "passed");
+    return errors ? 1 : 0;
+}
+
+%}

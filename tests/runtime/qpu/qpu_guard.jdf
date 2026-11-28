@@ -1,0 +1,365 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+/**
+ * The guard against reaching hardware by accident.
+ *
+ * A backend that can drive a quantum device may be used only when
+ * device_qpu_allow_hardware is set, and no test sets it. This test registers
+ * two backends of its own that drive nothing and count what is asked of
+ * them:
+ *
+ *   guard_physical  says, before it is opened, that it can drive a device
+ *   guard_late      says so only in its capabilities, once it is open
+ *
+ * and runs two quantum tasks with the backend named on the command line
+ * (--mca device_qpu_backend, after "--"). TRY submits from a body that is
+ * not of the QPU type, so it runs whatever devices there are and sees what
+ * its submission is answered. TYPED has a body of type QPU and a CPU body,
+ * so the runtime chooses: the QPU body where there is a QPU device, the CPU
+ * body where there is none.
+ *
+ *   guard_physical  there is no QPU device; the submission of TRY is refused
+ *                   and TYPED runs its CPU body; the backend was never opened
+ *   guard_late      the same; the backend was opened once, asked what it
+ *                   is, and closed; it received no job
+ *   guard_missing   (a name no backend has) the same, and nothing was opened
+ *   adapter         with an adapter that says it drives a quantum device (the
+ *                   test's own, which drives nothing): the same as guard_late.
+ *                   With -A before "--", nothing listens where the adapter is
+ *                   said to be: the same again, and no refusal is counted
+ *   mock            the control: there is a QPU device, both tasks submit and
+ *                   get their results, so the refusals above are the guard's
+ *                   doing
+ *
+ * In no case may another backend be used in place of the one asked for.
+ */
+
+#include "qpu_test_common.h"
+#include "parsec/constants.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+static int submit_seen = 0, typed_seen = 0, fallback_seen = 0;
+static parsec_hook_return_t submit_rc = PARSEC_HOOK_RETURN_DONE, typed_rc = PARSEC_HOOK_RETURN_DONE;
+
+/* What was asked of the test's backends. One thread at a time gets here. */
+static int fake_opens = 0, fake_closes = 0, fake_capabilities = 0, fake_submits = 0;
+
+static const parsec_qpu_backend_ops_t guard_physical_ops, guard_late_ops;
+
+static int fake_open(parsec_qpu_backend_t **backend, const parsec_qpu_backend_ops_t *ops)
+{
+    parsec_qpu_backend_t *fake = (parsec_qpu_backend_t*)calloc(1, sizeof(parsec_qpu_backend_t));
+    fake->ops = ops;
+    fake_opens++;
+    *backend = fake;
+    return PARSEC_SUCCESS;
+}
+
+static int fake_open_physical(parsec_qpu_backend_t **backend, int device_index)
+{
+    (void)device_index;
+    return fake_open(backend, &guard_physical_ops);
+}
+
+static int fake_open_late(parsec_qpu_backend_t **backend, int device_index)
+{
+    (void)device_index;
+    return fake_open(backend, &guard_late_ops);
+}
+
+static int fake_caps(parsec_qpu_backend_t *backend, parsec_qpu_caps_t *caps)
+{
+    (void)backend;
+    fake_capabilities++;
+    caps->nb_qubits            = 64;
+    caps->max_shots            = 0;
+    caps->max_jobs             = 0;
+    caps->max_circuits_per_job = 1;
+    caps->is_physical          = 1;
+    return PARSEC_SUCCESS;
+}
+
+/* If the guard did not hold, the job is refused here, and counted. */
+static int fake_submit(parsec_qpu_backend_t *backend, const parsec_qpu_request_t *requests, int nb,
+                       uint64_t tag, parsec_qpu_job_id_t *id)
+{
+    (void)backend; (void)requests; (void)nb; (void)tag; (void)id;
+    fake_submits++;
+    return PARSEC_ERR_NOT_SUPPORTED;
+}
+
+static int fake_wait(parsec_qpu_backend_t *backend, int64_t timeout_ns, parsec_qpu_event_t *events, int max_events)
+{
+    struct timespec ts = { 0, 1000000 };
+    (void)backend; (void)events; (void)max_events;
+    if( (timeout_ns >= 0) && (timeout_ns < 1000000) ) ts.tv_nsec = (long)timeout_ns;
+    nanosleep(&ts, NULL);
+    return 0;
+}
+
+static int fake_wakeup(parsec_qpu_backend_t *backend) { (void)backend; return PARSEC_SUCCESS; }
+
+static int fake_results(parsec_qpu_backend_t *backend, parsec_qpu_job_id_t id, parsec_qpu_result_t **results, int nb)
+{
+    (void)backend; (void)id; (void)results; (void)nb;
+    return PARSEC_ERR_NOT_FOUND;
+}
+
+static int fake_cancel(parsec_qpu_backend_t *backend, parsec_qpu_job_id_t id)
+{
+    (void)backend; (void)id;
+    return PARSEC_ERR_NOT_FOUND;
+}
+
+static int fake_close(parsec_qpu_backend_t *backend)
+{
+    fake_closes++;
+    free(backend);
+    return PARSEC_SUCCESS;
+}
+
+static const parsec_qpu_backend_ops_t guard_physical_ops = {
+    .name = "guard_physical", .physical = 1,
+    .open = fake_open_physical, .capabilities = fake_caps, .submit = fake_submit, .wait = fake_wait,
+    .wakeup = fake_wakeup, .results = fake_results, .cancel = fake_cancel, .close = fake_close
+};
+
+static const parsec_qpu_backend_ops_t guard_late_ops = {
+    .name = "guard_late", .physical = 0,
+    .open = fake_open_late, .capabilities = fake_caps, .submit = fake_submit, .wait = fake_wait,
+    .wakeup = fake_wakeup, .results = fake_results, .cancel = fake_cancel, .close = fake_close
+};
+%}
+
+W        [ type = "parsec_data_collection_t*" ]
+R        [ type = "parsec_data_collection_t*" ]
+
+PREP(z)
+
+z = 0 .. 0
+
+: W(0)
+
+WRITE C  -> C  TRY(0)
+         -> C  TYPED(0)
+WRITE TH -> TH TRY(0)
+         -> TH TYPED(0)
+
+BODY
+{
+    qpu_test_make_circuit(C, 1, 2, 0);
+    qpu_test_make_params(TH, 1, 2);
+}
+END
+
+TRY(z)
+
+z = 0 .. 0
+
+: R(0)
+
+READ C   <- C  PREP(0)
+READ TH  <- TH PREP(0)
+RW   RES <- R(0)
+         -> R(0)
+
+BODY
+{
+    memset(RES, 0xff, QPU_TEST_BLOCK);
+    submit_rc   = PARSEC_QPU_SUBMIT_KEYED(C, TH, RES, 50, qpu_test_key(1, 2));
+    submit_seen = 1;
+    /* The task was taken only if the answer is ASYNC. A refusal leaves it
+     * with this body, which then simply ends. */
+    if( PARSEC_HOOK_RETURN_ASYNC == submit_rc ) return submit_rc;
+}
+END
+
+TYPED(z)
+
+z = 0 .. 0
+
+: R(1)
+
+READ C   <- C  PREP(0)
+READ TH  <- TH PREP(0)
+RW   RES <- R(1)
+         -> R(1)
+
+BODY [type=QPU]
+{
+    memset(RES, 0xff, QPU_TEST_BLOCK);
+    typed_rc   = PARSEC_QPU_SUBMIT_KEYED(C, TH, RES, 50, qpu_test_key(1, 3));
+    typed_seen = 1;
+    if( PARSEC_HOOK_RETURN_ASYNC == typed_rc ) return typed_rc;
+}
+END
+
+BODY
+{
+    /* What the runtime runs when the context has no QPU device. */
+    fallback_seen = 1;
+}
+END
+
+extern "C" %{
+
+#define EXPECT(COND, ...)                                                   \
+    do {                                                                    \
+        if( !(COND) ) {                                                     \
+            fprintf(stderr, "qpu_guard (%s): ", name);                      \
+            fprintf(stderr, __VA_ARGS__);                                   \
+            fprintf(stderr, "\n");                                          \
+            errors++;                                                       \
+        }                                                                   \
+    } while(0)
+
+int main(int argc, char *argv[])
+{
+    parsec_context_t *parsec;
+    parsec_qpu_guard_taskpool_t *tp;
+    parsec_data_collection_t *W, *R;
+    parsec_qpu_stats_t stats;
+    parsec_qpu_mock_stats_t mock;
+    parsec_qpu_device_info_t info;
+    int nb_qpus, have_info;
+    const char *name = "before init";
+    char name_copy[64];
+    int rank = 0, world = 1, rc, test_argc, pargc, errors = 0;
+    char **pargv;
+
+    qpu_test_split_args(argc, argv, &test_argc, &pargc, &pargv);
+
+    /* Backends are added before the runtime starts. */
+    EXPECT(PARSEC_SUCCESS == parsec_qpu_backend_register(&guard_physical_ops), "could not register guard_physical");
+    EXPECT(PARSEC_SUCCESS == parsec_qpu_backend_register(&guard_late_ops), "could not register guard_late");
+    EXPECT(PARSEC_ERR_EXISTS == parsec_qpu_backend_register(&guard_late_ops), "a backend was registered twice");
+    EXPECT(&guard_physical_ops == parsec_qpu_backend_find("guard_physical"), "guard_physical is not found by its name");
+    EXPECT(&parsec_qpu_backend_mock_ops == parsec_qpu_backend_find("mock"), "the mock is not found by its name");
+    EXPECT(NULL == parsec_qpu_backend_find("guard_missing"), "a backend that does not exist was found");
+
+    rc = parsec_tests_context_init(-1, PARSEC_TEST_THREAD_SERIALIZED, &pargc, &pargv, &parsec, &rank, &world);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_init");
+    if( 1 != world ) {
+        fprintf(stderr, "qpu_guard runs on one rank\n");
+        parsec_tests_abort(parsec, 1);
+    }
+    /* A copy: the parameter does not outlive the context. */
+    snprintf(name_copy, sizeof(name_copy), "%s", (NULL != parsec_qpu_params.backend) ? parsec_qpu_params.backend : "(none)");
+    name = name_copy;
+    EXPECT(0 == parsec_qpu_params.allow_hardware, "device_qpu_allow_hardware is set: this test is about it not being set");
+
+    W = qpu_test_placement_new(rank, world, -1);
+    R = qpu_test_tiles_new(rank, world, 0, 2);
+    /* What the context has, before any task runs. */
+    nb_qpus   = parsec_context_query(parsec, PARSEC_CONTEXT_QUERY_DEVICES, PARSEC_DEV_QPU);
+    have_info = (PARSEC_SUCCESS == parsec_qpu_device_info(0, &info));
+    tp = parsec_qpu_guard_new(W, R);
+    qpu_test_block_type_set(&tp->arenas_datatypes[PARSEC_qpu_guard_DEFAULT_ADT_IDX]);
+
+    rc = parsec_context_add_taskpool(parsec, (parsec_taskpool_t*)tp);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+    rc = parsec_context_wait(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+
+    parsec_qpu_service_stats(&stats);
+    parsec_qpu_mock_stats(&mock);
+
+    EXPECT(submit_seen, "the task that submits did not run");
+    EXPECT(typed_seen + fallback_seen == 1, "the task with a QPU body and a CPU body ran %d bodies",
+           typed_seen + fallback_seen);
+    EXPECT(0 == fake_submits, "a backend that says it drives a quantum device received %d job(s)", fake_submits);
+
+    if( 0 == strcmp(name, "mock") ) {
+        unsigned char circuit[QPU_TEST_BLOCK], params[QPU_TEST_BLOCK];
+        /* The control: with a backend that may be used, the same tasks run. */
+        EXPECT(1 == nb_qpus, "the context has %d QPU device(s) with the mock, expected 1", nb_qpus);
+        EXPECT(have_info && info.is_owner && !info.is_physical, "the QPU device is not described as the mock on its rank");
+        EXPECT(PARSEC_HOOK_RETURN_ASYNC == submit_rc, "the submission returned %d with the mock", (int)submit_rc);
+        EXPECT(typed_seen && !fallback_seen, "with a QPU device, the CPU body ran in place of the QPU body");
+        EXPECT(PARSEC_HOOK_RETURN_ASYNC == typed_rc, "the submission of the QPU body returned %d with the mock", (int)typed_rc);
+        EXPECT(0 == fake_opens, "a backend of the test was opened %d time(s) when the mock was asked for", fake_opens);
+        EXPECT(1 == mock.opens, "the mock was opened %llu time(s)", (unsigned long long)mock.opens);
+        EXPECT(0 == stats.refused_hardware, "%llu backend(s) refused", (unsigned long long)stats.refused_hardware);
+        qpu_test_make_circuit(circuit, 1, 2, 0);
+        qpu_test_make_params(params, 1, 2);
+        errors += qpu_test_check_result(qpu_test_tiles_ptr(R, 0), circuit, params, 50, qpu_test_key(1, 2), "tile", 1, 2);
+        errors += qpu_test_check_result(qpu_test_tiles_ptr(R, 1), circuit, params, 50, qpu_test_key(1, 3), "tile", 1, 3);
+        errors += qpu_test_check_service(1, 2, 0, 0);
+    } else {
+        /* No backend that may be used, so no device: the runtime chose the CPU
+         * body by itself, and a body that submits all the same is refused. */
+        EXPECT(0 == nb_qpus, "the context has %d QPU device(s) without a backend that may be used", nb_qpus);
+        EXPECT(!have_info, "a QPU device is described although its backend may not be used");
+        EXPECT(fallback_seen && !typed_seen, "without a QPU device, the QPU body ran");
+        EXPECT(PARSEC_HOOK_RETURN_ERROR == submit_rc, "the submission returned %d, not an error", (int)submit_rc);
+        EXPECT(0 == mock.opens, "the mock was opened in place of the backend that was asked for");
+        EXPECT(0 == stats.running, "a progress thread runs");
+        EXPECT(0 == stats.backend_open, "a backend is open");
+        EXPECT(0 == stats.jobs_submitted, "%llu job(s) submitted", (unsigned long long)stats.jobs_submitted);
+        if( 0 == strcmp(name, "guard_physical") ) {
+            EXPECT(0 == fake_opens, "a backend that says it drives a quantum device was opened %d time(s)", fake_opens);
+            EXPECT(0 == fake_capabilities, "it was asked for its capabilities %d time(s)", fake_capabilities);
+            EXPECT(1 == stats.refused_hardware, "%llu refusal(s) counted, expected 1", (unsigned long long)stats.refused_hardware);
+        } else if( 0 == strcmp(name, "guard_late") ) {
+            EXPECT(1 == fake_opens, "the backend was opened %d time(s), expected once", fake_opens);
+            EXPECT(1 == fake_capabilities, "it was asked for its capabilities %d time(s), expected once", fake_capabilities);
+            EXPECT(1 == fake_closes, "it was closed %d time(s) after it said what it is, expected once", fake_closes);
+            EXPECT(1 == stats.refused_hardware, "%llu refusal(s) counted, expected 1", (unsigned long long)stats.refused_hardware);
+        } else if( 0 == strcmp(name, "adapter") ) {
+            /* The client of an adapter that says it drives a quantum device
+             * (the test's own adapter says so, and drives nothing): opened,
+             * heard, closed, and given no job, which the adapter checks. */
+            parsec_qpu_adapter_stats_t adapter;
+            int absent = 0;
+            for( int i = 1; i < test_argc; i++ ) {
+                if( 0 == strcmp(argv[i], "-A") ) absent = 1;
+            }
+            /* That it was given no job is the adapter's to say: the client
+             * that was refused is closed, and its counters with it. The
+             * adapter of the tests is started with -N and fails the test if
+             * a job reaches it. */
+            parsec_qpu_adapter_stats(&adapter);
+            EXPECT(0 == fake_opens, "a backend of the test was opened %d time(s) when the adapter was asked for", fake_opens);
+            if( absent ) {
+                /* -A: nothing listens where the adapter is said to be. The
+                 * client does not open, and that is no refusal of hardware. */
+                EXPECT(0 == adapter.opens, "the client of an adapter that is not there opened %llu time(s)", (unsigned long long)adapter.opens);
+                EXPECT(0 == stats.refused_hardware, "%llu refusal(s) counted for an adapter that is not there",
+                       (unsigned long long)stats.refused_hardware);
+            } else {
+                EXPECT(1 == adapter.opens, "the client of the adapter was opened %llu time(s), expected once", (unsigned long long)adapter.opens);
+                EXPECT(1 == stats.refused_hardware, "%llu refusal(s) counted, expected 1", (unsigned long long)stats.refused_hardware);
+            }
+        } else {
+            EXPECT(0 == fake_opens, "a backend of the test was opened %d time(s) for an unknown name", fake_opens);
+            EXPECT(0 == stats.refused_hardware, "%llu refusal(s) counted for a backend that does not exist",
+                   (unsigned long long)stats.refused_hardware);
+        }
+    }
+
+    qpu_test_block_type_unset(&tp->arenas_datatypes[PARSEC_qpu_guard_DEFAULT_ADT_IDX]);
+    PARSEC_OBJ_DESTRUCT(&tp->arenas_datatypes[PARSEC_qpu_guard_DEFAULT_ADT_IDX]);
+    parsec_taskpool_free((parsec_taskpool_t*)tp);
+    qpu_test_placement_free(W);
+    qpu_test_tiles_free(R);
+
+    rc = parsec_tests_context_fini(&parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
+    EXPECT(fake_opens == fake_closes, "a backend of the test was opened %d time(s) and closed %d", fake_opens, fake_closes);
+
+    printf("qpu_guard: backend %s: %s\n", name, errors ? "FAILED" : "passed");
+    return errors ? 1 : 0;
+}
+
+%}

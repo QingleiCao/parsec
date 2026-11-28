@@ -1,0 +1,314 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+/**
+ * CPU, GPU and QPU incarnations in one task graph, over the same data.
+ *
+ * For each chain k:
+ *
+ *   GINIT(k)   fills the tiles D and G, each with a pattern    CUDA body, or CPU body
+ *   PREP(k)    writes a circuit and its parameters             CPU body
+ *   QEXEC(k)   checks that D and G hold their patterns, fills  QPU body
+ *              a flow of its own, then submits the job with D
+ *              as its result
+ *   GCOPY(k)   copies D into the tile E                        CUDA body, or CPU body
+ *   CHECK(k)   verifies that E is the result of the job        CPU body
+ *
+ * The same tile goes from an accelerator to the QPU and back:
+ *   - what the accelerator wrote has to be in host memory when the quantum
+ *     task runs, since a QPU holds no data and its task reads on the host.
+ *     That holds for every input of the task: G is the last of them, in a
+ *     task that also has a flow it only writes, which is the shape of a
+ *     quantum task that reads its inputs and writes a result;
+ *   - the result the QPU layer writes on the host has to replace the copy
+ *     the accelerator still has of D. If the runtime were not told that the
+ *     quantum task wrote D, GCOPY would copy the pattern, and CHECK would
+ *     find it where it expects a result.
+ *
+ * GINIT and GCOPY have a CUDA body and a CPU body. Without a CUDA device the
+ * CPU bodies run and the graph is the same; with -g the test requires the
+ * CUDA bodies to have run, and is skipped when there is no CUDA device.
+ *
+ * Options, before "--":
+ *   -n NT     chains (default 16)
+ *   -s SHOTS  shots per job (default 100)
+ *   -g        the CUDA bodies must run
+ *   -q N      the context must have N QPU devices (default: one at least).
+ *             With several, a quantum task runs on whichever has a place,
+ *             and the tasks the devices executed are counted together
+ *   -v        verbose
+ */
+
+#include "qpu_test_common.h"
+#include "parsec/sys/atomic.h"
+#include "parsec/constants.h"
+#if defined(PARSEC_HAVE_DEV_CUDA_SUPPORT)
+#include "parsec/mca/device/cuda/device_cuda.h"
+#endif
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define PATTERN   0x11
+#define PATTERN_G 0x2e
+#define PATTERN_X 0x5c
+
+static int verbose = 0;
+static int32_t nb_errors = 0;
+static int32_t gpu_bodies = 0, cpu_bodies = 0, qpu_bodies = 0, checked = 0;
+%}
+
+W            [ type = "parsec_data_collection_t*" ]
+A            [ type = "parsec_data_collection_t*" ]
+B            [ type = "parsec_data_collection_t*" aligned = A ]
+NT           [ type = int ]
+SHOTS        [ type = int ]
+
+GINIT(k)
+
+k = 0 .. NT-1
+
+: A(k)
+
+RW D <- A(k)
+     -> D QEXEC(k)
+RW G <- B(k)
+     -> G QEXEC(k)
+
+BODY [type=CUDA]
+{
+    cudaMemset(D, PATTERN, QPU_TEST_BLOCK);
+    cudaMemset(G, PATTERN_G, QPU_TEST_BLOCK);
+    (void)parsec_atomic_fetch_inc_int32(&gpu_bodies);
+}
+END
+
+BODY
+{
+    memset(D, PATTERN, QPU_TEST_BLOCK);
+    memset(G, PATTERN_G, QPU_TEST_BLOCK);
+    (void)parsec_atomic_fetch_inc_int32(&cpu_bodies);
+}
+END
+
+PREP(k)
+
+k = 0 .. NT-1
+
+: W(0)
+
+WRITE C  -> C  QEXEC(k)
+         -> C  CHECK(k)
+WRITE TH -> TH QEXEC(k)
+         -> TH CHECK(k)
+
+BODY
+{
+    qpu_test_make_circuit(C, k, 0, 0);
+    qpu_test_make_params(TH, k, 0);
+}
+END
+
+QEXEC(k)
+
+k = 0 .. NT-1
+
+: A(k)
+
+READ  C   <- C  PREP(k)
+READ  TH  <- TH PREP(k)
+RW    D   <- D  GINIT(k)
+          -> D  GCOPY(k)
+WRITE AUX -> AUX CHECK(k)
+READ  G   <- G  GINIT(k)
+
+BODY [type=QPU]
+{
+    const unsigned char *bytes = (const unsigned char*)D, *gbytes = (const unsigned char*)G;
+
+    /* What the task before wrote, wherever it ran, is on the host. */
+    for( int i = 0; i < QPU_TEST_BLOCK; i++ ) {
+        if( PATTERN != bytes[i] ) {
+            fprintf(stderr, "QEXEC(%d): byte %d of the tile is %02x on the host, the task before wrote %02x\n",
+                    k, i, bytes[i], PATTERN);
+            (void)parsec_atomic_fetch_inc_int32(&nb_errors);
+            break;
+        }
+    }
+    for( int i = 0; i < QPU_TEST_BLOCK; i++ ) {
+        if( PATTERN_G != gbytes[i] ) {
+            fprintf(stderr, "QEXEC(%d): byte %d of the second tile is %02x on the host, the task before wrote %02x\n",
+                    k, i, gbytes[i], PATTERN_G);
+            (void)parsec_atomic_fetch_inc_int32(&nb_errors);
+            break;
+        }
+    }
+    memset(AUX, PATTERN_X, QPU_TEST_BLOCK);
+    (void)parsec_atomic_fetch_inc_int32(&qpu_bodies);
+    return PARSEC_QPU_SUBMIT_KEYED(C, TH, D, SHOTS, qpu_test_key(k, 0));
+}
+END
+
+GCOPY(k)
+
+k = 0 .. NT-1
+
+: A(NT + k)
+
+READ D <- D QEXEC(k)
+RW   E <- A(NT + k)
+       -> E CHECK(k)
+
+BODY [type=CUDA]
+{
+    cudaMemcpy(E, D, QPU_TEST_BLOCK, cudaMemcpyDeviceToDevice);
+    (void)parsec_atomic_fetch_inc_int32(&gpu_bodies);
+}
+END
+
+BODY
+{
+    memcpy(E, D, QPU_TEST_BLOCK);
+    (void)parsec_atomic_fetch_inc_int32(&cpu_bodies);
+}
+END
+
+CHECK(k)
+
+k = 0 .. NT-1
+
+: W(0)
+
+READ C   <- C   PREP(k)
+READ TH  <- TH  PREP(k)
+READ E   <- E   GCOPY(k)
+READ AUX <- AUX QEXEC(k)
+
+BODY
+{
+    int errors = qpu_test_check_result(E, C, TH, SHOTS, qpu_test_key(k, 0), "CHECK", k, 0);
+    for( int i = 0; i < QPU_TEST_BLOCK; i++ ) {
+        if( PATTERN_X != ((const unsigned char*)AUX)[i] ) {
+            fprintf(stderr, "CHECK(%d): the flow the quantum task filled by itself is not what it wrote\n", k);
+            errors++;
+            break;
+        }
+    }
+    if( errors > 0 ) (void)parsec_atomic_fetch_add_int32(&nb_errors, errors);
+    (void)parsec_atomic_fetch_inc_int32(&checked);
+    if( verbose ) printf("CHECK(%d): %d problem(s)\n", k, errors);
+}
+END
+
+extern "C" %{
+
+int main(int argc, char *argv[])
+{
+    parsec_context_t *parsec;
+    parsec_cpu_gpu_qpu_taskpool_t *tp;
+    parsec_data_collection_t *W, *A, *B;
+    int nt = 16, shots = 100, want_gpu = 0, want_qpus = 0, nb_cuda, nb_qpus;
+    int rank = 0, world = 1, rc, test_argc, pargc, errors = 0, q_given = 0;
+    char **pargv;
+
+    qpu_test_split_args(argc, argv, &test_argc, &pargc, &pargv);
+    for( int i = 1; i < test_argc; i++ ) {
+        if( 0 == strcmp(argv[i], "-v") ) { verbose = 1; continue; }
+        if( 0 == strcmp(argv[i], "-g") ) { want_gpu = 1; continue; }
+        if( strcmp(argv[i], "-n") && strcmp(argv[i], "-s") && strcmp(argv[i], "-q") ) {
+            fprintf(stderr, "cpu_gpu_qpu: %s is not an option\n", argv[i]);
+            return 1;
+        }
+        if( i + 1 >= test_argc ) {
+            fprintf(stderr, "cpu_gpu_qpu: %s takes a number\n", argv[i]);
+            return 1;
+        }
+        if( 0 == strcmp(argv[i], "-n") ) nt = atoi(argv[++i]);
+        else if( 0 == strcmp(argv[i], "-s") ) shots = atoi(argv[++i]);
+        else { want_qpus = atoi(argv[++i]); q_given = 1; }
+    }
+    if( (nt <= 0) || (shots <= 0) || (q_given && (want_qpus <= 0)) ) {
+        fprintf(stderr, "cpu_gpu_qpu: -n, -s and -q must be positive\n");
+        return 1;
+    }
+
+    rc = parsec_tests_context_init(-1, PARSEC_TEST_THREAD_SERIALIZED, &pargc, &pargv, &parsec, &rank, &world);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_init");
+    if( 1 != world ) {
+        fprintf(stderr, "cpu_gpu_qpu runs on one rank\n");
+        parsec_tests_abort(parsec, 1);
+    }
+    nb_cuda = parsec_context_query(parsec, PARSEC_CONTEXT_QUERY_DEVICES, PARSEC_DEV_CUDA);
+    if( want_gpu && (nb_cuda <= 0) ) {
+        /* A skip, not a pass (see SKIP_RETURN_CODE in tests/CMakeLists.txt). */
+        parsec_warning("cpu_gpu_qpu -g can only run if at least one CUDA device is present");
+        rc = parsec_tests_context_fini(&parsec);
+        PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
+        return -PARSEC_ERR_DEVICE;
+    }
+    nb_qpus = parsec_context_query(parsec, PARSEC_CONTEXT_QUERY_DEVICES, PARSEC_DEV_QPU);
+    if( nb_qpus < 1 ) {
+        fprintf(stderr, "cpu_gpu_qpu: the context has no QPU device (--mca device_qpu_enabled 1)\n");
+        errors++;
+    }
+    if( (want_qpus > 0) && (want_qpus != nb_qpus) ) {
+        fprintf(stderr, "cpu_gpu_qpu: the context has %d QPU device(s), expected %d\n", nb_qpus, want_qpus);
+        errors++;
+    }
+
+    W = qpu_test_placement_new(rank, world, -1);
+    A = qpu_test_tiles_new(rank, world, 0, 2 * nt);
+    B = qpu_test_tiles_new(rank, world, 0, nt);     /* tile k lives where tile k of A does */
+    tp = parsec_cpu_gpu_qpu_new(W, A, B, nt, shots);
+    qpu_test_block_type_set(&tp->arenas_datatypes[PARSEC_cpu_gpu_qpu_DEFAULT_ADT_IDX]);
+
+    rc = parsec_context_add_taskpool(parsec, (parsec_taskpool_t*)tp);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+    rc = parsec_context_wait(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+
+    errors += nb_errors;
+    if( nt != checked ) {
+        fprintf(stderr, "cpu_gpu_qpu: %d of %d results were checked\n", checked, nt);
+        errors++;
+    }
+    if( nt != qpu_bodies ) {
+        fprintf(stderr, "cpu_gpu_qpu: %d of %d quantum tasks ran their QPU body\n", qpu_bodies, nt);
+        errors++;
+    }
+    if( want_gpu ) {
+        if( (2 * nt != gpu_bodies) || (0 != cpu_bodies) ) {
+            fprintf(stderr, "cpu_gpu_qpu: %d CUDA bodies and %d CPU bodies ran, expected %d and 0\n",
+                    gpu_bodies, cpu_bodies, 2 * nt);
+            errors++;
+        }
+    } else if( 2 * nt != gpu_bodies + cpu_bodies ) {
+        fprintf(stderr, "cpu_gpu_qpu: %d CUDA bodies and %d CPU bodies ran, expected %d in all\n",
+                gpu_bodies, cpu_bodies, 2 * nt);
+        errors++;
+    }
+    errors += qpu_test_check_service(1, nt, 0, verbose);
+
+    qpu_test_block_type_unset(&tp->arenas_datatypes[PARSEC_cpu_gpu_qpu_DEFAULT_ADT_IDX]);
+    PARSEC_OBJ_DESTRUCT(&tp->arenas_datatypes[PARSEC_cpu_gpu_qpu_DEFAULT_ADT_IDX]);
+    parsec_taskpool_free((parsec_taskpool_t*)tp);
+    qpu_test_placement_free(W);
+    qpu_test_tiles_free(A);
+    qpu_test_tiles_free(B);
+
+    rc = parsec_tests_context_fini(&parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
+
+    printf("cpu_gpu_qpu: %d chains, %d CUDA device(s), %d QPU device(s); %d CUDA bodies, %d CPU bodies, %d QPU bodies: %s\n",
+           nt, nb_cuda, nb_qpus, gpu_bodies, cpu_bodies, qpu_bodies, errors ? "FAILED" : "passed");
+    return errors ? 1 : 0;
+}
+
+%}

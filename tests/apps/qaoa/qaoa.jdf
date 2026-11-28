@@ -1,0 +1,647 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+/**
+ * Block-decomposed QAOA for weighted MaxCut as one task graph.
+ *
+ * R sweeps over the K blocks of an instance. One update of block b in round
+ * r is the chain
+ *
+ *   GATHER(r,b,k)   fold the state of the k-th neighbour into the boundary
+ *   BUILD(r,b)      the local problem, its circuit, the optimizer, and the
+ *                   two sets of angles of step 0
+ *   QEXEC(r,b,t,e)  one quantum job: the circuit at the angles of (t, e)
+ *   EVAL(r,b,t,e)   what its counts say about the local problem
+ *   STEP(r,b,t)     take in the two evaluations of step t-1, propose step t
+ *                   (t = 1 .. T; the last one proposes nothing)
+ *   UPDATE(r,b)     keep the best bitstring measured if it is strictly better
+ *
+ * and every body is one or two calls into qaoa_core.c, the same calls the
+ * sequential reference makes in the same order per block.
+ *
+ * The only ordering between blocks is between neighbours. Block b in round
+ * r reads a neighbour s as round r left it when s has a smaller colour, and
+ * as round r-1 left it otherwise: any execution of this graph is one
+ * sequential sweep in the order (round, colour, block). There is no barrier
+ * per colour and none per round: a block starts when its own neighbours are
+ * done.
+ *
+ * The state of a block is one buffer that UPDATE rewrites in place and
+ * hands to its readers: the next BUILD and UPDATE of the block and the
+ * GATHER tasks of its neighbours. Every one of those readers is upstream of
+ * the next UPDATE of the block (that update needs the neighbours' updates,
+ * which need their own gathers), so nothing reads the buffer while it is
+ * rewritten, and a copy sent to another rank has been received before.
+ *
+ * Where the tasks run: everything of block b on the rank of X(b); the
+ * quantum tasks of block b on the rank of Q(b mod NQ): Q has one element for
+ * each rank that owns a QPU, so with one such rank that is the rank of Q(0).
+ * A quantum task names no QPU, and runs on whichever QPU of its rank has a
+ * place for its job; or it names the QPU its block was given (qpus).
+ * Two chains keep the accounts, and nothing depends on them but the report
+ * at the end: FINAL collects the last state of every block on the rank of
+ * A(0), and SUM adds up what the updates of a round report, going from the
+ * rank of one block to the next and ending in TOTAL on the rank of G(r).
+ *
+ * No task sends two different outputs to two different sets of ranks. With
+ * the default (chain) broadcast of the runtime, an output is relayed only by
+ * ranks that consume it, and a rank that a first output reaches through a
+ * relay is not sent a second output the relay does not have. This is why
+ * the report of an update goes to a task on its own rank.
+ *
+ * What travels. Each kind of data has an arena of its own size and goes to
+ * another rank as that many bytes: a state to the gathers of the neighbours,
+ * a circuit and two sets of angles to the QPU's rank, a result back, a
+ * report to the rank that keeps the accounts. A flow that is written gets
+ * its copy from "<- NEW [type = ...]"; a dependency that may cross ranks
+ * says "[type_remote = ...]" at both ends; nothing is ever converted.
+ *
+ * Every input of every task has a source, whatever the instance: in a PTG a
+ * data flow whose guards are all false is never satisfied. So BUILD proposes
+ * step 0 itself, and a block with no neighbour reads its boundary from E(b),
+ * a tile that holds an empty one.
+ *
+ * The colour-synchronous control (colour_sync). With it, the blocks of a
+ * colour start only once every block of the colour before has had its
+ * update, as in a code that puts a barrier between colours: the JOIN tasks
+ * of a colour form a binary tree, one per block of the colour, each waiting
+ * for the update of its block and for its two children; the root lets the
+ * BUILD tasks of the next colour go. The results are the same; only the
+ * order is stricter. (A tree of tasks and not a gather of controls over a
+ * named range: at this commit the runtime counts some of those wrong.)
+ *
+ * The log (qaoa_taskpool_log): when asked for, EVAL keeps the timestamps of
+ * the result of each job, and BUILD and UPDATE the times an update began
+ * and ended, per process, for the measurements.
+ */
+
+#include "qaoa_core.h"
+#include "qaoa_data.h"
+#include "parsec/mca/device/qpu/device_qpu.h"
+#include "parsec/sys/atomic.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* With QAOA_TRACE in the environment, every task says when its body runs. */
+static int qaoa_trace = -1;
+#define TRACE(...)                                                          \
+    do {                                                                    \
+        if( qaoa_trace < 0 ) qaoa_trace = (NULL != getenv("QAOA_TRACE"));   \
+        if( qaoa_trace ) {                                                  \
+            fprintf(stderr, "[rank %d] ", es->virtual_process->parsec_context->my_rank); \
+            fprintf(stderr, __VA_ARGS__);                                   \
+            fprintf(stderr, "\n");                                          \
+        }                                                                   \
+    } while(0)
+
+/* Every state says how many updates its block has had. A task that reads
+ * one knows how many that must be, from the rule its dependencies encode;
+ * a state of another round is a dependency that is wrong. Counted per
+ * process, read with qaoa_taskpool_violations(). */
+static int32_t qaoa_violations = 0;
+#define EXPECT_UPDATES(STATE, WANT, ...)                                    \
+    do {                                                                    \
+        if( ((const qaoa_state_t*)(STATE))->updates != (uint32_t)(WANT) ) { \
+            if( 0 == parsec_atomic_fetch_inc_int32(&qaoa_violations) ) {    \
+                fprintf(stderr, "qaoa: ");                                  \
+                fprintf(stderr, __VA_ARGS__);                               \
+                fprintf(stderr, " reads a state that had %u update(s), and should read one that had %d\n", \
+                        ((const qaoa_state_t*)(STATE))->updates, (int)(WANT)); \
+            }                                                               \
+        }                                                                   \
+    } while(0)
+
+/* What the colour-synchronous control checks: the updates of each colour of
+ * each round done in this process. A BUILD that is let go by the colour
+ * before finds all of that colour's blocks of this process done. */
+static int32_t *qaoa_phase_done = NULL;
+/* JOIN tasks run in this process since it started. */
+static int32_t qaoa_joins = 0;
+
+/* The log of the measurements, when asked for: one record per job, one per
+ * update, indexed as the tasks are. */
+static qaoa_job_record_t    *qaoa_job_log = NULL;
+static qaoa_update_record_t *qaoa_update_log = NULL;
+#define JOB_RECORD(r, b, t, e)  (&qaoa_job_log[((((size_t)(r) * K + (b)) * T) + (t)) * 2 + (e)])
+#define UPDATE_RECORD(r, b)     (&qaoa_update_log[(size_t)(r) * K + (b)])
+
+/* The blocks of colour c in block order: how many, the i-th, and the place
+ * of block b among those of its colour. */
+static inline int colour_count(const qaoa_instance_t *inst, int c)
+{
+    int n = 0;
+    for( int b = 0; b < inst->part.nb_blocks; b++ ) n += (inst->part.colour[b] == c);
+    return n;
+}
+
+static inline int colour_block(const qaoa_instance_t *inst, int c, int i)
+{
+    for( int b = 0; b < inst->part.nb_blocks; b++ ) {
+        if( (inst->part.colour[b] == c) && (0 == i--) ) return b;
+    }
+    return -1;
+}
+
+static inline int colour_index(const qaoa_instance_t *inst, int b)
+{
+    int i = 0;
+    for( int a = 0; a < b; a++ ) i += (inst->part.colour[a] == inst->part.colour[b]);
+    return i;
+}
+
+/* The tables of the partition, as the dependencies below use them. */
+#define DEG(b)       (inst->part.deg[(b)])
+#define NBR(b, k)    qaoa_block_nbr(&inst->part, (b), (k))
+#define REV(b, k)    qaoa_block_rev(&inst->part, (b), (k))
+/* a is updated before b within a round */
+#define BEFORE(a, b) (inst->part.colour[(a)] < inst->part.colour[(b)])
+#define COLOUR(b)    (inst->part.colour[(b)])
+#define NCOL         (inst->part.nb_colours)
+#define CCOUNT(c)    colour_count(inst, (c))
+#define CBLOCK(c, i) colour_block(inst, (c), (i))
+#define CINDEX(b)    colour_index(inst, (b))
+%}
+
+inst           [ type = "const qaoa_instance_t*" ]
+cfg            [ type = "const qaoa_config_t*" ]
+X              [ type = "parsec_data_collection_t*" ]
+Q              [ type = "parsec_data_collection_t*" ]
+A              [ type = "parsec_data_collection_t*" ]
+G              [ type = "parsec_data_collection_t*" ]
+E              [ type = "parsec_data_collection_t*" aligned = X ]
+K              [ type = int ]
+R              [ type = int ]
+T              [ type = int ]
+circuit_bytes  [ type = int ]
+colour_sync    [ type = int ]
+NQ             [ type = int ]
+qpus           [ type = "const int*" ]
+
+/**************************************************
+ * INIT(b): the first assignment of block b
+ **************************************************/
+INIT(b)
+
+b  = 0 .. K-1
+dg = %{ return DEG(b); %}
+
+: X(b)
+
+RW x <- X(b)
+     -> x BUILD(0, b)
+     -> x UPDATE(0, b)
+     -> [ k = 0 .. dg-1 ] %{ return BEFORE(NBR(b, k), b); %} ? x GATHER(0, %{ return NBR(b, k); %}, %{ return REV(b, k); %})  [ type_remote = STATE ]
+
+BODY
+{
+    TRACE("INIT(%d)", b);
+    qaoa_state_init((qaoa_state_t*)x, inst, cfg, b);
+}
+END
+
+/**************************************************
+ * GATHER(r, b, k): the k-th neighbour of b, into the boundary of b
+ **************************************************/
+GATHER(r, b, k)
+
+r     = 0 .. R-1
+b     = 0 .. K-1
+k     = 0 .. %{ return DEG(b) - 1; %}
+s     = %{ return NBR(b, k); %}
+first = %{ return BEFORE(s, b); %}
+last  = %{ return k == DEG(b) - 1; %}
+
+: X(b)
+
+RW   h <- (k == 0) ? NEW : h GATHER(r, b, k-1)                  [ type = BOUNDARY ]
+       -> last ? h BUILD(r, b) : h GATHER(r, b, k+1)
+READ x <- first ? x UPDATE(r, s)                                [ type_remote = STATE ]
+       <- %{ return !first && (0 == r); %} ? x INIT(s)          [ type_remote = STATE ]
+       <- %{ return !first && (0 < r); %} ? x UPDATE(r-1, s)    [ type_remote = STATE ]
+
+BODY
+{
+    TRACE("GATHER(%d, %d, %d) reads block %d", r, b, k, s);
+    /* A neighbour that is updated before this block in a round has had its
+     * update of this round; any other has had the one of the round before. */
+    EXPECT_UPDATES(x, first ? r + 1 : r, "GATHER(%d, %d, %d), for block %d,", r, b, k, s);
+    if( 0 == k ) qaoa_boundary_init((qaoa_boundary_t*)h, inst, b);
+    qaoa_boundary_gather((qaoa_boundary_t*)h, inst, b, k, (const qaoa_state_t*)x);
+}
+END
+
+/**************************************************
+ * BUILD(r, b): the local problem of this update, its circuit, the optimizer
+ **************************************************/
+BUILD(r, b)
+
+r    = 0 .. R-1
+b    = 0 .. K-1
+dg   = %{ return DEG(b); %}
+pc   = %{ return (COLOUR(b) > 0) ? COLOUR(b) - 1 : NCOL - 1; %}
+pr   = %{ return (COLOUR(b) > 0) ? r : r - 1; %}
+wait = %{ return colour_sync && (pr >= 0); %}
+
+: X(b)
+
+CTL   Y   <- wait ? J JOIN(pr, pc, 0)
+READ  x   <- (r == 0) ? x INIT(b) : x UPDATE(r-1, b)
+READ  h   <- (dg > 0) ? h GATHER(r, b, dg-1) : E(b)
+WRITE P   <- NEW                                    [ type = LOCAL ]
+          -> P EVAL(r, b, 0 .. T-1, 0 .. 1)
+          -> P UPDATE(r, b)
+WRITE C   <- NEW                                    [ type = CIRCUIT ]
+          -> C QEXEC(r, b, 0 .. T-1, 0 .. 1)        [ type_remote = CIRCUIT ]
+WRITE S   <- NEW                                    [ type = OPT ]
+          -> S STEP(r, b, 1)
+WRITE TH0 <- NEW                                    [ type = THETA ]
+          -> TH QEXEC(r, b, 0, 0)                   [ type_remote = THETA ]
+WRITE TH1 <- NEW                                    [ type = THETA ]
+          -> TH QEXEC(r, b, 0, 1)                   [ type_remote = THETA ]
+
+BODY
+{
+    TRACE("BUILD(%d, %d)", r, b);
+    EXPECT_UPDATES(x, r, "BUILD(%d, %d)", r, b);
+    if( NULL != qaoa_update_log ) UPDATE_RECORD(r, b)->t_build = parsec_qpu_now_ns();
+    if( wait ) {
+        /* Let go by the colour before: every block of it in this process
+         * has had its update of that round. */
+        const parsec_data_collection_t *dc = (const parsec_data_collection_t*)X;
+        int mine = 0;
+        for( int a = 0; a < K; a++ ) {
+            mine += (COLOUR(a) == pc) && ((uint32_t)dc->myrank == ((parsec_data_collection_t*)X)->rank_of((parsec_data_collection_t*)X, a));
+        }
+        if( parsec_atomic_fetch_add_int32(&qaoa_phase_done[pr * NCOL + pc], 0) != mine ) {
+            if( 0 == parsec_atomic_fetch_inc_int32(&qaoa_violations) ) {
+                fprintf(stderr, "qaoa: BUILD(%d, %d) started before the %d block(s) of colour %d of round %d in this process had their update\n",
+                        r, b, mine, pc, pr);
+            }
+        }
+    }
+    qaoa_local_build((qaoa_local_t*)P, inst, cfg, r, b, (const qaoa_state_t*)x, (const qaoa_boundary_t*)h);
+    if( 0 != qaoa_circuit_build((parsec_qpu_circuit_t*)C, (size_t)circuit_bytes, (const qaoa_local_t*)P, cfg) ) {
+        fprintf(stderr, "qaoa: the circuit of block %d does not fit in %d bytes\n", b, circuit_bytes);
+        return PARSEC_HOOK_RETURN_ERROR;
+    }
+    qaoa_opt_init((qaoa_opt_t*)S, cfg, (const qaoa_state_t*)x, (const qaoa_local_t*)P);
+    /* Step 0: its two sets of angles. */
+    qaoa_opt_propose((qaoa_opt_t*)S, cfg, (double*)TH0, (double*)TH1);
+}
+END
+
+/**************************************************
+ * STEP(r, b, t): take in the evaluations of step t-1, propose step t
+ **************************************************/
+STEP(r, b, t)
+
+r = 0 .. R-1
+b = 0 .. K-1
+t = 1 .. T
+
+: X(b)
+
+RW    S   <- (t == 1) ? S BUILD(r, b) : S STEP(r, b, t-1)
+          -> (t < T) ? S STEP(r, b, t+1) : S UPDATE(r, b)
+READ  F0  <- F EVAL(r, b, t-1, 0)
+READ  F1  <- F EVAL(r, b, t-1, 1)
+WRITE TH0 <- NEW                                    [ type = THETA ]
+          -> (t < T) ? TH QEXEC(r, b, t, 0)         [ type_remote = THETA ]
+WRITE TH1 <- NEW                                    [ type = THETA ]
+          -> (t < T) ? TH QEXEC(r, b, t, 1)         [ type_remote = THETA ]
+
+BODY
+{
+    TRACE("STEP(%d, %d, %d)", r, b, t);
+    qaoa_opt_absorb((qaoa_opt_t*)S, cfg, (const qaoa_eval_t*)F0, (const qaoa_eval_t*)F1);
+    if( t < T ) qaoa_opt_propose((qaoa_opt_t*)S, cfg, (double*)TH0, (double*)TH1);
+}
+END
+
+/**************************************************
+ * QEXEC(r, b, t, e): one quantum job
+ **************************************************/
+QEXEC(r, b, t, e)
+
+r = 0 .. R-1
+b = 0 .. K-1
+t = 0 .. T-1
+e = 0 .. 1
+
+: Q(b % NQ)
+
+READ  C   <- C BUILD(r, b)                                          [ type_remote = CIRCUIT ]
+READ  TH  <- %{ return (0 == t) && (0 == e); %} ? TH0 BUILD(r, b)   [ type_remote = THETA ]
+          <- %{ return (0 == t) && (1 == e); %} ? TH1 BUILD(r, b)   [ type_remote = THETA ]
+          <- %{ return (0 <  t) && (0 == e); %} ? TH0 STEP(r, b, t) [ type_remote = THETA ]
+          <- %{ return (0 <  t) && (1 == e); %} ? TH1 STEP(r, b, t) [ type_remote = THETA ]
+WRITE RES <- NEW                                                    [ type = RESULT ]
+          -> RES EVAL(r, b, t, e)                                   [ type_remote = RESULT ]
+
+BODY [type=QPU]
+{
+    /* The key names the evaluation: the sequential reference gives its
+     * sampler the same one, and so draws the same counts. */
+    TRACE("QEXEC(%d, %d, %d, %d)", r, b, t, e);
+    return PARSEC_QPU_SUBMIT_ON((NULL != qpus) ? qpus[b] : PARSEC_QPU_ANY, C, TH, RES, cfg->shots, qaoa_key(r, b, t, e));
+}
+END
+
+/**************************************************
+ * EVAL(r, b, t, e): what the counts of one job say
+ **************************************************/
+EVAL(r, b, t, e)
+
+r = 0 .. R-1
+b = 0 .. K-1
+t = 0 .. T-1
+e = 0 .. 1
+
+: X(b)
+
+READ  RES <- RES QEXEC(r, b, t, e)                  [ type_remote = RESULT ]
+READ  P   <- P BUILD(r, b)
+WRITE F   <- NEW                                    [ type = EVAL ]
+          -> (e == 0) ? F0 STEP(r, b, t+1) : F1 STEP(r, b, t+1)
+
+BODY
+{
+    TRACE("EVAL(%d, %d, %d, %d)", r, b, t, e);
+    qaoa_eval((qaoa_eval_t*)F, (const qaoa_local_t*)P, (const parsec_qpu_result_t*)RES);
+    if( NULL != qaoa_job_log ) {
+        const parsec_qpu_result_t *res = (const parsec_qpu_result_t*)RES;
+        qaoa_job_record_t *rec = JOB_RECORD(r, b, t, e);
+        rec->t_hook     = res->t_hook;
+        rec->t_submit   = res->t_submit;
+        rec->t_start    = res->t_start;
+        rec->t_end      = res->t_end;
+        rec->t_retrieve = res->t_retrieve;
+        rec->t_eval     = parsec_qpu_now_ns();
+        rec->batch      = res->batch;
+        rec->attempts   = res->attempts;
+        rec->status     = res->status;
+        rec->done       = 1;
+    }
+}
+END
+
+/**************************************************
+ * UPDATE(r, b): the block takes the best bitstring measured, or stays
+ **************************************************/
+UPDATE(r, b)
+
+r  = 0 .. R-1
+b  = 0 .. K-1
+dg = %{ return DEG(b); %}
+
+: X(b)
+
+READ  S <- S STEP(r, b, T)
+READ  P <- P BUILD(r, b)
+CTL   U -> colour_sync ? U JOIN(r, %{ return COLOUR(b); %}, %{ return CINDEX(b); %})
+RW    x <- (r == 0) ? x INIT(b) : x UPDATE(r-1, b)
+        -> (r < R-1) ? x BUILD(r+1, b)
+        -> (r < R-1) ? x UPDATE(r+1, b)
+        -> [ k = 0 .. dg-1 ] %{ return BEFORE(b, NBR(b, k)); %} ? x GATHER(r, %{ return NBR(b, k); %}, %{ return REV(b, k); %})  [ type_remote = STATE ]
+        -> [ j = 0 .. dg-1 ] %{ return (r < R-1) && !BEFORE(b, NBR(b, j)); %} ? x GATHER(r+1, %{ return NBR(b, j); %}, %{ return REV(b, j); %})  [ type_remote = STATE ]
+        -> (r == R-1) ? x FINAL(b)                  [ type_remote = STATE ]
+WRITE D <- NEW                                      [ type = REPORT ]
+        -> D SUM(r, b)
+
+BODY
+{
+    const qaoa_opt_t *opt = (const qaoa_opt_t*)S;
+    const qaoa_local_t *local = (const qaoa_local_t*)P;
+    qaoa_report_t *report = (qaoa_report_t*)D;
+
+    TRACE("UPDATE(%d, %d)", r, b);
+    EXPECT_UPDATES(x, r, "UPDATE(%d, %d)", r, b);
+    memset(report, 0, sizeof(*report));
+    report->improvement = qaoa_state_update((qaoa_state_t*)x, local, opt);
+    report->updates     = 1;
+    report->accepted    = (report->improvement > 0.0);
+    report->skipped     = (0 != local->skip);
+    report->evaluations = opt->evaluations;
+    report->failed      = opt->failed;
+    if( NULL != qaoa_update_log ) UPDATE_RECORD(r, b)->t_update = parsec_qpu_now_ns();
+    if( colour_sync ) (void)parsec_atomic_fetch_inc_int32(&qaoa_phase_done[r * NCOL + COLOUR(b)]);
+}
+END
+
+/**************************************************
+ * JOIN(r, c, i): with colour_sync, the i-th block of colour c and the blocks
+ * below it in the tree (2i+1, 2i+2, ...) have had their update of round r.
+ * The root, JOIN(r, c, 0), lets the next colour go.
+ **************************************************/
+JOIN(r, c, i)
+
+r      = 0 .. %{ return colour_sync ? R-1 : -1; %}
+c      = 0 .. %{ return NCOL - 1; %}
+i      = 0 .. %{ return CCOUNT(c) - 1; %}
+blk    = %{ return CBLOCK(c, i); %}
+n      = %{ return CCOUNT(c); %}
+nnext  = %{ return ((0 == i) && (c + 1 < NCOL)) ? CCOUNT(c + 1) : 0; %}
+nfirst = %{ return ((0 == i) && (c + 1 == NCOL) && (r + 1 < R)) ? CCOUNT(0) : 0; %}
+
+: X(blk)
+
+CTL U <- U UPDATE(r, blk)
+CTL L <- (2 * i + 1 < n) ? J JOIN(r, c, 2 * i + 1)
+CTL H <- (2 * i + 2 < n) ? J JOIN(r, c, 2 * i + 2)
+CTL J -> ((i > 0) && (1 == i % 2)) ? L JOIN(r, c, (i - 1) / 2)
+      -> ((i > 0) && (0 == i % 2)) ? H JOIN(r, c, (i - 1) / 2)
+      -> [ p = 0 .. nnext-1 ] (nnext > 0) ? Y BUILD(r, %{ return CBLOCK(c + 1, p); %})
+      -> [ q = 0 .. nfirst-1 ] (nfirst > 0) ? Y BUILD(r+1, %{ return CBLOCK(0, q); %})
+
+BODY
+{
+    TRACE("JOIN(%d, %d, %d) for block %d", r, c, i, blk);
+    (void)parsec_atomic_fetch_inc_int32(&qaoa_joins);
+}
+END
+
+/**************************************************
+ * FINAL(b): the last state of block b, next to the others
+ **************************************************/
+FINAL(b)
+
+b = 0 .. K-1
+
+: A(0)
+
+READ x   <- x UPDATE(R-1, b)                        [ type_remote = STATE ]
+RW   all <- (b == 0) ? A(0) : all FINAL(b-1)
+         -> (b < K-1) ? all FINAL(b+1) : A(0)
+
+BODY
+{
+    TRACE("FINAL(%d)", b);
+    EXPECT_UPDATES(x, R, "FINAL(%d)", b);
+    memcpy((char*)all + (size_t)b * sizeof(qaoa_state_t), x, sizeof(qaoa_state_t));
+}
+END
+
+/**************************************************
+ * SUM(r, b): what the updates of round r add up to, block after block
+ **************************************************/
+SUM(r, b)
+
+r = 0 .. R-1
+b = 0 .. K-1
+
+: X(b)
+
+READ D   <- D UPDATE(r, b)
+RW   acc <- (b == 0) ? NEW                          [ type = REPORT ]
+         <- (b >  0) ? acc SUM(r, b-1)              [ type_remote = REPORT ]
+         -> (b < K-1) ? acc SUM(r, b+1)             [ type_remote = REPORT ]
+         -> (b == K-1) ? acc TOTAL(r)               [ type_remote = REPORT ]
+
+BODY
+{
+    const qaoa_report_t *one = (const qaoa_report_t*)D;
+    qaoa_report_t *sum = (qaoa_report_t*)acc;
+
+    TRACE("SUM(%d, %d)", r, b);
+    if( 0 == b ) memset(sum, 0, sizeof(*sum));
+    /* Improvements are multiples of 1/16: their sum is exact in any order. */
+    sum->improvement += one->improvement;
+    sum->updates     += one->updates;
+    sum->accepted    += one->accepted;
+    sum->skipped     += one->skipped;
+    sum->evaluations += one->evaluations;
+    sum->failed      += one->failed;
+}
+END
+
+/**************************************************
+ * TOTAL(r): the sum of round r, where the report is read
+ **************************************************/
+TOTAL(r)
+
+r = 0 .. R-1
+
+: G(r)
+
+READ acc <- acc SUM(r, K-1)                         [ type_remote = REPORT ]
+RW   g   <- G(r)
+         -> G(r)
+
+BODY
+{
+    TRACE("TOTAL(%d)", r);
+    memcpy(g, acc, sizeof(qaoa_report_t));
+}
+END
+
+extern "C" %{
+
+int qaoa_taskpool_violations(void)
+{
+    return (int)qaoa_violations;
+}
+
+int qaoa_taskpool_joins(void)
+{
+    return (int)qaoa_joins;
+}
+
+/* The kinds of data that flow between the tasks, and the size of each. */
+#define QAOA_NB_KINDS 9
+static void qaoa_kinds(const qaoa_sizes_t *sizes, int index[QAOA_NB_KINDS], size_t bytes[QAOA_NB_KINDS])
+{
+    index[0] = PARSEC_qaoa_STATE_ADT_IDX;     bytes[0] = sizes->state;
+    index[1] = PARSEC_qaoa_BOUNDARY_ADT_IDX;  bytes[1] = sizes->boundary;
+    index[2] = PARSEC_qaoa_LOCAL_ADT_IDX;     bytes[2] = sizes->local;
+    index[3] = PARSEC_qaoa_CIRCUIT_ADT_IDX;   bytes[3] = sizes->circuit;
+    index[4] = PARSEC_qaoa_OPT_ADT_IDX;       bytes[4] = sizes->opt;
+    index[5] = PARSEC_qaoa_THETA_ADT_IDX;     bytes[5] = sizes->theta;
+    index[6] = PARSEC_qaoa_RESULT_ADT_IDX;    bytes[6] = sizes->result;
+    index[7] = PARSEC_qaoa_EVAL_ADT_IDX;      bytes[7] = sizes->eval;
+    index[8] = PARSEC_qaoa_REPORT_ADT_IDX;    bytes[8] = sizes->report;
+}
+
+parsec_taskpool_t *qaoa_taskpool_new(const qaoa_instance_t *instance, const qaoa_config_t *config,
+                                     parsec_data_collection_t *dcX, parsec_data_collection_t *dcQ,
+                                     parsec_data_collection_t *dcA, parsec_data_collection_t *dcG,
+                                     parsec_data_collection_t *dcE, const qaoa_sizes_t *sizes,
+                                     int colour_sync, int log, int nb_qpu_ranks, const int *qpus)
+{
+    parsec_qaoa_taskpool_t *tp;
+    int index[QAOA_NB_KINDS];
+    size_t bytes[QAOA_NB_KINDS];
+
+    /* One round and one step at least: the graph has no task for less. And
+     * what the reference refuses as well: the optimizer has room for
+     * QAOA_MAX_LAYERS layers, and a job has at least one shot. */
+    if( (config->rounds < 1) || (config->steps < 1) || (config->shots < 1) ||
+        (config->layers < 1) || (config->layers > QAOA_MAX_LAYERS) ) return NULL;
+
+    tp = parsec_qaoa_new(instance, config, dcX, dcQ, dcA, dcG, dcE,
+                         instance->part.nb_blocks, config->rounds, config->steps, (int)sizes->circuit, !!colour_sync,
+                         (nb_qpu_ranks > 0) ? nb_qpu_ranks : 1, qpus);
+
+    /* One taskpool at a time: what these point to is of the last one made. */
+    free(qaoa_phase_done); qaoa_phase_done = NULL;
+    free(qaoa_job_log);    qaoa_job_log    = NULL;
+    free(qaoa_update_log); qaoa_update_log = NULL;
+    if( colour_sync ) {
+        qaoa_phase_done = (int32_t*)calloc((size_t)config->rounds * (size_t)instance->part.nb_colours, sizeof(int32_t));
+    }
+    if( log ) {
+        qaoa_job_log    = (qaoa_job_record_t*)calloc((size_t)config->rounds * instance->part.nb_blocks * config->steps * 2,
+                                                     sizeof(qaoa_job_record_t));
+        qaoa_update_log = (qaoa_update_record_t*)calloc((size_t)config->rounds * instance->part.nb_blocks,
+                                                        sizeof(qaoa_update_record_t));
+    }
+
+    qaoa_kinds(sizes, index, bytes);
+    for( int i = 0; i < QAOA_NB_KINDS; i++ ) {
+        qaoa_arena_set(&tp->arenas_datatypes[index[i]], bytes[i]);
+    }
+    /* No flow has the default type; a dependency that forgot its own would
+     * get it, so it exists, at the size of a state. */
+    qaoa_arena_set(&tp->arenas_datatypes[PARSEC_qaoa_DEFAULT_ADT_IDX], sizes->state);
+    /* The state of a block starts in its tile of X, and is sent from there:
+     * the tile is a state for the communication engine as well. */
+    dcX->default_dtt = tp->arenas_datatypes[PARSEC_qaoa_STATE_ADT_IDX].opaque_dtt;
+    return (parsec_taskpool_t*)tp;
+}
+
+void qaoa_taskpool_free(parsec_taskpool_t *taskpool)
+{
+    parsec_qaoa_taskpool_t *tp = (parsec_qaoa_taskpool_t*)taskpool;
+    qaoa_sizes_t unused;
+    int index[QAOA_NB_KINDS];
+    size_t bytes[QAOA_NB_KINDS];
+
+    memset(&unused, 0, sizeof(unused));
+    /* The tiles of X were states for the communication engine; that
+     * datatype goes with the taskpool. */
+    ((parsec_data_collection_t*)tp->_g_X)->default_dtt = PARSEC_DATATYPE_NULL;
+    qaoa_kinds(&unused, index, bytes);
+    for( int i = 0; i < QAOA_NB_KINDS; i++ ) {
+        qaoa_arena_unset(&tp->arenas_datatypes[index[i]]);
+        PARSEC_OBJ_DESTRUCT(&tp->arenas_datatypes[index[i]]);
+    }
+    qaoa_arena_unset(&tp->arenas_datatypes[PARSEC_qaoa_DEFAULT_ADT_IDX]);
+    PARSEC_OBJ_DESTRUCT(&tp->arenas_datatypes[PARSEC_qaoa_DEFAULT_ADT_IDX]);
+    parsec_taskpool_free(taskpool);
+    free(qaoa_phase_done); qaoa_phase_done = NULL;
+    free(qaoa_job_log);    qaoa_job_log    = NULL;
+    free(qaoa_update_log); qaoa_update_log = NULL;
+}
+
+void qaoa_taskpool_log(const qaoa_job_record_t **jobs, const qaoa_update_record_t **updates)
+{
+    *jobs    = qaoa_job_log;
+    *updates = qaoa_update_log;
+}
+
+%}

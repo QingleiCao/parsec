@@ -97,6 +97,7 @@ uint8_t parsec_device_type_from_name(const char *name, size_t length)
         { "hip",        PARSEC_DEV_HIP        },
         { "level_zero", PARSEC_DEV_LEVEL_ZERO },
         { "ze",         PARSEC_DEV_LEVEL_ZERO },
+        { "qpu",        PARSEC_DEV_QPU        },
         { "gpu",        PARSEC_DEV_GPU_MASK   },
         { "all",        PARSEC_DEV_ANY_TYPE   },
         { NULL,         PARSEC_DEV_NONE       }
@@ -326,12 +327,14 @@ device_selected:
 #if defined(PARSEC_DEBUG_PARANOID)
     /* Sanity check: if at least one of the data copies is not parsec
      * managed, check that all the non-parsec-managed data copies
-     * exist on the same device */
+     * exist on the same device. A device that holds no data (a QPU) has its
+     * tasks work on the copies of the host. */
+    const int data_device = PARSEC_DEV_IS_GPU(dev->type) ? dev->device_index : 0;
     for( int i = 0; i < this_task->task_class->nb_flows; i++ ) {
         /* Make sure data_in is not NULL */
         if (NULL == this_task->data[i].data_in) continue;
         if ((this_task->data[i].data_in->flags & PARSEC_DATA_FLAG_PARSEC_MANAGED) == 0 &&
-            this_task->data[i].data_in->device_index != dev->device_index) {
+            this_task->data[i].data_in->device_index != data_device) {
             char task_str[MAX_TASK_STRLEN];
             parsec_fatal("*** User-Managed Copy Error: Task %s is selected to run on device %d:%s,\n"
                          "*** but flow %d is represented by a data copy not managed by PaRSEC,\n"
@@ -467,17 +470,20 @@ int parsec_mca_device_init(void)
                     device_components[i] = NULL;
                     continue;
                 }
-                if( i != j ) {  /* compress the list of components */
+                /* Keep the components that gave a module together at the head
+                 * of the list: whoever walks it stops at the first hole. Every
+                 * one of them takes a place, also when it is already in it. */
+                if( i != j ) {
                     device_components[j] = device_components[i];
                     device_components[i] = NULL;
-                    j++;
                 }
                 modules_activated[num_modules_activated++] = modules[0];
 
 #if defined(PARSEC_PROF_TRACE)
-                strncat(modules_activated_str, device_components[i]->mca_component_name, 1023);
+                strncat(modules_activated_str, device_components[j]->mca_component_name, 1023);
                 strncat(modules_activated_str, ",", 1023);
 #endif
+                j++;
             }
         }
     }
@@ -864,6 +870,9 @@ int parsec_mca_device_registration_complete(parsec_context_t* context)
         if( PARSEC_DEV_RECURSIVE & device->type ) continue;
         if( NULL != device->all_devices_attached )
             device->all_devices_attached(device);
+        /* A device that declares no flop rate, a QPU for one, takes no part in
+         * the weights and keeps the time estimate it set itself. */
+        if( 0 == device->gflops_fp64 ) continue;
         if( PARSEC_DEV_CPU & device->type ) {
             c = 0;
             for(int p = 0; p < context->nb_vp; p++)
@@ -884,6 +893,7 @@ int parsec_mca_device_registration_complete(parsec_context_t* context)
         parsec_device_module_t* device = parsec_devices[i];
         if( NULL == device ) continue;
         if( PARSEC_DEV_RECURSIVE & device->type ) continue;
+        if( 0 == device->gflops_fp64 ) continue;
         device->time_estimate_default = total_gflops_fp64/(double)device->gflops_fp64;
         parsec_debug_verbose(6, parsec_device_output, "  Dev[%d] default-time-estimate %-4"PRId64" <- double %-8"PRId64" single %-8"PRId64" tensor %-8"PRId64" half %-8"PRId64" %s",
                              i, device->time_estimate_default, device->gflops_fp64, device->gflops_fp32, device->gflops_tf32, device->gflops_fp16, device->gflops_guess? "GUESSED": "");
@@ -1206,7 +1216,7 @@ parsec_device_module_t* parsec_mca_device_get(uint32_t device_index)
 int parsec_mca_device_is_gpu(uint32_t devindex) {
     parsec_device_module_t *dev = parsec_mca_device_get(devindex);
     if(NULL == dev) return false;
-    return PARSEC_DEV_RECURSIVE < dev->type;
+    return PARSEC_DEV_IS_GPU(dev->type);
 }
 
 int parsec_mca_device_remove(parsec_device_module_t* device)

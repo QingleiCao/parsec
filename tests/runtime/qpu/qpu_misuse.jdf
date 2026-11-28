@@ -1,0 +1,192 @@
+extern "C" %{
+/*
+ * Copyright (c) 2026      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+/**
+ * What parsec_qpu_submit() refuses.
+ *
+ * A body that hands over something that is not a job gets an error back and
+ * keeps its task: nothing is submitted, and nothing reads past the end of a
+ * buffer. Each task TRY(i) submits one case and notes the answer; a body
+ * that got an error simply ends, so the run goes on.
+ *
+ *   0  a well-formed job (the control: it is taken, and gets its result)
+ *   1  a circuit of an unknown version
+ *   2  a gate on a qubit after its measurement
+ *   3  a rotation that uses a parameter slot beyond what the parameter
+ *      flow holds
+ *   4  no shot
+ *   5  more operations than the circuit flow holds
+ *   6  an operation that does not exist
+ *   7  a qubit the circuit does not have
+ */
+
+#include "qpu_test_common.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define NB_CASES 8
+
+static const char *case_names[NB_CASES] = {
+    "a well-formed job",
+    "a circuit of an unknown version",
+    "a gate after the measurement of its qubit",
+    "a parameter slot beyond the parameter flow",
+    "no shot",
+    "more operations than the flow holds",
+    "an operation that does not exist",
+    "a qubit the circuit does not have"
+};
+
+static int seen[NB_CASES];
+static parsec_hook_return_t answers[NB_CASES];
+
+static void make_case(int i, void *vcircuit, void *params)
+{
+    parsec_qpu_circuit_t *circuit = (parsec_qpu_circuit_t*)vcircuit;
+    parsec_qpu_op_t *ops;
+
+    qpu_test_make_circuit(vcircuit, i, 0, 0);
+    qpu_test_make_params(params, i, 0);
+    ops = parsec_qpu_circuit_ops(circuit);
+    switch( i ) {
+    case 1:
+        circuit->version = 7;
+        break;
+    case 2:     /* the last operation measures the last qubit; make it a gate on the first, measured before */
+        ops[circuit->nb_ops - 1].opcode = PARSEC_QPU_OP_X;
+        ops[circuit->nb_ops - 1].q0     = 0;
+        break;
+    case 3:     /* one slot more than a block of doubles holds, and a rotation that reads it */
+        circuit->nb_params = QPU_TEST_BLOCK / sizeof(double) + 1;
+        ops[QPU_TEST_NB_QUBITS].param = (int16_t)(QPU_TEST_BLOCK / sizeof(double));
+        break;
+    case 5:     /* one operation more than fits behind the header */
+        circuit->nb_ops = (QPU_TEST_BLOCK - sizeof(parsec_qpu_circuit_t)) / PARSEC_QPU_OP_SIZE + 1;
+        break;
+    case 6:
+        ops[0].opcode = 200;
+        break;
+    case 7:
+        ops[1].q0 = QPU_TEST_NB_QUBITS;
+        break;
+    default:
+        break;
+    }
+}
+%}
+
+W        [ type = "parsec_data_collection_t*" ]
+R        [ type = "parsec_data_collection_t*" ]
+N        [ type = int ]
+
+PREP(i)
+
+i = 0 .. N-1
+
+: W(0)
+
+WRITE C  -> C  TRY(i)
+WRITE TH -> TH TRY(i)
+
+BODY
+{
+    make_case(i, C, TH);
+}
+END
+
+TRY(i)
+
+i = 0 .. N-1
+
+: R(i)
+
+READ C   <- C  PREP(i)
+READ TH  <- TH PREP(i)
+RW   RES <- R(i)
+         -> R(i)
+
+BODY [type=QPU]
+{
+    memset(RES, 0xff, QPU_TEST_BLOCK);
+    answers[i] = PARSEC_QPU_SUBMIT_KEYED(C, TH, RES, (4 == i) ? 0 : 50, qpu_test_key(i, 0));
+    seen[i]    = 1;
+    /* The task was taken only if the answer is ASYNC. */
+    if( PARSEC_HOOK_RETURN_ASYNC == answers[i] ) return answers[i];
+}
+END
+
+extern "C" %{
+
+int main(int argc, char *argv[])
+{
+    parsec_context_t *parsec;
+    parsec_qpu_misuse_taskpool_t *tp;
+    parsec_data_collection_t *W, *R;
+    unsigned char circuit[QPU_TEST_BLOCK], params[QPU_TEST_BLOCK];
+    int rank = 0, world = 1, rc, test_argc, pargc, errors = 0;
+    char **pargv;
+
+    qpu_test_split_args(argc, argv, &test_argc, &pargc, &pargv);
+    rc = parsec_tests_context_init(-1, PARSEC_TEST_THREAD_SERIALIZED, &pargc, &pargv, &parsec, &rank, &world);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_init");
+    if( 1 != world ) {
+        fprintf(stderr, "qpu_misuse runs on one rank\n");
+        parsec_tests_abort(parsec, 1);
+    }
+
+    W = qpu_test_placement_new(rank, world, -1);
+    R = qpu_test_tiles_new(rank, world, 0, NB_CASES);
+    /* The results go to copies that PaRSEC does not manage, as those of an
+     * application's own collection: a QPU task works on them where they are,
+     * on the host. */
+    qpu_test_tiles_user_managed(R);
+    tp = parsec_qpu_misuse_new(W, R, NB_CASES);
+    qpu_test_block_type_set(&tp->arenas_datatypes[PARSEC_qpu_misuse_DEFAULT_ADT_IDX]);
+
+    rc = parsec_context_add_taskpool(parsec, (parsec_taskpool_t*)tp);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+    rc = parsec_context_wait(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+
+    for( int i = 0; i < NB_CASES; i++ ) {
+        const parsec_hook_return_t expected = (0 == i) ? PARSEC_HOOK_RETURN_ASYNC : PARSEC_HOOK_RETURN_ERROR;
+        if( !seen[i] ) {
+            fprintf(stderr, "case %d (%s): the task did not run\n", i, case_names[i]);
+            errors++;
+        } else if( expected != answers[i] ) {
+            fprintf(stderr, "case %d (%s): the submission returned %d, expected %d\n", i, case_names[i],
+                    (int)answers[i], (int)expected);
+            errors++;
+        }
+    }
+    /* The one job that was taken ran, and nothing else got anywhere. */
+    qpu_test_make_circuit(circuit, 0, 0, 0);
+    qpu_test_make_params(params, 0, 0);
+    errors += qpu_test_check_result(qpu_test_tiles_ptr(R, 0), circuit, params, 50, qpu_test_key(0, 0), "tile", 0, 0);
+    /* The seven bodies that were refused ended by themselves, and count as
+     * executed by the device their task class was selected for. */
+    qpu_test_expect_also_executed(NB_CASES - 1);
+    errors += qpu_test_check_service(1, 1, 0, 0);
+
+    qpu_test_block_type_unset(&tp->arenas_datatypes[PARSEC_qpu_misuse_DEFAULT_ADT_IDX]);
+    PARSEC_OBJ_DESTRUCT(&tp->arenas_datatypes[PARSEC_qpu_misuse_DEFAULT_ADT_IDX]);
+    parsec_taskpool_free((parsec_taskpool_t*)tp);
+    qpu_test_placement_free(W);
+    qpu_test_tiles_free(R);
+
+    rc = parsec_tests_context_fini(&parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_tests_context_fini");
+
+    printf("qpu_misuse: %d cases: %s\n", NB_CASES, errors ? "FAILED" : "passed");
+    return errors ? 1 : 0;
+}
+
+%}
