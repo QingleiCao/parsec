@@ -157,6 +157,12 @@ plain data structures. `PARSEC_REF` passes a pointer value without creating a
 data dependency. `PARSEC_SCRATCH` asks the runtime to allocate temporary task
 storage. `PASSED_BY_REF` with a DTD tile creates a tracked data flow.
 
+The same tile may be passed for several data flows of one task, as happens when
+a kernel written for distinct tiles is called with one of them twice. The task
+is then a single user of that tile: a reader if all these flows read it, a
+writer if at least one of them writes it, and its body gets the same copy for
+each of these flows.
+
 Task bodies recover parameters in insertion order:
 
 ```c
@@ -439,6 +445,7 @@ The DTD tests are useful examples and regression anchors:
 | `dtd_test_data_flush` | Single-tile and full-collection flush behavior. |
 | `dtd_test_broadcast`, `dtd_test_reduce`, `dtd_test_allreduce` | Distributed collective-style dependency patterns. |
 | `dtd_test_pingpong`, `dtd_test_war` | Cross-rank ordering and write-after-read behavior. |
+| `dtd_test_same_tile_flows` | Tasks that pass the same tile for several of their flows. |
 | `dtd_test_task_insertion`, `dtd_test_task_inserting_task`, `dtd_test_hierarchy` | Tasks that insert tasks and use `PARSEC_HOOK_RETURN_AGAIN`. |
 | `dtd_test_tp_enqueue_dequeue` | Dynamic taskpool enqueue/dequeue and asynchronous completion patterns. |
 | `dtd_test_multiple_handle_wait` | Repeated waits on DTD taskpools. |

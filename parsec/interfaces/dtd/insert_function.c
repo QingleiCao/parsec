@@ -2106,6 +2106,16 @@ data_lookup_of_dtd_task(parsec_execution_stream_t *es,
 
         copy = current_task->super.data[current_dep].data_in;
 
+        if( (NULL == copy) && ((FLOW_OF(current_task, current_dep))->flags & FLOW_SHARES_TILE) ) {
+            /* The tile is tracked through another flow of this task, and that
+             * flow got the copy. Every flow holds its own reference on it. */
+            copy = current_task->super.data[(PARENT_OF(current_task, current_dep))->flow_index].data_in;
+            if( NULL != copy ) {
+                parsec_dtd_retain_data_copy(copy);
+                current_task->super.data[current_dep].data_in = copy;
+            }
+        }
+
         if( NULL == copy ) {
             continue;
         }
@@ -3005,6 +3015,90 @@ parsec_dtd_record_local_task_inserted(parsec_dtd_taskpool_t *dtd_tp)
     return should_block;
 }
 
+/* Whether a flow writes its tile */
+static inline int
+parsec_dtd_flow_writes(const parsec_dtd_flow_info_t *flow)
+{
+    const int op_type = flow->op_type & PARSEC_GET_OP_TYPE;
+    return (PARSEC_INOUT == op_type) || (PARSEC_OUTPUT == op_type);
+}
+
+/* **************************************************************************** */
+/**
+ * Give a task a single place in the chain of users of each tile it names
+ *
+ * A task may name the same tile in several of its flows. If each of these
+ * flows entered the chain of the tile, the task would be its own predecessor
+ * there: it would wait for itself, be counted among the readers of a copy it
+ * may write, and hand the tile on once per flow. One flow stands for all of
+ * them instead: the first one that writes the tile, so that the task waits for
+ * the readers before it and owns the tile until the next writer, or the first
+ * one when none writes. The other flows are marked FLOW_SHARES_TILE and name
+ * that flow as their parent; data_lookup_of_dtd_task() gives them its copy
+ * when the task is about to run.
+ *
+ * A local task holds one reference per writing flow, given back when the walk
+ * over its successors finds the next owner of the tile. The walk does this for
+ * the flow that stands in the chain only, so the references of the other
+ * writing flows of the tile are given back here.
+ *
+ * @param[in,out]   this_task
+ *                      The task being inserted
+ *
+ * @ingroup     DTD_INTERFACE_INTERNAL
+ */
+static void
+parsec_dtd_share_tiles_between_flows(parsec_dtd_task_t *this_task)
+{
+    const int nb_flows = this_task->super.task_class->nb_flows;
+    int first, other, lead, writers, shared;
+    parsec_dtd_flow_info_t *flow;
+    parsec_dtd_tile_t *tile;
+
+    for( first = 0; first < nb_flows - 1; first++ ) {
+        flow = FLOW_OF(this_task, first);
+        tile = flow->tile;
+        if( (NULL == tile) || (flow->op_type & PARSEC_DONT_TRACK) || (flow->flags & FLOW_SHARES_TILE) ) {
+            continue;  /* not tracked, or seen with an earlier flow */
+        }
+
+        lead = first;
+        writers = parsec_dtd_flow_writes(flow);
+        shared = 0;
+        for( other = first + 1; other < nb_flows; other++ ) {
+            flow = FLOW_OF(this_task, other);
+            if( (flow->tile != tile) || (flow->op_type & PARSEC_DONT_TRACK) ) {
+                continue;
+            }
+            flow->flags |= FLOW_SHARES_TILE;
+            shared = 1;
+            if( parsec_dtd_flow_writes(flow) && (0 == writers++) ) {
+                lead = other;  /* the first flow that writes the tile */
+            }
+        }
+        if( !shared ) {
+            continue;
+        }
+
+        if( lead != first ) {
+            FLOW_OF(this_task, first)->flags |= FLOW_SHARES_TILE;
+            FLOW_OF(this_task, lead)->flags &= ~FLOW_SHARES_TILE;
+        }
+        for( other = first; other < nb_flows; other++ ) {
+            flow = FLOW_OF(this_task, other);
+            if( (flow->tile == tile) && (flow->flags & FLOW_SHARES_TILE) ) {
+                parsec_dtd_set_parent(this_task, lead, this_task, other);
+            }
+        }
+
+        if( parsec_dtd_task_is_local(this_task) ) {
+            for( ; writers > 1; writers-- ) {
+                parsec_dtd_release_local_task(this_task);
+            }
+        }
+    }
+}
+
 /* **************************************************************************** */
 /**
  * Function to insert dtd task in PaRSEC
@@ -3032,6 +3126,9 @@ parsec_insert_dtd_task(parsec_task_t *__this_task)
         parsec_dtd_remote_task_retain(this_task);
     }
 
+    /* A tile named in several flows is tracked through one of them */
+    parsec_dtd_share_tiles_between_flows(this_task);
+
     /* In the next segment we resolve the dependencies of each flow */
     for( flow_index = 0, tile = NULL, tile_op_type = 0; flow_index < tc->nb_flows; flow_index++ ) {
         parsec_dtd_tile_user_t last_user, last_writer;
@@ -3055,6 +3152,13 @@ parsec_insert_dtd_task(parsec_task_t *__this_task)
             tile->arena_index = (tile_op_type & PARSEC_GET_REGION_INFO);
         }
         (FLOW_OF(this_task, flow_index))->arena_index = (tile_op_type & PARSEC_GET_REGION_INFO);
+
+        if( (FLOW_OF(this_task, flow_index))->flags & FLOW_SHARES_TILE ) {
+            /* Another flow of this task stands for this one in the chain of
+             * the tile, and brings the data: nothing to wait for here. */
+            satisfied_flow++;
+            continue;
+        }
 
         /* Locking the last_user of the tile */
         parsec_dtd_last_user_lock(&(tile->last_user));

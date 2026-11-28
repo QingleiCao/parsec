@@ -104,6 +104,13 @@ typedef void (parsec_taskpool_wait_t)( parsec_taskpool_t *tp );
  * through the last "R" flow.
  */
 #define RELEASE_OWNERSHIP_SPECIAL (1<<4)
+/* A task may name the same tile in several of its flows. One of these flows
+ * then stands for the task in the chain of the users of the tile, and the
+ * others carry this flag: they take no part in the tracking of the tile, name
+ * the flow that stands for them as their parent, and get its data copy when
+ * the task is about to run.
+ */
+#define FLOW_SHARES_TILE (1<<5)
 
 /*
  * Contains info about each flow of a task
@@ -120,6 +127,7 @@ typedef struct parsec_dtd_flow_info_s {
     2 data_released;
     3 release remote data
     4 release ownership even when the flow is of type R
+    5 the tile is tracked through another flow of the task
     */
     parsec_dtd_tile_t *tile;
 } parsec_dtd_flow_info_t;
