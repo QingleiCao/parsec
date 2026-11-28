@@ -3556,7 +3556,7 @@ Run in the night after M4a was committed, with simulators only: the mock, the ad
 
 What it means for the milestones, as far as the facts go:
 
-- **M11 does not wait for an installation any more**, on a machine with an A100 or on CPUs. Its table can be written. Three facts will shape it:
+- **M11 does not wait for an installation any more**, on a machine with an A100 or on CPUs. Its table can be written (written the same day: section 10.5). Three facts will shape it:
   - **The result of `sample_async` has one call, `get()`, which blocks.** There is no test for "ready", no time-out and no wait on several. A backend's `wait` then needs a thread per job in flight.
   - **CUDA-Q is C++.** The wheel has headers and libraries and no C interface, so the backend is a C++ file, or a second adapter program in Python.
   - **A job has no seed of its own**, where the mock and the Qiskit adapter draw from the key of an evaluation. Whether CUDA-Q's counts can be made to depend on the key alone, with jobs on several QPUs at once, was not tried.
@@ -3593,6 +3593,196 @@ What it means for the milestones, as far as the facts go:
 - **M4b** adds a backend to the adapter program, and nothing to PaRSEC: the client, the protocol and the guard are there. What it has to settle: the provider's job tags against the session and tag of the protocol; cancelling at the provider what the client gave up on while the adapter could not be reached; the rate limit, for which `device_qpu_submit_interval` exists; and the flag without which the adapter does not start.
 - **A circuit is prepared in the call that submits it**, so a job waits for the transpilation of its circuit. With a device model, a QAOA circuit of 16 qubits takes Qiskit some tens of milliseconds. Measured since, for 8 qubits (E11): reading the text takes 74 to 131 ms, and transpiling 13 to 37 ms. Making it a task of its own is what section 3.4 foresaw.
 - **M10** can use the OpenQASM 3 writer as its test of what it lowers, and the reader for circuits an application brings.
+
+## 9.10 M11a: an adapter program on CUDA-Q (2026-11-28)
+
+Approved with "Approve, start M11a", the same day the table of section 10.5 was written. Built on `34840f00f`. The dependency it adds is outside the build: a Python with `cudaq`, for the adapter program and for the optional tests. Simulators only, CUDA-Q's on the CPU and on GPUs: no provider was contacted, no account exists, and nothing in the tree has code that could reach a quantum device.
+
+### What exists now
+
+- **`tools/qpu/parsec_qpu_adapter_cudaq.py`** (new): an adapter for the backend `adapter` that runs the jobs on a simulator of CUDA-Q, with a reader of its own for the circuits.
+- **`tools/qpu/parsec_qpu_adapter_protocol.py`** (new): the protocol half of the Qiskit adapter, moved: sessions, jobs, the requests, the socket. Both programs load it.
+- **`tools/qpu/parsec_qpu_adapter_qiskit.py`**: keeps its simulator and its options.
+- **Tests** (`tests/runtime/qpu`, `tests/apps/qaoa`): 11 new ones, each registered only when its Python is found; `qpu_qasm_test`, `qpu_adapter_stat` and `qpu_adapter_sessions` check more than they did; `check_no_hardware.cmake` knows the third adapter program, and its self-test has 36 definitions where it had 13.
+- **`tools/qpu/README.md`**: the adapter for CUDA-Q.
+- **Nothing in `parsec/` changed.** No C source of the component is in this milestone.
+
+### The adapter, as built
+
+- **One adapter is one QPU of CUDA-Q, and runs one job at a time.** The protocol half is given one worker thread. Everything of CUDA-Q after the target is set is called by that thread: the kernel of a circuit is built there, at the first job that needs it; the seed is set there; the sample is taken there. So `prepare`, which a thread of the connection answers, only reads the text, and never waits for a job.
+- **The seed of an evaluation** is `cudaq.set_random_seed` of a mix of `--seed` and the key, set right before its sample. No job runs then, since the one thread waited for the last one: the call returns at once, and the sample draws from it (section 10.5, "Measured for this table").
+- **The reader is exact.** It takes a text line by line, as `parsec_qpu_qasm_write()` writes one. Then it writes the circuit it read as that function would, in Python, and compares: a text is taken only if the two are the same bytes. A number written another way, a definition that is not used, and anything else that would be the same circuit in other words is refused. So is a circuit that measures nothing, which is no circuit to the component either (`parsec_qpu_circuit_check`).
+- **The lowering.** h, x, y, z, rx, ry, rz, cx and cz are the builder's gates. rxx, ryy and rzz are built by the three definitions of the text, and the reader refuses a text whose definitions are other words than those. The measurements all stand at the end of the kernel, in the order of the qubits: nothing follows a measurement on its qubit, so that is the same circuit.
+- **A result.** Character *i* of a string of CUDA-Q is the *i*-th measured qubit by its index, and bit *q* of an outcome is qubit *q*. A result of another width than what was measured, or of another number of shots than was asked for, fails the job.
+- **An angle that is no finite number fails its job.** A coefficient times a value that is too large is such an angle, and CUDA-Q ends the process on it (the review, below). The adapter checks every such product before a sample.
+- **Targets.** `qpp-cpu` and `nvidia`, and for `nvidia` the option `mqpu`: a table in the program. With `qpp-cpu` the adapter hides the GPUs from CUDA-Q before it loads it: CUDA-Q takes its GPU simulator, and a GPU, as soon as it sees one. `--qpu K` is the QPU of the target that runs the jobs.
+- **Threads.** `--threads` decides for the CPU simulator; without it, `OMP_NUM_THREADS` of the environment, and one thread when that is not set.
+- **No option may be written short** (`allow_abbrev` is off in both programs), so that `--targ` is no way around what reads the test definitions.
+- **It says in `hello` that it drives no device**, as the protocol half does for every program built on it.
+
+### The protocol half: moved, and four changes
+
+- **The move changes three lines** of the classes that moved: the simulator and the number of workers are given to the adapter, where it made the one and read the other. Checked by comparing the committed program, line by line, with the two files. The five tests with Aer passed on the moved code before anything else was built.
+- **Four changes followed the review**, all in what the adapter backend never asks of an adapter that works:
+  - a request that comes while a wait is held: the wait is answered first, where it got no answer at all;
+  - a key is `0x` and one to sixteen hexadecimal digits, where a number written any way was taken;
+  - an adapter does not start on a path where another one listens, and at its end removes the socket only if it is still its own;
+  - when the adapter is told to stop, the job that runs ends after the evaluation it is in.
+
+### The guard script
+
+- **Its rules for this adapter**: a `--target` is `qpp-cpu` or `nvidia`; an `--option` is `mqpu`; a `--qpu` is a number; the program is started with its own Python, from `tools/qpu`. They are read only in a file that names the adapter, so that another program's `--target` is its own business, and cmake's `--build ... --target` is taken out first.
+- **What the review made of it**:
+  - options are looked for in the text without its quotes and brackets;
+  - an option without its value beside it is refused;
+  - the launcher's time may have a fraction;
+  - every `qpu_adapter_run` a file names has to be one the script could read;
+  - names of the environment that hold a token, a secret or credentials are refused anywhere, and in a file that names an adapter also what tells it or CUDA-Q what to load (`CUDAQ_...`, `PYTHONPATH`).
+- **The self-test** names, for 23 of its 35 definitions that have to be refused, the rule that has to refuse it, and fails when another rule does, or two.
+- **What it is.** A second lock. The first is the adapter's own: its table of targets, read before CUDA-Q is loaded. A script that reads test definitions as text cannot see every way to write one, and the review found ways; the ones above are closed.
+
+### The tests
+
+Eleven new tests; the suite has 379 with both Pythons.
+
+| Test | Needs | What it checks |
+|---|---|---|
+| `adapter:cudaq:reader` | any `python3` | The adapter's reader against the texts `qpu_qasm_test -o` keeps: 205 texts of the writer are read as the circuits they were written from (every operation, every kind of angle, 200 circuits drawn at random); 58 texts the component's reader refuses are refused; 54 texts it takes and the writer does not write are refused |
+| `adapter:cudaq:targets` | any `python3` | The adapter's help names two targets, the two simulators |
+| `adapter:cudaq:short_option`, `adapter:cudaq:option` | any `python3` | An option written short is refused, and so is an option the target does not take: both before CUDA-Q is loaded |
+| `adapter:cudaq` | `cudaq` | `qpu_adapter_stat` against the adapter on the CPU simulator |
+| `adapter:cudaq:sessions` | `cudaq` | `qpu_adapter_sessions` |
+| `adapter:cudaq:seed`, `adapter:aer:seed` | `cudaq`; Qiskit Aer | Three adapters: an evaluation gives the same counts at two that were started alike, in two processes, and other counts at one started with another seed |
+| `adapter:cudaq:taken` | `cudaq` | A second adapter started on the socket of one that listens says so and ends |
+| `apps/qaoa:adapter:cudaq` | `cudaq` | The application through the adapter, without the comparison with the reference |
+| `apps/qaoa:adapter:cudaq:two` | `cudaq` | The same on two QPUs that are two adapters, every task naming its QPU |
+
+What the three test programs gained, for both adapter programs:
+
+- **`qpu_qasm_test -o DIR`** keeps its texts: the writer's with their circuits, the ones the reader refuses, and the ones it takes that are not the writer's. It gained 15 texts that are the writer's own but for one thing each (a number written another way; a qubit the circuit does not have; an operation after a measurement; a definition that is not used; no measurement), and it reads each as the component's reader has to.
+- **`qpu_adapter_stat`**:
+  - eight jobs in flight at once give the counts each gives alone;
+  - three of four qubits measured, out of order, one of them before the operations on the others;
+  - a parameter that makes an angle infinite: the job fails or is refused, and the adapter is the same process for what follows;
+  - with `-b` and `-B`, the comparison of adapters by their seed.
+- **`qpu_adapter_sessions`** says one job in the protocol: a submission asked again is the job the adapter has; its results are given once; a key that is not written as the protocol writes it is refused; a wait with a request behind it is answered, and then the request.
+
+### Verification
+
+Every job built from a fixed copy of the working tree. The numbers are those of the fourth and last copy (`/home/qcao3/qpu_m11a_tmp/src4`; `sha256` of its difference to `34840f00f` in `parsec`, `tests` and `tools` starts `41ce4b6397d18556`), from which the tree differs in this document only. The first and the third copy went through the same jobs, and passed them. Scripts, status files and logs: `exp_qpu/checks/m11a/`.
+
+| What | Where | Result |
+|---|---|---|
+| Debug with `PARSEC_DEBUG_PARANOID` and MPI, both Pythons: the whole suite | serotonin, exclusive (Slurm job 68337) | 379 of 379 |
+| Release, both Pythons: the whole suite | | 379 of 379 |
+| Debug, a Python without `cudaq` (the one with Qiskit): every QPU and QAOA test | | 373 tests registered: the four that need only a Python are there, the six with CUDA-Q are not. 206 of 206 |
+| No Python; the component off: what is registered (configured, not built) | | 363 tests; 168 tests, none of the component |
+| The 20 tests of M11a and the ones it touched, 20 times each, in the Debug and in the Release build | | all pass |
+| Every QPU and QAOA test, 3 times, Debug | | 212 of 212 |
+| A build with CUDA (Debug, `PARSEC_DEBUG_PARANOID`, MPI): those 20 tests as ctest runs them | guyot, three A100 (Slurm job 68338) | 20 of 20, of 472 tests registered |
+| No compiler warning in the QPU files in the four builds; no directory written by Python beside the sources; no adapter process left | | |
+
+By hand, on the GPU simulator (the same job on guyot; PaRSEC's CUDA device on one GPU, CUDA-Q on the two others):
+
+| Run | Result |
+|---|---|
+| `qpu_adapter_stat` and `qpu_adapter_sessions`, the adapter with `--target nvidia` on one GPU | pass |
+| `qpu_adapter_stat`, the adapter with `--target nvidia --option mqpu --qpu 1` on two GPUs | passes; the adapter says QPU 1 of 2 |
+| The application, two QPUs that are two adapters on two GPUs, every task naming its QPU, a CUDA device of PaRSEC's up in its context | runs: 900 tasks in 900 jobs on one QPU, 1,146 in 734 on the other |
+| The same, a task bound when a place is free | runs: 813 tasks in 813 jobs, 1,233 in 821 |
+| The application on two ranks, a QPU on each | runs: 1,116 tasks in 900 jobs, 930 in 734 |
+| 8 blocks of 20 qubits, and of 24, on one QPU and on two (128 jobs) | run; on two QPUs 65 and 63 jobs, and 63 and 65 |
+| 4 blocks of 28 qubits on QPU 1 of CUDA-Q's platform of two | runs (32 jobs). Most memory used and most utilisation meanwhile: 2,535 MiB and 93% on the second GPU, 425 MiB and 6% on the first |
+| The adapter started with an option its target does not take, a QPU its target does not have, 65 qubits, no thread, an option written short | each refused, with the reason, before a socket exists |
+
+Those runs say that the paths work on GPUs. They are no measurement: a run of 128 jobs takes 5 s with the start of its adapters and the compiling of its circuits, and nothing was timed inside it.
+
+By hand, the threads of the adapter for the CPU simulator (serotonin, 16 cores; the application with 4 blocks of 14 qubits):
+
+| Started with | Time of the run | CPU time of the adapter | Most threads it had |
+|---|---|---|---|
+| its defaults | 3.3 s | 3 s | 21 |
+| `--threads 4` | 1.3 s | 4 s | 24 |
+| `--threads 1`, and `OMP_NUM_THREADS=4` in the environment | 3.3 s | 3 s | 21 |
+
+So the simulator computes on one thread unless told, and the option decides. The other threads are CUDA-Q's, one per core for compiling a circuit.
+
+### Does a test notice
+
+63 deliberate bugs, each one edit of a copy of a file (two edits for a bug that the reader and its writer share), and the tests run on the copy: 37 in the adapter for CUDA-Q, 9 in the protocol half, 17 in the guard script. `exp_qpu/checks/m11a/mutate_m11a.py`; the results are `status_mutations_local_1`, `_3` and `_3b` there.
+
+- **The first pass, before the review: 39 of 48 noticed.** What the nine misses led to:
+  - *The reader takes a text that is not as the writer writes it.* No kept text was the writer's but for its spelling: 5 such texts, and the review asked for more of the kind.
+  - *A circuit that measures nothing gets an answer.* The adapter answered all zeros; the component refuses such a circuit, so the reader refuses it now, and a text for it is kept.
+  - *The seed does not depend on `--seed`.* The two tests of three adapters.
+  - *The table of targets has a quantum device in it.* The test of the help text.
+  - *The results of a job can be taken twice*, and *a tag the adapter has gets a second job*, both in the protocol half and both older than this milestone: the adapter backend asks neither of an adapter that works. `qpu_adapter_sessions` asks both now.
+  - *Any option of a target is taken*, later with *an option may be written short* and *an adapter starts where another one listens*: the three tests of what the adapter says.
+- **The last pass, on the last version: 59 of 63.** The four that no test notices, and what holds them:
+  - *`--qpu` is ignored.* By hand, on two A100: with CUDA-Q's platform of two QPUs and `--qpu 1`, blocks of 28 qubits took the second GPU to 2.5 GiB and 94%, and the first to 0.4 GiB and 3% (table above).
+  - *The CPU simulator is not told its threads*, and *`--threads` does not decide where the environment says something.* By hand, by the CPU time of the adapter (table above).
+  - *The adapter for the CPU simulator lets CUDA-Q see the GPUs.* By hand on methane, whose A100 the adapter could see: no process on the GPU while it ran the statistical test.
+- **Every bug in what a circuit means is noticed**: 14 of 14 in the lowering, 4 of 4 in the results, 5 of 5 in the reader, 4 of 4 in the seeds and the one job at a time. So are 17 of 17 in the guard script, by its self-test, and 9 of 9 in the protocol half.
+
+### What an independent review found
+
+A reviewer with the sources of the second fixed copy, the means to run them, and none of the reasoning. Its report is `exp_qpu/checks/m11a/review/review_snapshot2.md`. Twelve findings; none in what a circuit means, in the bit order or in the seeds, which it checked by its own runs and found sound.
+
+| Finding | What was done |
+|---|---|
+| **An angle that is not finite ends the adapter process**: `rx(2.0 * p0)` with the value 1e308, which the client sends since the value is finite. CUDA-Q aborts on it, and every job of every client is gone | Fixed: such an evaluation fails in the adapter. `qpu_adapter_stat` submits that job to both adapters |
+| **The refusals of the reader test could not fail**: none of the kept texts was in the writer's own lines, so all were refused at the first line, and ten checks of the reader could be removed unseen | Fixed in the test: 15 texts that are the writer's but for one thing. The pass of deliberate bugs below has what is left |
+| **`--threads` did nothing where the environment set `OMP_NUM_THREADS`** | Fixed: the option decides |
+| **The guard script let a test start another program**: a launcher's time with a fraction, a quoted option, the launcher in a variable, a bracket in a socket's name. The pattern is M4a's | Fixed, each with a definition in the self-test |
+| **The guard's new rules had holes**: a quoted `--target`, short forms, an option in a variable, a socket named so that what followed looked like cmake's `--build`; and names of other vendors in the environment | Fixed, but for short forms, which the adapters refuse themselves now |
+| **The guard's new patterns refused what is not theirs**: `--machinefile`, another program's `--target` | Fixed: the rules are read in the files that name the adapter |
+| **The self-test did not say which rule refused a case**, and one case was refused by two | Fixed |
+| **Resources the README did not state**: a thread per core for compiling; the first job of a long circuit takes seconds; a megabyte per kept circuit | In the README. Measured again here (`exp_qpu/checks/m11a/first_job_and_memory.log`): the first job of a circuit takes 0.11 s more than the ones after it at 20 operations, 0.14 s at 100, 1.0 s at 1,000 and 2.4 s at 2,000; a kept circuit takes 0.9 MB. The adapter keeps 256 circuits by default, where the Qiskit adapter keeps 4,096 |
+| **The README still said one adapter exists; the adapter's name had parentheses**, which the client prints as question marks | Fixed |
+| **Six things in the protocol half**, none new with the move | Four fixed (above). Two are not: see "What is not done" |
+| **Tests whose point was not checked**: several measured qubits with others between; the two-adapter test's comment; texts of an earlier run kept | Fixed: a test, the comment, and the directory is emptied |
+| **The tests left the GPUs visible to an adapter for the CPU simulator** | Fixed in the adapter, which hides them. By hand on methane, with its A100 visible: no process on the GPU while the adapter ran the statistical test |
+
+The reviewer tried to start the adapter with a target that is not a simulator, to see it refused, and was not allowed to. Early in the milestone the same had been done once by hand here (`--target ionq`: refused by the parser of the arguments, before CUDA-Q is loaded). It was not done again, and the job scripts do not do it: the test of the help text is what holds the list.
+
+### What a job costs through this adapter (E10c)
+
+`qpu_bench` through this adapter on the CPU simulator with one thread, as E10b did for the Qiskit adapter: no classical work, 4 workers, 100 shots; 6 runs each on serotonin, exclusive, a Release build (Slurm job 68339; 12 runs, none failed). The adapter was started through `exp_qpu/cudaq_timed_adapter.py`, which loads its module and puts timers around its calls. Microseconds, medians; `exp_qpu/tables/e10c.md` has the spreads.
+
+| | One chain, 300 jobs | 64 chains, 1,280 jobs |
+|---|---|---|
+| A link, or a task | 1,406 | 836 |
+| A sample (`sample_async` and `get()`), not the first of its circuit | 522 | 632 |
+| The seed (`set_random_seed`) | 13.5 | 12.6 |
+| The result made into counts | 16 | 16 |
+| Once per circuit, spread over the jobs of the run | 722 | 170 |
+| A job waited for the one thread | 20 | 51,248 |
+| The rest: the protocol, the adapter's Python, the client, the runtime | 141 | 5 |
+
+Once per circuit (9 circuits a run): reading the text 0.09 ms, building the kernel 0.85 ms, its first sample 20 ms.
+
+- **Beyond its simulation, a job costs 0.17 ms through this adapter**: 0.14 ms for the protocol, the adapter's Python, the client and the runtime, and 0.03 ms for the seed and the counts. The Qiskit adapter's 0.16 ms (E10b) is the same within what two different programs allow.
+- **The reader costs nothing that shows**: 0.09 ms a circuit, where `qiskit.qasm3.loads` takes 74 to 131 ms (E11). What a circuit costs once here is CUDA-Q's compiling at its first sample.
+- **One adapter gives 1,200 jobs a second of these small circuits**, since one job runs at a time: with 64 chains a task takes 0.84 ms, which is a job in its thread, and a job waits 51 ms in the queue of that thread. More throughput is more adapters.
+- **Not measured**: the GPU simulator; circuits of the application's size; several adapters at once.
+
+### Departures from the table of section 10.5
+
+1. **Three test programs changed**, which the table does not list: `qpu_qasm_test.c`, `qpu_adapter_stat.c` and `qpu_adapter_sessions.c`. The table had "texts that the reader has to refuse"; what was built is the cross-check of the reader against every text of the writer's own test, and the checks the review and the deliberate bugs asked for.
+2. **The reader is stricter than the table says**: it takes a text only if it can write it again byte for byte.
+3. **The kernel is built at the first job of its circuit**, by the thread of the jobs, not when the text is given. One thread then calls CUDA-Q, and a `prepare` never waits.
+4. **Four changes in the protocol half**, where the table has it "moved".
+5. **The test of a quantum task between two accelerator tasks was not run with this adapter.** It compares the counts with the exact sampler (`qpu_test_check_counts`), and a simulator of its own gives other counts. In its place, by hand: the application on two GPU-simulated QPUs while its context has a CUDA device of PaRSEC's up on a third GPU.
+6. **`adapter:aer:seed`** is a test of the Qiskit adapter that the table does not have.
+
+### What is not done
+
+- **No test runs on a GPU.** The GPU simulator, the option `mqpu` and `--qpu` are checked by hand, in one job. leconte's GPUs cannot run it.
+- **Two findings of the review in the protocol half are left**, both from M4a and neither reachable by the adapter backend, which uses one connection per session and names a circuit by its bytes: a connection that waits on a session while another connection says `bye` for it may read a descriptor that was closed; and two `prepare` of one name with different texts at the same moment are both taken.
+- **When it is told to stop, the adapter still ends the evaluation that runs**, which on a CPU may take seconds.
+- **`--qpu` is held by no test**, and is checked by hand by where the memory goes (above).
+- **CUDA-Q 0.17.0 only.** It warns on import that `sample` will change in a later release.
+- **A quantum device through CUDA-Q**: not in M11a (section 10.5).
 
 ---
 
@@ -3653,6 +3843,7 @@ The project facts and sections 1.4, 2.1, 2.2, 2.6, 2.7, 6.7, 7.3 and 7.4 point h
   - CUDA-Q is C++. It would be an optional dependency of one backend file, built only on request, like any provider SDK (section 7.5).
   - The same backend serves CUDA-Q's multi-QPU platform, where every GPU of a node is a simulated QPU chosen by its index [N5][N6]: one PaRSEC QPU per CUDA-Q QPU index.
   - Not verified: that a kernel built at run time is sampled on a physical QPU the same way as on a simulator.
+  - Changed on 2026-11-28 (section 10.5, M11): CUDA-Q comes first as an adapter program for the backend of M4a, outside the process, with one adapter per QPU. The backend in the process, as this assumption describes it, is the second half, M11b, and is not planned.
 - **A5. Nothing else changes in the runtime.** To the runtime, an NVQLink-coupled QPU is a QPU device with a backend, as the mock is. NVQLink changes where the owner rank runs and how short a useful job can be.
 
 This design does not assume that the runtime sees qubits, pulses or syndromes.
@@ -3901,9 +4092,77 @@ M4a and M4b as in section 10.4. M4's files, risks and tests stay as section 7.3 
 
 Assumption A4 as a backend, for NVQLink-coupled QPUs and for CUDA-Q's simulated multi-QPU platform. It needs a CUDA-Q installation, and nothing here has one. Its milestone table is to be written when an installation exists. Since 2026-11-28 one exists, outside the repository: section 9.9, "Three installs".
 
+**The table was written on 2026-11-28, and follows. Nothing of it is built.** Source references below are to `34840f00f`. What is said of CUDA-Q is of release 0.17.0 as `pip` installs it, and is marked as run here, or as read.
+
+**Two ways to put CUDA-Q behind a QPU**, as there are two routes to IBM (section 10.4).
+
+| | An adapter program (M11a) | A backend in the process (M11b) |
+|---|---|---|
+| What it is | A second program for the backend "adapter" of M4a, in Python on the `cudaq` package | A4 as it was written: C++ in the process of the owner rank, on CUDA-Q's headers and libraries |
+| What changes in PaRSEC | Nothing. The client, the protocol and the hardware guard are there | A C++ source, built on request, and CUDA-Q's libraries linked with it. The component is built from the `.c` files of its directory (`ValidateModule.CMake`). A library of its own could add the backend with `parsec_qpu_backend_register()`, which exists; its header, `device_qpu_backend.h`, is not installed |
+| Choosing the simulator | `cudaq.set_target()`, when the adapter starts | By the libraries the program is linked with, in what the probe ran (section 9.9): a build for the CPU simulator and another for the GPU one. The platform class has a `setTargetBackend()`; what it does in a program not built by CUDA-Q's compiler, which the wheel does not have, was not tried |
+| Waiting for a job | A thread of the adapter sits in `get()`, and the interpreter stays free meanwhile (run) | A helper thread sits in `get()`: the result object has no other call (read) |
+| What a job costs beyond its simulation | The socket and the adapter's Python. For the Qiskit adapter that is 0.16 ms (E10b); for this one it is to be measured | Not measured. Nothing crosses a socket |
+| What shares the process of a rank with it | Nothing | CUDA-Q's runtime, its compiler libraries and its simulators, beside PaRSEC's own CUDA device. Not tried |
+| Needs at run time, on the owner rank's node | Python and `cudaq` | CUDA-Q's libraries; no Python (the probe's C program had none in its process) |
+
+**Recommendation: M11a, and M11b only when a measurement asks for it.**
+
+- **The cost the adapter adds does not matter here.** A job is milliseconds or more (A1), and the smallest job measured below takes 1.6 ms in CUDA-Q itself.
+- **M11a changes nothing in PaRSEC.** A second SDK behind the protocol of M4a is also the test of that protocol: the two programs that speak it so far, the adapter of the tests and the Qiskit adapter, were written with the client.
+- **M11b brings CUDA-Q into the process of every rank that owns such a QPU**, and, as far as the probe found, fixes its simulator when it is built. Both are costs with nothing measured against them yet.
+
+**Measured for this table** (CUDA-Q 0.17.0, its CPU simulator `qpp-cpu` with 4 threads, on methane; scripts and logs in `exp_qpu/checks/m11_plan/`).
+
+- **A seed set before a job decides its counts.** After `cudaq.set_random_seed(s)` a job gives the same counts whatever ran before it: after three jobs without a seed, after a job with other angles, from `sample` and from `sample_async`, and from a thread that is not the main one. Another seed gives other counts.
+- **`set_random_seed` waits for the job that runs, and holds the interpreter while it waits.** Behind a job of 1.47 s it took 1.44 s (30 us with nothing running). Called from a second thread behind such a job, it left the main thread one tick of 10 ms in 1.45 s. `sample_async` returns in 1 to 22 ms, with a job running or not.
+- **Two jobs submitted one after the other, each after its seed, each get their seed's counts** (5 of 5), because the second seed waits for the first job.
+- **`sample`, and `get()` on the result of `sample_async`, leave the interpreter free**: a second thread got 148 and 150 ticks of 10 ms in 1.5 s.
+- **Small jobs.** A circuit of the application's shape is built gate by gate in 3 to 5 ms. Its first sample takes 70 to 80 ms (8 and 10 qubits). After that, with other angles each time and 256 shots: 1.6 ms (8 qubits, one layer), 2.3 ms (8 qubits, two layers), 5.0 ms (10 qubits). At 16 qubits the CPU simulator takes 0.6 s a job. `import cudaq` takes 0.5 s.
+- **CUDA-Q does not say which targets are simulators.** With no GPU visible this install knows 22 targets. Four name a simulator. The 18 others name none: by their names, vendors' services and devices. `is_remote()` and `is_emulated()` answer false for every one of the 22 descriptions (asked with `qpp-cpu` as the target; no other target was set). So the adapter keeps a list of its own.
+- **Not tried:** seeds with jobs on several QPUs of one process, which the design below does not need; the GPU simulator, for anything in this list; any release but 0.17.0.
+
+From the probe (section 9.9): the builder has no rxx, ryy or rzz; character *i* of a result string is qubit *i*; when some qubits are measured, the string has them in the order of their indices; no importer of CUDA-Q reads an OpenQASM 3 text that has parameters; one QPU runs its jobs one after the other; the GPU simulator needs compute capability 7.5, which leconte's V100 do not have and the A100 of methane and guyot do.
+
+**What follows for the design.**
+
+- **One adapter process is one CUDA-Q QPU, and runs one job at a time**: the seed of an evaluation, then its sample. That keeps the counts a matter of `--seed` and the key alone, as with the Qiskit adapter, and it never calls `set_random_seed` behind a running job. Nothing is lost by it: a CUDA-Q QPU runs one job at a time anyway.
+- **Several QPUs are several adapters**, one entry of `device_qpu_devices` each (M9). On a node with several GPUs every adapter is given its own GPU (`CUDA_VISIBLE_DEVICES`) and the target `nvidia`. So it is PaRSEC's list of QPUs that spreads jobs over the GPUs, where A4 had CUDA-Q's `mqpu` platform do it with one QPU per index. The adapter still takes `--qpu K`, the index of a QPU of its target, for a platform whose QPUs are not the GPUs of the node.
+- **The adapter reads the text itself.** A reader in Python for the form `parsec_qpu_qasm_write()` writes, and nothing else of OpenQASM 3: any other text is refused at `prepare`. It builds the kernel once per circuit, with rxx, ryy and rzz by the three definitions of the text.
+- **Simulators only.** `--target` takes `qpp-cpu` or `nvidia`, and for `nvidia` the option `mqpu`: a list written in the program, of what was run here. It has no code that sets another target, and says in `hello` that it drives no device.
+- **The half of the Qiskit adapter that is the protocol is shared**, not copied: sessions, jobs, the requests and the socket move to a module that both programs load.
+
+### M11a: an adapter program on CUDA-Q
+
+Built on 2026-11-28: section 9.10, with its departures from this table.
+
+| Item | Description |
+|---|---|
+| Objective | `tools/qpu/parsec_qpu_adapter_cudaq.py`: an adapter for the backend "adapter" that runs the jobs on a simulator of CUDA-Q. A kernel is built once per circuit from its OpenQASM 3 text, and sampled with `cudaq.sample_async` on one QPU of the target, one job at a time. One adapter per QPU |
+| Files | New: `tools/qpu/parsec_qpu_adapter_cudaq.py`; `tools/qpu/parsec_qpu_adapter_protocol.py`, the protocol half of the Qiskit adapter, moved. Edited: `tools/qpu/parsec_qpu_adapter_qiskit.py`, which keeps Qiskit and Aer; `tools/qpu/README.md`; `tests/runtime/qpu/Testings.cmake` and `tests/apps/qaoa/Testings.cmake` (the optional tests); `tests/runtime/qpu/check_no_hardware.cmake` and `check_no_hardware_selftest.cmake`. Nothing in `parsec/` |
+| Dependencies | M4a: the backend, the protocol, the launcher `qpu_adapter_run` and the two test programs that take an adapter's socket. M9 for more than one QPU. A Python with `cudaq`, which no build and no required test needs. For the GPU simulator, a GPU of compute capability 7.5 or more |
+| Difficulty | Low to medium. New are the reader, the lowering, and the order of seed and job; the rest exists |
+| Risks | A second reader of the same text, in another language: a text the C writer writes and the Python reader takes for another circuit. The bit order, and a circuit that measures only some of its qubits. The seed belongs to the process: the counts depend on the key alone only while one job runs at a time, and CUDA-Q warns on import that `sample` will change in a later release. `set_random_seed` behind a running job would stop the thread that answers the client. The CPU simulator takes every core unless told, and 0.6 s for 16 qubits: the tests stay at 10 qubits or fewer and set the threads. Moving half of a tested program. `pip` installs the newest CUDA-Q, and only 0.17.0 was run here |
+| Tests | Registered only when a Python with `cudaq` is found (`PARSEC_QPU_CUDAQ_PYTHON`, or `python3` of the path), on the CPU simulator, and never required. `qpu_adapter_stat` against this adapter: circuits with one outcome, the frequencies of every operation against the exact probabilities, the same counts for the same key. `qpu_adapter_sessions`. Texts that the reader has to refuse. The application through it, without the comparison with the reference (`-c 0`), on one QPU and on two adapters of one rank. In every build: the guard script knows the third adapter program and its two targets, and its self-test gains a definition for each rule that is new. The tests of the Qiskit adapter, unchanged, after the move. By hand, on an A100: the statistical test on the target `nvidia`; two QPUs on two GPUs of guyot; `--qpu 1` on an `mqpu` platform; the test of a quantum task between two accelerator tasks, with PaRSEC's CUDA device and CUDA-Q's simulator in one run. The deliberate-bug pass and an independent review, as for M4a |
+| Acceptance criteria | Through this adapter on the CPU simulator: every operation of the circuit format gives the exact probabilities within the distance `qpu_adapter_stat` allows (0.08); a key gives the same counts whatever ran before it; the application runs to its end on one QPU and on two, with every evaluation answered. The adapter does not start with a target outside its list, no test definition names one, and the guard script refuses a definition that does. On an A100, by hand: the statistical test passes, and two adapters on two GPUs both run jobs. Every existing test passes unchanged, with and without a Python that has `cudaq`. Measured and recorded: what a job costs through this adapter beyond its simulation, as E10b did for the Qiskit adapter |
+
+### M11b: the backend in the process
+
+Not planned. It is A4's backend, and it is worth building when one of two things is true: the cost that M11a measures for a job matters to a workload, or a site has no Python where the owner rank runs. What it needs, as far as the facts go:
+
+- **A C++ source and a way to build it.** Either in the component, whose build takes C files only today, or as a library of its own that registers its backend before `parsec_init()`. The second leaves `libparsec` without CUDA-Q, and needs `device_qpu_backend.h` installed.
+- **A build per simulator**, unless a way to choose one at run time is found (the table above).
+- **A helper thread per QPU in `get()`**, which wakes the progress thread, since `submit` may not block for the life of a job.
+- **The same order of seed and job** as the adapter, and so one job in flight per QPU. Whether `cudaq::set_random_seed` waits in C++ as it does from Python was not tried.
+- **CUDA-Q and PaRSEC's CUDA device in one process**: not tried.
+
+**Not in M11: a quantum device through CUDA-Q.** The adapter has no target but simulators, so A4's open point stays open: that a kernel built at run time is sampled on a physical QPU as on a simulator. A device would be a step of its own, with `device_qpu_allow_hardware` and an explicit go-ahead, as M4b is for IBM.
+
+**What M11a makes possible.** An experiment in which the time of a job is a simulation on a GPU, where every experiment so far has a delay that was made up, or a simulation of 8 or 10 qubits on a CPU: the application on 1 to 8 QPUs that are the A100 of one node, with blocks wide enough that a job takes milliseconds to seconds. It is not part of the milestone.
+
 ## 10.6 What this means for the plan
 
-- **Order.** M9 comes first: it needs nothing from outside, and the three backends are worth more with it. Then M4a. M10, M4b and M11 each wait for something from outside: access to hardware, or an installation. (The three installations were tried on 2026-11-28, and work: section 9.9, "Three installs". M4b still waits for an account, and M10's acceptance for a provider.)
+- **Order.** M9 comes first: it needs nothing from outside, and the three backends are worth more with it. Then M4a. M10, M4b and M11 each wait for something from outside: access to hardware, or an installation. (The three installations were tried on 2026-11-28, and work: section 9.9, "Three installs". M4b still waits for an account, and M10's acceptance for a provider. M11 has its table since that day, in section 10.5; it waits for nothing from outside.)
 - **Experiments that M9 makes possible.** All three were run on 2026-11-27 with mock QPUs (section 9.8, "The checks that were left, and the experiments on several QPUs").
   - E5 with several QPUs: tasks that share jobs across QPUs.
   - E6 with QPUs on several ranks.
