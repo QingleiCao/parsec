@@ -3234,6 +3234,226 @@ The first QPU slower than the others, 2 places each:
 - **A backend's calls may block.** `submit`, `results`, `cancel` and `abandon` are called without the pool's lock, and the other QPUs go on meanwhile.
 - **Experiments.** E5 and E6 were run again on several QPUs, and the comparison of binding rules of section 10.6 (E9) with them, on 2026-11-27: above. The model with one queue and several groups of places is `exp_qpu/model_multi.py`.
 
+## 9.9 M4a: the adapter backend, OpenQASM 3, and Qiskit Aer (2026-11-27)
+
+Approved with "sure. go ahead" to the question "Start M4a, the adapter with Qiskit Aer?". Built on `c419f982f` (M9 and the checks that followed it). The dependency it adds is outside the build: a Python environment with `qiskit`, `qiskit-aer` and `qiskit-qasm3-import`, for the adapter program and for the optional tests. No provider was contacted, no account exists, and nothing in the tree has code that could reach a quantum device.
+
+### What exists now
+
+- **`parsec/mca/device/qpu/device_qpu_qasm.c` and `device_qpu_qasm.h`** (new, the header installed): a circuit as OpenQASM 3 text, written and read, with no dependency.
+- **`device_qpu_backend_adapter.c`** (new): the backend `adapter`, the client of a separate program over a Unix-domain socket. It is in the table of backends beside the mock.
+- **`device_qpu_json.c`** (new): as much JSON as the protocol needs, read in place, and a text that grows.
+- **`tools/qpu/parsec_qpu_adapter_qiskit.py`** (new): the adapter. It runs the jobs on Qiskit Aer and has no other backend.
+- **Two parameters**, `device_qpu_adapter_address` (the name section 7.2 fixed) and `device_qpu_adapter_timeout`, and two keys of a list entry, `address` and `timeout`.
+- **`check_no_hardware.cmake`** knows the adapter, and has a test of itself (`check_no_hardware_selftest.cmake`).
+- **Tests** (`tests/runtime/qpu`): `qpu_qasm_test.c`; `qpu_adapter_loopback.c`, an adapter in C for the tests, which answers from the sampler; `qpu_adapter_test.c`, the client alone against it; `qpu_adapter_run.c`, which starts an adapter beside a command; `qpu_adapter_stat.c`, the client against an adapter that simulates by its own means; `qpu_adapter_sessions.c`, which asks that adapter, in the protocol and without the client, what it keeps for a client whose connection is gone. 26 new tests: 21 that need nothing but the build, and 5 that are registered only when a Python with Qiskit Aer is found. The suite has 368 tests with all of them.
+- **`tools/qpu/README.md`**: how to use the adapter, the OpenQASM 3 functions, and the protocol.
+- **Nothing outside the component, its tests and its tools changed.**
+
+### Circuits as OpenQASM 3, as built
+
+- **The writer** declares the parameter slots as `input float[64] p0;`, `p1`, and so on, writes an angle as a number or as `number * pK`, and measures qubit i into bit i. Numbers are written with 17 significant digits, which reads back as the same double.
+- **rxx, ryy and rzz are not in OpenQASM 3's standard library**, so the writer defines the ones a circuit uses: `cx, rz, cx` for rzz; that between `h` on both qubits for rxx; that between `rx(pi/2)` before and `rx(-pi/2)` after for ryy. `qpu_qasm_test` reads the three definitions back as circuits and compares the states they prepare with those of the native operations, through the exact sampler.
+- **The reader** takes what the writer writes, and what `qiskit.qasm3.dumps` of Qiskit 2.6.2 writes for a circuit of these gates (a text of it is in the test): inputs of type `float[64]` or `angle`, gate definitions (skipped), `barrier` (ignored), angles such as `(-1.5)*gamma` or `pi/2`. The k-th `input` is slot k; Qiskit declares its parameters in the order of their names.
+- **Angles are an expression of numbers, `pi` and one input**, which has to come to a number or to a number times that input, since that is all an operation of the circuit format holds. `a + 1`, `a * b` and `1 / a` are refused, with the line.
+- **Written and read back, a circuit is the same bytes**, the fields an operation does not use apart (the text does not hold them). The test does it for every operation, for angles down to the smallest double and for the two zeros, and for 200 circuits drawn at random. This is what lets a job through the adapter of the tests give the counts of the sampler.
+
+### The adapter protocol, as built
+
+Section 2.6's table, with these additions. `tools/qpu/README.md` has the table as built.
+
+- **`hello` names a session.** The client makes the name up when it opens (time, process, host, QPU). The adapter keeps a client's jobs under it, so a client that connects again finds them, and two runs of one program do not share tags (the point section 9.2 left for M4).
+- **`submit` carries the key and the attempt of each evaluation.** The adapter of the tests needs the key to answer as the sampler does. The Qiskit adapter seeds its simulator from its `--seed` and the key, so its counts depend on those two and on nothing else, as the mock's do.
+- **`wake`.** A `wait` is held by the adapter until a job ends or its time is up. The client's thread sits in `poll()` on the socket and on a pipe; `wakeup()` writes a byte to the pipe, and the thread then sends `wake`, which makes the adapter answer the `wait` at once. So every byte on the socket is written and read by the progress thread, and the backend has no lock.
+- **`abandon(tag)`**, for a submission whose answer never came.
+- **A job that ended is told again after a new connection** until the client has taken its result or said `cancel`, so an answer lost on the way does not lose the job.
+- **64-bit values are strings**, `"0x..."`: a JSON number cannot be trusted with them.
+
+### The client when things go wrong
+
+| What happens | What the client does |
+|---|---|
+| A request gets no answer, or one that is not of the protocol | Closes the connection. The next call connects again, not more often than every 20 ms to 1 s |
+| The answer to `submit` is lost | `submit` returns "ask again". Asked again with the same tag, the adapter answers with the job it has: the job ran once |
+| The job of such a submission ends before the caller asked again | The end is kept, and reported only once `submit` has returned the job's identifier, as the interface requires |
+| The adapter was started again (it does not know the session) | Its jobs are reported as failed, and the runtime submits them again. The circuits are given again |
+| The adapter stays out of reach for `unavailable_timeout` | Its jobs are reported as failed, and it is told to drop them if it comes back. `wait` sleeps between attempts |
+| An adapter that takes no connection, with its queue full | An error at once: the socket does not block |
+| The adapter that was started again gives its jobs the names the first one used | The caller knows a job by a name of the client's own, which is never used twice |
+| The adapter says `busy`, or `unknown_circuit` | "Ask again"; the circuit is given again, once |
+| The result is not one: a shot missing, a bitstring twice or too wide | `results` fails, and the job is forgotten on both sides |
+| The adapter that answers after a new connection says it drives a device, and the first one did not (or the reverse) | It is not used again |
+
+### The hardware guard and the adapter
+
+- **What an adapter drives is what it says in `hello`.** The backend's description cannot know it before, so it is the second check of section 9.2 that applies: a backend that says so once open is closed at once, with no job. An adapter that does not say is taken for one that drives a device.
+- **An adapter that changes its answer** when the client connects again is dropped (table above). Without that, a simulator replaced by a hardware adapter in the middle of a run would get past a guard that looked once.
+- **`no_hardware_in_tests`** accepts `adapter` in a list of QPUs, and has a third check: no test definition may start the Qiskit adapter with a backend other than `aer`, or with an option that names a device or an account.
+- **The adapter of this milestone has one backend, Aer.** `--backend` takes nothing else. M4b adds the one that reaches a provider, behind a flag of its own (section 4.2, layer 5).
+- **Credentials.** The client reads no variable of the environment and no file, and writes no message to a log. The test sets the variables an SDK reads its credentials from to a known text, tells the adapter of the tests that text, and the adapter fails the test if it ever sees it.
+
+### The Qiskit adapter
+
+- **One thread per client**, a pool of threads for the jobs, one lock.
+- **`prepare`** reads the text with `qiskit.qasm3.loads` and transpiles it once for the simulator.
+- **`--device generic:N[:line|ring|full]`** makes the simulator a device model: `GenericBackendV2` of Qiskit, with the gates `cx, id, rz, sx, x`, the connectivity asked for, and made-up error rates. It is not the model of an existing device. Section 10.4 left open which noise models of IBM devices the SDK ships: they are in `qiskit-ibm-runtime`, which this milestone does not install.
+- **Its socket** can be opened by the user who started it and nobody else.
+
+### Verification
+
+Every job built from a fixed copy of the working tree. The numbers are those of snapshot 4: `c419f982f` with the uncommitted work of M4a as it is after the review and after the tests that the deliberate bugs led to (the difference in `parsec`, `tests` and `tools` has the sha256 `fdc607f2be562f71`). No file of the component or of `tools/qpu` differs between snapshots 3 and 4; the tests do. Snapshot 3, the code after the review, had passed the same configurations on serotonin (367 of 367, 168 of 168, each test of M4a 30 times), and snapshot 1, before the review, too (364 of 364, 168 of 168). Scripts and logs: `exp_qpu/checks/m4a`.
+
+| Check | Result (caffeine, an exclusive allocation; gcc 11.5, Open MPI 5.0.5) |
+|---|---|
+| The whole suite: Release, Release with profiling, Debug, Debug with profiling | 368 of 368 in each: 201 QPU and QAOA tests, 26 of them new, 5 with Aer |
+| The component off (Debug), and the default options (Release) | 168 of 168 in each. No symbol of the component in the library, no file of it compiled. The 167 other tests pass with the component on and off, the same list |
+| The two Debug configurations of the upstream CI | Compile |
+| Compiler warnings in the component and its tests, 8 builds | 0 |
+| Configured with a Python that has no Qiskit | 363 tests, none with Aer, and a line that says so. Nothing else differs |
+| Headers installed for the component | `device_qpu.h`, `device_qpu_qasm.h` |
+| The 33 tests of M4a and the ones it touched, 30 times each, three at a time: Debug, Release | 33 of 33, and 33 of 33 |
+| Every QPU and QAOA test, 5 times each (Debug) | 201 of 201 |
+| Adapter processes left when everything was over | None |
+
+- **On methane**, the whole suite before the review: 363 of 364. `overlap:1worker` failed, the timing test of M1, which uses the mock only; other sessions had the machine at a load of 16, and the test passed 5 times of 5 alone.
+- **Since snapshot 4** only this section and a paragraph of `tools/qpu/README.md` (on `--idle-drop`) were written: nothing that is built, or that a test reads.
+- **The commits one by one.** M4a is five commits: the component, the adapter program with the README, the tests of the runtime, those of the application, and this section. The states after the first and after the third were built and run through the QPU and QAOA tests on methane (Debug), and the state after the fourth is snapshot 4 with the paragraph of the README. After the first: 175 of 175, the tests as they were before M4a. After the third: 196 of 197. The one that failed is `termination:dynamic:mp:2`, with the assertion of the dynamic termination detector that section 9.8 found on four ranks (`termdet_fourcounter_module.c:596`). Repeated on that build it failed again at the 79th run, with other sessions on the machine; it is the same program in snapshot 4, where it passed each of the 9 times it ran.
+- **Not run:** a CUDA build (M4a has no GPU code, and the tests of M4a were not built with CUDA); more than one node; a locale that writes numbers with a comma; any Qiskit but 2.6.2 with Aer 0.18.4 and Python 3.12; and no provider, since the adapter has none.
+
+### The tests
+
+| Test | What it checks |
+|---|---|
+| `runtime/qpu/qasm` | Section "Circuits as OpenQASM 3": the text written for a small circuit, line by line; round trips; the three definitions; Qiskit's text; 27 angle expressions; 50 texts that have to be refused, each with its line and reason; sizes |
+| `runtime/qpu/adapter` | The client alone, as the progress thread drives it, against 20 adapters started one after the other, each with its own faults: the table "when things go wrong", and jobs, `wait` and `wakeup`, `cancel` and `abandon`. Every result is compared with the sampler's, entry for entry, one of them for parameters that need all 17 digits |
+| `adapter:chain`, `:chain:dtd`, `:chain:shared`, `:chain:shared:cap`, `:chain:slow` | PTG and DTD chains of quantum tasks through the adapter; jobs of several circuits; an adapter that takes fewer circuits than the runtime would give; jobs longer than the runtime waits in one go |
+| `adapter:multi`, `adapter:multi:two` | An adapter between two mocks; two QPUs on one adapter |
+| `adapter:restart`, `adapter:lost_answer` | The adapter is started again with jobs in flight, or loses the answer to a submission: every task still has the counts of the sampler |
+| `adapter:guard`, `adapter:absent`, `adapter:badlist` | An adapter that says it drives a device gets no job (the adapter of the tests fails the test if it gets one); no adapter where one is said to be; a misspelt key |
+| `adapter:chain:mp`, `adapter:chain:mp:last` | Four ranks, the QPU on rank 0 and on the last |
+| `apps/qaoa:adapter`, `:adapter:shared`, `:adapter:mp` | The application: final states equal to the reference bit for bit |
+| `adapter:stat:circuits` | The circuits of the tests with Aer tell the operations apart (the review, below). No adapter is needed |
+| `no_hardware_in_tests:itself` | The script that keeps test definitions away from devices refuses 12 definitions that each break one of its rules, and accepts one that breaks none |
+| `adapter:aer`, `adapter:aer:device`, `adapter:aer:noise`, `apps/qaoa:adapter:aer` (optional) | With Qiskit Aer: below |
+| `adapter:aer:sessions` (optional) | What the Qiskit adapter keeps for a client whose connection is gone, asked in the protocol by a client that is not PaRSEC's: a session is new or resumed as the adapter says; it stays while a second connection uses it, however long; it is there for a client that comes back within `--idle-drop`, and gone after |
+
+- **Every test with the adapter of the tests** also fails when that adapter saw its client break the protocol: it ends with a code of its own, and the launcher passes it on.
+- **What the tests with Aer check.** A simulator of its own does not give the sampler's counts, so nothing is compared count for count.
+  - Circuits with one outcome: bit order, the control of `cx`, a qubit that is not measured, the parameter slots, a coefficient, an input the circuit does not use.
+  - Every operation: the frequencies of 4,000 shots against the exact probabilities, by total variation distance.
+  - The same key gives the same counts, alone and in a job of three; another key gives others.
+  - The application runs on it without the comparison with the reference (`-c 0`).
+
+**Measured with Aer** (Qiskit 2.6.2, Aer 0.18.4, `--seed 1`, on methane; the adapter draws from its seed, so a run gives these numbers again). Total variation distance between the frequencies of 4,000 shots and the exact probabilities:
+
+| Circuit | Ideal simulator | Device model `generic:5:line`, without its noise | With its noise |
+|---|---|---|---|
+| 3 qubits, every operation | 0.023 | 0.023 | 0.037 |
+| 4 qubits, every operation | 0.023 | 0.023 | 0.033 |
+| 5 qubits, every operation | 0.028 | 0.028 | 0.041 |
+| rxx alone | 0.007 | 0.007 | 0.010 |
+| ryy alone | 0.020 | 0.020 | 0.017 |
+| rzz alone | 0.006 | 0.006 | 0.010 |
+
+- **The tests allow 0.08**, and 0.2 with noise. For scale: 4,000 shots drawn exactly from 32 equally likely outcomes are about 0.036 from them, so the first two columns are what sampling alone gives. And a reader that took one operation for another would move the outcomes of one of the three circuits by 0.32 at least (`adapter:stat:circuits`).
+- **Transpiled to the gates and the line of the device model**, without noise, the distances are the same to four digits as on the ideal simulator.
+- **The circuits with one outcome** give it in 400 shots of 400 on the first two, and have to give it in 300 of 400 with noise.
+- **The application on Aer**: `ring64` with 192 jobs takes its cut from 63.1 to 103.6, in 5.5 s. The run of 96 jobs with two layers takes 5.6 s on Aer and 0.05 s with the adapter of the tests. Where the time on Aer goes (reading, transpiling, simulating) was not measured, nor how many of the jobs are different circuits.
+
+### Does a test notice
+
+For each of 61 deliberate bugs, a private copy of the sources was built with that one bug (Debug) and the tests M4a adds or touches were run. A bug counts as noticed when at least one test fails. The bugs are one-line changes of the kind a slip would make: a sign, an index, a check left out, a wrong field. They are listed in `exp_qpu/checks/m4a/mutate_m4a.py`; the verdicts are in `status_mutations_3` and `status_mutations_4` there, and the logs beside them.
+
+| Where the bug is | Bugs | Noticed at first | Noticed with the tests added after |
+|---|---|---|---|
+| The OpenQASM writer | 6 | 6 | 6 |
+| The OpenQASM reader | 8 | 8 | 8 |
+| The JSON reader and writer | 4 | 3 | 4 |
+| The client (`device_qpu_backend_adapter.c`) | 29 | 24 | 28 |
+| The keys of a list entry | 1 | 1 | 1 |
+| `check_no_hardware.cmake` | 6 | 5 | 6 |
+| The circuits of the test with Aer | 1 | 1 | 1 |
+| The Qiskit adapter | 6 | 4 | 6 |
+| All | 61 | 52 | 60 |
+
+- **The first pass** (snapshot 3, 33 tests, histamine3): 52 noticed, 9 not. The 33 tests pass before the first bug and after the last one is taken out.
+- **The nine that no test noticed**, and what was done:
+
+| Bug | Why no test failed | The test that fails now |
+|---|---|---|
+| The client sends a parameter with 6 digits, not 17 | The parameters of the tests were short decimals, and a change in the seventh digit moves no count | `runtime/qpu/adapter`: a circuit whose angles are 1e9 and -3e8 times a parameter, compared with the sampler entry for entry |
+| The client does not look at the number of an answer | No adapter of the tests answered under another number | The same test: the adapter of the tests has a fault `stale`, an answer under the number of the request before; it is a fourth way to lose the answer to a submission |
+| After the adapter was started again the client takes its circuits for known there | The submission is refused (`unknown_circuit`), the circuit is given, and the job is submitted again: the same result, with one request more | The same test counts the submissions the new adapter received |
+| `results` asks the adapter for the result of a job whose adapter is gone | A second check, six lines below, gives the same error. Only a caller that takes the lost job for a job of another size gets past both, and the client then told the new adapter to drop the job that has the lost one's name | The same test, a third case of "the same names": the new adapter's job is still there and gives its result |
+| `parsec_qpu_json_member` clears its result before it reads its object | It matters only when both are one variable, which no code of the component does (the fuzzing driver did, section "Sanitizers") | The same test reads three members into the variable that holds their object |
+| `check_no_hardware.cmake` lets any other adapter script be named | The definition that names one in the test of the script was already refused by the rule on what a test starts | `no_hardware_in_tests:itself`: a twelfth definition, which starts another script through a shell |
+| The Qiskit adapter drops a session that a connection still uses (the review's fourth finding) | No test had two connections of one session | `adapter:aer:sessions`, a new test |
+| The Qiskit adapter says `resumed` for a session it never saw | The client does nothing with that on its first connection, and no test started the Qiskit adapter again | The same |
+| The client talks to an adapter of another user | It takes a second account to listen | None: not tested |
+
+- **The second pass** (snapshot 4, 34 tests, histamine3): the nine again. Eight now fail one test each, the one named above. The 52 others were not run again; the tests gained checks and lost none, and the 34 pass with no bug.
+- **One test holds most of them.** Of the 60 that are noticed, 37 fail one test only: 19 `runtime/qpu/adapter`, 9 `runtime/qpu/qasm`, 5 one of the two tests of the script, 2 `adapter:aer:sessions`, 1 `adapter:badlist` and 1 `adapter:multi:two`. The six bugs in the Qiskit adapter are noticed only by the tests with Aer, so only where Qiskit is installed.
+- **What this does not show.** The list was written by the author of the code, after the code, so it holds the mistakes that were thought of. The six defects of the review (below) were in code whose tests all passed.
+
+### Sanitizers
+
+Builds without MPI, as for the earlier milestones (gcc 12.4). Run on snapshots 1 and 3 on serotonin, and on snapshot 4 on histamine3; the numbers are those of snapshot 4.
+
+- **Address**: every QPU and QAOA test of that build, 155 (22 of M4a). No report.
+- **Undefined behaviour**: one report, the same in 130 of the 155 tests, and it is the runtime's: `parsec/parsec.c:2057`, a member read through a pointer that is not aligned. No report has a file of the component, of its tests or of the application in its place, and none has a frame of the component in its stack.
+  - **What it is.** In a Debug build `parsec_get_copy_reshape_from_dep` (`parsec_reshape.c:753`) prints the task into a string for its messages, and `parsec_task_snprintf` reads `data_in->original->key` of every flow. For the flow whose dependency made the task ready, `data_in` holds what the predecessor's repository entry holds (`parsec.c:1887` and `:1840`), which at that point is a reshape promise and not a data copy (`:1953` casts the same value to one). What is taken for `original` is an address in the code of the library. It is read, for a string, and nothing is written. Both files are as in `09c721868`. Not reported upstream.
+  - **What the runs on snapshots 1 and 3 could not show.** Their script counted the reports in ctest's log, which keeps the output of failed tests only, and no test had failed: a report in a test that passes went uncounted, and the count was 0. The outputs of the runs by hand on snapshot 3 hold this report in 11 of 15, so it was there. Snapshot 4 was run again with all output kept (`status_san_4b`), which is where the counts above come from.
+- **One test fails in that build on histamine3**, `overlap:1worker`: 154 of 155. It is the timing test of M1, with the mock: the run has to be shorter than the job and the classical chain one after the other, 500 ms, and takes 500 to 512. The time is the sanitizer's: it prints the report above with its stack, on the only worker thread, before the job is submitted. Alone, 40 times each way: 34 failures with the stack printed, none without it (`UBSAN_OPTIONS=print_stacktrace=0`). On serotonin, snapshots 1 and 3, it had passed.
+- **Leaks**: 15 runs by hand (the two tests without the runtime, 12 runs of the runtime through the adapter of the tests, the client against Aer). No error. Leak records in one run, the DTD chain: 6, in DTD's tiles and in the task mempool, where section 9.4 found them for the same test with the mock. None has a frame in the component.
+- **The two readers, with texts that are wrong.** They read what comes from outside the process, so they were given 2,000,000 OpenQASM texts and as many JSON lines, each a valid one with one to four random edits, in buffers of exactly their size, under the address and undefined-behaviour sanitizers (`exp_qpu/checks/m4a/fuzz`). No report. Of the OpenQASM texts 89,826 were accepted: each is a well-formed circuit, and each is the same bytes after it is written and read again. The 1,898,459 that were refused each have a line and a reason.
+- **Threads**: the same 15 runs. No report is located in the component. The reports are the runtime's own, as in every milestone (`parsec.c:1820` and `:1831`, the LIFO, the generated start-up code); none has a frame in a file of M4a.
+
+### What an independent review found
+
+A reviewer that had the sources (snapshot 2) and none of the reasoning. It changed nothing and ran experiments of its own, which are kept in `exp_qpu/checks/m4a/review`. It found six defects and four tests that could not fail or missed their point. All ten are fixed, and the checks of this section were run again on the result (snapshot 3).
+
+| Finding | What was done | The test that now holds it |
+|---|---|---|
+| A job given up because the adapter was out of reach for too long was never cancelled at an adapter that came back. It ran on while the runtime ran the task again: twice, and on a device paid twice | Such a job is told to the adapter (`cancel`) when it answers again. Only the jobs of an adapter that was replaced are not, since nobody is left to tell | `runtime/qpu/adapter`: the adapter is stopped for longer than the time-out and continued. Afterwards it holds no job, and the end is not reported a second time |
+| An adapter that is started again numbers its jobs from the first again. Its first job took the place of a lost job that was not reported yet: one task never completed, and a result that was not taken yet could be taken from another job | The client names the jobs itself and never uses a name twice. The adapter's name is kept beside it, and is not looked at for a job whose adapter is gone; the result of such a job is an error, and the adapter is not asked | Two cases of the same test, with an adapter of the tests that numbers from the first again as a new process does |
+| `connect()` waited without limit on an adapter that accepts nothing and whose queue is full. No wake-up reaches there, and the end of the run would wait with it | The socket does not block: a full queue is an error at once | The same case: the stopped adapter has room for one connection to wait, and no wait of 100 ms may take 1.5 s |
+| The Qiskit adapter dropped a session in use: the thread of an old connection marked it as left after the client had connected again, and ten minutes later every job of that client was gone | A session counts its connections and is left when it has none | `adapter:aer:sessions`, added when the deliberate bugs showed that no test held it (above) |
+| The Qiskit adapter wrote to the pipe of a session after closing it; the number could be another file's by then | Written under the lock, and not after the session is closed | None |
+| The OpenQASM reader followed signs and parentheses one call each: 400,000 of them in an angle overran the stack | Signs are counted in a loop, and an angle may have 32 parentheses inside each other | `qasm`: 400,001 signs are read as one; 32 parentheses are read, 33 and 400,000 are refused |
+| `qpu_guard` checked that the client had submitted no job from counters that were gone with the client: it could not fail | Taken out, with a comment. The adapter of the tests does that check (`-N`) | |
+| The adapter of the tests kept its job numbers when it "forgot", and no test had an adapter come back: the first two defects could not show | It numbers from the first again; the cases above | |
+| In the test with a simulator of its own, the Pauli gates stood right before the measurement: "y read as x" and "z left out" changed no probability | The circuits have them in the middle, and a layer of rotations before the measurement. The test now checks its own circuits against 25 such mistakes: each has to move the outcomes of one of them by 0.15, and the smallest moves them by 0.32 | `adapter:stat:circuits`, in every build |
+| The third check of `no_hardware_in_tests` accepted three definitions the reviewer made up: another adapter program, `--backend aer2`, and a backend named on the line after `--backend` | It reads a file as one text, and checks which program a test starts, the whole name of the backend, and the device | `no_hardware_in_tests:itself` gives the script definitions that each break one rule (11 then, 12 now) and one that breaks none |
+
+- **Smaller points, changed.**
+  - The client logs nothing an adapter sent. It logged the reason of a refusal, which the Qiskit adapter fills with Qiskit's words, and those can quote a circuit.
+  - Numbers are written and read with a point whatever the locale of the process. This could not be tested: methane has no locale that writes a comma.
+  - The client talks only to an adapter that runs as the same user (`SO_PEERCRED`), and the README's example puts the socket in a directory of the user's own: the client connects again by itself to whatever listens at the path.
+  - The times of a result cannot lie in the future. A 64-bit value has to be hexadecimal digits and nothing else. The list of ends heard early grows, and an end is taken out when its job is abandoned.
+  - The Qiskit adapter removes only a socket at its path, and answers a request of an unexpected shape where it ended the connection.
+  - `qpu_adapter_stop()` refuses the process numbers 0 and -1.
+- **Left as it is.** A request to the adapter, the first `hello` and the cancellations after a new connection included, cannot be ended by a wake-up: a QPU's thread can sit in one for `device_qpu_adapter_timeout` when the adapter is there and silent. The README says so. The seed the Qiskit adapter gives Aer has 31 bits.
+- **What the fuzzing did not find**: the stack overrun. Its texts are valid ones with a few edits, which never nest that deep.
+- **Looked at and found sound**, in the reviewer's words: the line buffer of the client and its growth; that no request is sent while an answer is still read; the hardware guard in the client (hello first on every connection, a missing answer taken for a device, a changed answer ends everything before anything is sent); no access to the environment or to a file in the client; the JSON reader's bounds and depth; the OpenQASM lexer's bounds, the angle arithmetic and the round trip; that no wake-up is lost; that an early end is held back; the Qiskit adapter's fields against the README and the client; that the launcher reaps what it starts.
+
+### Departures from the plan
+
+1. **Inputs are declared `float[64]`, not `angle`** (sections 2.6 and 10.4 said `angle`). It is what Qiskit's own writer declares, and an angle times a real number, which the circuit format needs, is a product I did not find defined for the `angle` type of OpenQASM 3 (from memory of the specification; not checked against it in this pass). The reader takes both.
+2. **The adapter is `parsec_qpu_adapter_qiskit.py`**, not `parsec_qpu_adapter_ibm.py` (section 7.3): it holds what is common to Qiskit, and M4b adds IBM's service to it.
+3. **Reading OpenQASM 3 in the adapter needs a third package**, `qiskit-qasm3-import`: `qiskit.qasm3.loads` does not work without it, and Qiskit's other reader (`loads_experimental`) refuses a gate that the text defines.
+4. **The protocol** gained the session, the key and attempt of an entry, `wake`, `abandon` (whose answer names the job it dropped), and the repetition of ends after a new connection (above). **A job has two names**: the adapter's, and one of the client's own that the service sees (the review, below). `prepare` names a circuit by a digest of its bytes; the client keeps a second digest and refuses a job whose circuit shares a name with another.
+5. **A Unix-domain socket only.** Section 2.6's TCP mode with a token is for an adapter on a login node that reaches a provider, which is M4b's.
+6. **The test of the client is `runtime/qpu/adapter`** and the adapter of the tests is a program of its own (section 4.2 named one test, `adapter_loopback`, that would do both).
+7. **A result of a simulator behind an adapter carries the flag `PARSEC_QPU_RESULT_MOCK`**, whose comment said "from the mock backend". The flag keeps simulated results apart from a device's, which is what section 2.5 wanted it for.
+8. **The shared checks of the tests** know the adapter: a run with it is compared with the client's counters where a run with the mock is compared with the mock's, and a test whose adapter loses jobs on purpose says so (`QPU_TEST_ADAPTER_UNSTEADY`).
+9. **Not built:** IBM hardware (M4b); the TCP mode; reading QPY; a reader for circuits with more than one register; an adapter that prepares circuits in the background (`prepare` holds the progress thread for the time of a transpilation).
+
+### For later milestones
+
+- **M4b** adds a backend to the adapter program, and nothing to PaRSEC: the client, the protocol and the guard are there. What it has to settle: the provider's job tags against the session and tag of the protocol; cancelling at the provider what the client gave up on while the adapter could not be reached; the rate limit, for which `device_qpu_submit_interval` exists; and the flag without which the adapter does not start.
+- **A circuit is prepared in the call that submits it**, so a job waits for the transpilation of its circuit. With a device model, a QAOA circuit of 16 qubits takes Qiskit some tens of milliseconds. Making it a task of its own is what section 3.4 foresaw.
+- **M10** can use the OpenQASM 3 writer as its test of what it lowers, and the reader for circuits an application brings.
+
 ---
 
 # 10. Design revision: several QPUs, NVQLink, Qiskit (2026-11-26)
