@@ -151,6 +151,7 @@ static int run_one(parsec_context_t *parsec, int rank, int world, const qaoa_ins
     parsec_qpu_device_info_t info;
     parsec_qpu_stats_t before, after;
     parsec_qpu_mock_stats_t mock_before, mock_after;
+    parsec_qpu_adapter_stats_t adapter_before, adapter_after;
     parsec_taskpool_t *tp;
     qaoa_sizes_t sizes;
     qaoa_run_t ref;
@@ -245,6 +246,7 @@ static int run_one(parsec_context_t *parsec, int rank, int world, const qaoa_ins
 
     parsec_qpu_service_stats(&before);
     parsec_qpu_mock_stats(&mock_before);
+    parsec_qpu_adapter_stats(&adapter_before);
     if( FAIL_KEYS == fail_mode ) parsec_qpu_mock_set_fault_fn(fault_by_key, NULL);
     joins_before = qaoa_taskpool_joins();
 
@@ -286,6 +288,7 @@ static int run_one(parsec_context_t *parsec, int rank, int world, const qaoa_ins
     if( FAIL_KEYS == fail_mode ) parsec_qpu_mock_set_fault_fn(NULL, NULL);
     parsec_qpu_service_stats(&after);
     parsec_qpu_mock_stats(&mock_after);
+    parsec_qpu_adapter_stats(&adapter_after);
 
     /* ---- the order, on every rank: each task that read a state read it
      * after the number of updates its dependencies say ---- */
@@ -428,8 +431,9 @@ static int run_one(parsec_context_t *parsec, int rank, int world, const qaoa_ins
         mine[6]  = (int64_t)(after.tasks_coalesced - before.tasks_coalesced);
         mine[7]  = (int64_t)(after.tasks_submitted - before.tasks_submitted);
         mine[8]  = (int64_t)(after.jobs_failed - before.jobs_failed);
-        mine[9]  = (int64_t)(mock_after.submits - mock_before.submits);
-        mine[10] = (int64_t)(mock_after.circuits - mock_before.circuits);
+        /* What the backends say they took: the mocks, and the clients of adapters. */
+        mine[9]  = (int64_t)(mock_after.submits - mock_before.submits) + (int64_t)(adapter_after.submits - adapter_before.submits);
+        mine[10] = (int64_t)(mock_after.circuits - mock_before.circuits) + (int64_t)(adapter_after.circuits - adapter_before.circuits);
     }
     memcpy(sum, mine, sizeof(sum));
     if( PARSEC_SUCCESS != parsec_tests_allreduce(parsec, mine, sum, 11, parsec_datatype_int64_t, PARSEC_TESTS_REDUCE_SUM) ) {
@@ -526,7 +530,7 @@ static int run_one(parsec_context_t *parsec, int rank, int world, const qaoa_ins
         EXPECT(0 == after.backend_open, "a backend is open on a rank that owns no QPU");
         EXPECT(0 == after.tasks_submitted, "%llu quantum tasks were taken on a rank that owns no QPU",
                (unsigned long long)after.tasks_submitted);
-        EXPECT(0 == mock_after.opens, "a backend was opened on a rank that owns no QPU");
+        EXPECT((0 == mock_after.opens) && (0 == adapter_after.opens), "a backend was opened on a rank that owns no QPU");
     }
 
     free(qpus);

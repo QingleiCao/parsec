@@ -129,4 +129,36 @@ if(PARSEC_HAVE_QPU)
     qaoa_addtest(apps/qaoa:coalesce:fail:mp ${MPI_TEST_CMD_LIST} 3 apps/qaoa/testing_qaoa -C -F keys
                  ${_qaoa_one} --mca device_qpu_owner_rank -1)
   endif( MPI_C_FOUND )
+  # The same application with the adapter backend: its circuits cross a socket
+  # as OpenQASM 3 to the adapter of the tests (tests/runtime/qpu), which answers
+  # from the sampler. The final states are the reference's bit for bit only if
+  # every circuit was read back as it was written.
+  qaoa_addtest(apps/qaoa:adapter ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_adapter_run -s apps/qaoa/a_qaoa.sock
+               runtime/qpu/qpu_adapter_loopback -s apps/qaoa/a_qaoa.sock
+               -- apps/qaoa/testing_qaoa -- --mca device_qpu_enabled 1 --mca device_qpu_backend adapter
+               --mca device_qpu_adapter_address apps/qaoa/a_qaoa.sock)
+  # Tasks that share jobs.
+  qaoa_addtest(apps/qaoa:adapter:shared ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_adapter_run -s apps/qaoa/a_shared.sock
+               runtime/qpu/qpu_adapter_loopback -s apps/qaoa/a_shared.sock
+               -- apps/qaoa/testing_qaoa -- --mca device_qpu_enabled 1 --mca device_qpu_backend adapter
+               --mca device_qpu_adapter_address apps/qaoa/a_shared.sock
+               --mca device_qpu_max_outstanding 2 --mca device_qpu_max_batch 8)
+  if( MPI_C_FOUND )
+    qaoa_addtest(apps/qaoa:adapter:mp ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_adapter_run -s apps/qaoa/a_mp.sock
+                 runtime/qpu/qpu_adapter_loopback -s apps/qaoa/a_mp.sock
+                 -- ${MPI_TEST_CMD_LIST} 4 apps/qaoa/testing_qaoa -- --mca device_qpu_enabled 1 --mca device_qpu_backend adapter
+                 --mca device_qpu_adapter_address apps/qaoa/a_mp.sock)
+  endif( MPI_C_FOUND )
+  # Optional (tests/runtime/qpu/Testings.cmake says when): the application on
+  # Qiskit Aer through the adapter of tools/qpu. A simulator of its own does
+  # not give the counts of the sampler, so nothing is compared with the
+  # reference (-c 0): every circuit of the application is taken and run by
+  # Qiskit, and every evaluation comes back.
+  if(PARSEC_QPU_HAVE_AER_ADAPTER)
+    qaoa_addtest(apps/qaoa:adapter:aer ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_adapter_run -w 180 -s apps/qaoa/a_aer.sock
+                 "${_qpu_python}" ${PROJECT_SOURCE_DIR}/tools/qpu/parsec_qpu_adapter_qiskit.py --socket apps/qaoa/a_aer.sock --backend aer
+                 -- apps/qaoa/testing_qaoa -c 0 -- --mca device_qpu_enabled 1 --mca device_qpu_backend adapter
+                 --mca device_qpu_adapter_address apps/qaoa/a_aer.sock)
+    set_tests_properties(apps/qaoa:adapter:aer PROPERTIES TIMEOUT 600)
+  endif()
 endif(PARSEC_HAVE_QPU)
