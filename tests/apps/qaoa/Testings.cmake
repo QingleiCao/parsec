@@ -161,4 +161,22 @@ if(PARSEC_HAVE_QPU)
                  --mca device_qpu_adapter_address apps/qaoa/a_aer.sock)
     set_tests_properties(apps/qaoa:adapter:aer PROPERTIES TIMEOUT 600)
   endif()
+  # Optional as well: the application on the CPU simulator of CUDA-Q, through
+  # the other adapter of tools/qpu, on one QPU; and on two, each an adapter of
+  # its own. There every task names its QPU (-Q), in turn, and a task that
+  # names a QPU runs on no other: a run that ends had its jobs on both.
+  # Nothing is compared with the reference here either.
+  if(PARSEC_QPU_HAVE_CUDAQ_ADAPTER)
+    qaoa_addtest(apps/qaoa:adapter:cudaq ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_adapter_run -w 180 -s apps/qaoa/a_cudaq.sock
+                 "${_qpu_cudaq_python}" ${PROJECT_SOURCE_DIR}/tools/qpu/parsec_qpu_adapter_cudaq.py --socket apps/qaoa/a_cudaq.sock --target qpp-cpu
+                 -- apps/qaoa/testing_qaoa -c 0 -- --mca device_qpu_enabled 1 --mca device_qpu_backend adapter
+                 --mca device_qpu_adapter_address apps/qaoa/a_cudaq.sock)
+    qaoa_addtest(apps/qaoa:adapter:cudaq:two ${SHM_TEST_CMD_LIST} runtime/qpu/qpu_adapter_run -w 180 -s apps/qaoa/a_cudaq0.sock
+                 "${_qpu_cudaq_python}" ${PROJECT_SOURCE_DIR}/tools/qpu/parsec_qpu_adapter_cudaq.py --socket apps/qaoa/a_cudaq0.sock --target qpp-cpu
+                 -- runtime/qpu/qpu_adapter_run -w 180 -s apps/qaoa/a_cudaq1.sock
+                 "${_qpu_cudaq_python}" ${PROJECT_SOURCE_DIR}/tools/qpu/parsec_qpu_adapter_cudaq.py --socket apps/qaoa/a_cudaq1.sock --target qpp-cpu
+                 -- apps/qaoa/testing_qaoa -Q -c 0 -- --mca device_qpu_enabled 1
+                 --mca device_qpu_devices "adapter address=apps/qaoa/a_cudaq0.sock|adapter address=apps/qaoa/a_cudaq1.sock")
+    set_tests_properties(apps/qaoa:adapter:cudaq apps/qaoa:adapter:cudaq:two PROPERTIES TIMEOUT 600)
+  endif()
 endif(PARSEC_HAVE_QPU)
