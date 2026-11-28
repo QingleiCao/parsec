@@ -3318,7 +3318,7 @@ Every job built from a fixed copy of the working tree. The numbers are those of 
 - **On methane**, the whole suite before the review: 363 of 364. `overlap:1worker` failed, the timing test of M1, which uses the mock only; other sessions had the machine at a load of 16, and the test passed 5 times of 5 alone.
 - **Since snapshot 4** only this section and a paragraph of `tools/qpu/README.md` (on `--idle-drop`) were written: nothing that is built, or that a test reads.
 - **The commits one by one.** M4a is five commits: the component, the adapter program with the README, the tests of the runtime, those of the application, and this section. The states after the first and after the third were built and run through the QPU and QAOA tests on methane (Debug), and the state after the fourth is snapshot 4 with the paragraph of the README. After the first: 175 of 175, the tests as they were before M4a. After the third: 196 of 197. The one that failed is `termination:dynamic:mp:2`, with the assertion of the dynamic termination detector that section 9.8 found on four ranks (`termdet_fourcounter_module.c:596`). Repeated on that build it failed again at the 79th run, with other sessions on the machine; it is the same program in snapshot 4, where it passed each of the 9 times it ran.
-- **Not run:** a CUDA build (M4a has no GPU code, and the tests of M4a were not built with CUDA); more than one node; a locale that writes numbers with a comma; any Qiskit but 2.6.2 with Aer 0.18.4 and Python 3.12; and no provider, since the adapter has none.
+- **Not run, when M4a was committed:** a CUDA build (M4a has no GPU code, and the tests of M4a were not built with CUDA); more than one node; a locale that writes numbers with a comma; any Qiskit but 2.6.2 with Aer 0.18.4 and Python 3.12; and no provider, since the adapter has none. The CUDA build and two nodes were run the night after: "The checks that were left, what a job costs through the adapter, and three installs" below.
 
 ### The tests
 
@@ -3358,7 +3358,7 @@ Every job built from a fixed copy of the working tree. The numbers are those of 
 - **The tests allow 0.08**, and 0.2 with noise. For scale: 4,000 shots drawn exactly from 32 equally likely outcomes are about 0.036 from them, so the first two columns are what sampling alone gives. And a reader that took one operation for another would move the outcomes of one of the three circuits by 0.32 at least (`adapter:stat:circuits`).
 - **Transpiled to the gates and the line of the device model**, without noise, the distances are the same to four digits as on the ideal simulator.
 - **The circuits with one outcome** give it in 400 shots of 400 on the first two, and have to give it in 300 of 400 with noise.
-- **The application on Aer**: `ring64` with 192 jobs takes its cut from 63.1 to 103.6, in 5.5 s. The run of 96 jobs with two layers takes 5.6 s on Aer and 0.05 s with the adapter of the tests. Where the time on Aer goes (reading, transpiling, simulating) was not measured, nor how many of the jobs are different circuits.
+- **The application on Aer**: `ring64` with 192 jobs takes its cut from 63.1 to 103.6, in 5.5 s. The run of 96 jobs with two layers takes 5.6 s on Aer and 0.05 s with the adapter of the tests. Where the time on Aer goes (reading, transpiling, simulating) was not measured, nor how many of the jobs are different circuits. Both were measured the night after the commits: E11, below.
 
 ### Does a test notice
 
@@ -3436,6 +3436,146 @@ A reviewer that had the sources (snapshot 2) and none of the reasoning. It chang
 - **What the fuzzing did not find**: the stack overrun. Its texts are valid ones with a few edits, which never nest that deep.
 - **Looked at and found sound**, in the reviewer's words: the line buffer of the client and its growth; that no request is sent while an answer is still read; the hardware guard in the client (hello first on every connection, a missing answer taken for a device, a changed answer ends everything before anything is sent); no access to the environment or to a file in the client; the JSON reader's bounds and depth; the OpenQASM lexer's bounds, the angle arithmetic and the round trip; that no wake-up is lost; that an early end is held back; the Qiskit adapter's fields against the README and the client; that the launcher reaps what it starts.
 
+### The checks that were left, what a job costs through the adapter, and three installs (2026-11-28)
+
+Run in the night after M4a was committed, with simulators only: the mock, the adapter of the tests, and Qiskit Aer. No provider was contacted. Every job built from `git archive` of the committed head, `e61386550`. No source file changed: this subsection, with the pointers to it elsewhere in this document, is the only edit. The scripts, status files and logs are with the harness, in `exp_qpu/checks/m4a_night/`, and `REPORT.md` there is the account of the night.
+
+**With CUDA.** leconte, three V100 that read each other directly (devices 4, 5 and 6; Slurm job 68282, beside another user's job, on its own CPUs and GPUs). Debug with `PARSEC_DEBUG_PARANOID`, MPI and CUDA, the tests with Qiskit Aer registered, one GPU per rank.
+
+- **The suite, 461 tests: GPU tests 69 of 69, every other test 392 of 392**, none skipped. No compiler warning in the component or its tests.
+- **The 27 tests of the adapter, of OpenQASM 3 and of the guard script, five times each:** all pass.
+- **By hand, with a CUDA device up in the same context** (ctest gives a test that is not a GPU test `device_cuda_enabled=0`):
+  - `cpu_gpu_qpu -g`, the quantum task between two accelerator tasks, with its job through the adapter backend: passes, 16 tasks in 16 jobs. With an adapter between two mocks: passes, and the three QPUs ran 7, 1 and 8 tasks.
+  - The application through the adapter of the tests, on 1 and on 3 ranks with a GPU each: final states equal to the reference, 256 jobs.
+  - The application on Qiskit Aer, on 1 and on 3 ranks: it runs (2,046 tasks in 1,634 jobs; nothing is compared).
+- No adapter process was left.
+
+**Two nodes.** histamine3 and caffeine (AMD and Intel, Ethernet), a Debug build in the shared home, the ranks of every test on the two nodes in turn, and Open MPI over TCP as in section 9.8 (Slurm job 68285).
+
+- **The QPU and QAOA tests: 200 of 201.** The one that fails has to fail there: `adapter:chain:mp:last`. A test's adapter is started on the node ctest runs on; this test has its QPU on the last rank, which is on the other node; and a Unix-domain socket is reached from its own node only. The rank says "the adapter at runtime/qpu/a_mplast.sock is out of reach (nothing listens there)", its QPU does not open, and the quantum tasks fail. This is the rule the README gives: the adapter runs on the node of the rank that owns the QPU.
+- **The 39 other tests that go through `mpiexec`, 10 times each:** all pass.
+- **By hand, the adapter on the node of the rank that owns the QPU** (Slurm job 68290, which kept the exit code of every adapter: 0 says it saw nothing wrong in what its client sent):
+
+  | Run, 4 ranks | Result | The adapters |
+  |---|---|---|
+  | The chain test, the QPU on the last rank, which is on the other node, and the adapter of the tests there | Passes: 72 tasks in 72 jobs | 0 |
+  | The application, a QPU on rank 0 and one on rank 1, each with an adapter of the tests on its own node | Final states equal to the reference; 1,116 tasks in 900 jobs on one QPU, 930 in 734 on the other | 0 and 0 |
+  | The application on Qiskit Aer, the Qiskit adapter on the other node, the QPU on rank 1 | Runs: 2,046 tasks in 1,634 jobs | 0 |
+
+- **The sockets were files in the shared home** (NFS). Binding and connecting work there. From the other node such a socket is seen as a file, and cannot be connected to.
+- Not run: the 167 other tests (M4a changes nothing outside the component, and section 9.8 has them on two nodes), and Open MPI's UCX path, which fails on these nodes at the base commit.
+
+**The experiments.** serotonin (AMD Ryzen 9 7950X, 16 cores), exclusive allocations (Slurm jobs 68289, 68292 and 68293); a Release build. 822 runs, none failed. Tables are in `exp_qpu/tables/` (`e10`, `e10b`, `e11`, `e12`, `e12b`), from `exp_qpu/analysis/analyze_adapter.py`.
+
+**E10: what a job costs through the adapter backend.** The chains of `qpu_bench` with no classical work, as in E1. C is the mock backend in the process; A is the adapter backend with the adapter of the tests, so every job crosses a Unix-domain socket twice and its circuit is read as OpenQASM 3; both answer from the same sampler. 12 runs per setting in rotating order, 456 runs, none failed. Microseconds per link, medians; the difference is taken per repetition.
+
+| Workers | One chain: C | A | A - C | 64 chains: C | A | A - C |
+|---|---|---|---|---|---|---|
+| 1 | 57.9 | 60.7 | 2.8 | 2.9 | 27.7 | 24.8 |
+| 2 | 39.5 | 63.9 | 24.8 | 4.6 | 29.4 | 25.0 |
+| 4 | 30.4 | 63.1 | 32.6 | 3.6 | 28.5 | 24.9 |
+| 8 | 24.1 | 61.7 | 37.5 | 2.6 | 27.6 | 25.0 |
+| 14 | 21.2 | 62.3 | 41.1 | 2.5 | 28.5 | 25.9 |
+
+- **A job through the adapter takes 61 to 64 us on a chain of its own, whatever the number of workers,** where the mock takes 21 to 58. In throughput it costs 25 us more than a job of the mock (28 against 3), with every number of workers: about 35,000 jobs a second through one adapter.
+- **A result of 1,000 shots** (4 workers): 52 us more than the mock on one chain, and 31 with 64 chains.
+- **A job that takes 2 ms** (4 workers, one chain): the link takes 97 us more than the job with the mock, and 167 us with the adapter. With 64 chains the adapter costs 13 us more per task.
+- **What it says.** The protocol, the JSON and the socket cost tens of microseconds per job. That is 6 to 11 times the mock's cost of a job, and nothing beside a job of milliseconds or seconds.
+- Not measured: several QPUs on one adapter, and jobs that carry several circuits.
+
+**E10b: the Qiskit adapter beyond its simulation.** `qpu_bench` through the adapter of `tools/qpu` (the ideal simulator, 100 shots, 4 workers), with the timers of E11 below; 6 runs each. On one chain a link takes 2.94 ms. Of that, 0.55 ms are the job in its thread (0.41 ms of them the simulation), and 2.23 ms are the reading and transpiling of the 9 circuits of the run, spread over its 300 jobs. What is left, 0.16 ms a job, is the protocol, the adapter's own Python, the client and the runtime, against 0.06 to 0.11 ms for a whole link with the adapter of the tests (1 and 1,000 shots). With 64 chains a task takes 1.14 ms; the sums of the two job threads overlap there, and the same split cannot be made.
+
+**E11: where the time goes when the jobs run on Qiskit Aer.** The application on `ring64` (8 blocks of 8 qubits, 256 shots) without the reference, through the adapter of `tools/qpu` with its defaults, started through `exp_qpu/aer_timed_adapter.py`, which loads the adapter's module from the source tree and puts timers around four of its calls. Three runs each, 30 runs, none failed. Milliseconds, medians; the columns after "the run" are sums over the calls inside the adapter.
+
+| Simulator | Layers | Jobs | The run | Reading the text (`qasm3.loads`) | Transpiling | Simulating | Per circuit: reading | transpiling | Per job: simulating |
+|---|---|---|---|---|---|---|---|---|---|
+| Ideal | 1 | 128 | 1,456 | 888 | 398 | 264 | 74 | 36 | 2.1 |
+| Ideal | 1 | 512 | 1,990 | 899 | 399 | 898 | 75 | 36 | 1.8 |
+| Ideal | 2 | 128 | 2,107 | 1,501 | 397 | 326 | 131 | 36 | 2.5 |
+| Ideal | 2 | 512 | 2,808 | 1,538 | 407 | 1,134 | 133 | 37 | 2.2 |
+| Device model `generic:8:line`, without its noise | 1 | 128 | 1,250 | 880 | 159 | 384 | 74 | 14 | 3.0 |
+| | 1 | 512 | 1,871 | 889 | 144 | 1,162 | 74 | 13 | 2.3 |
+| | 2 | 128 | 1,980 | 1,542 | 148 | 496 | 134 | 13 | 3.9 |
+| | 2 | 512 | 2,799 | 1,506 | 146 | 1,758 | 130 | 13 | 3.4 |
+| With its noise | 1 | 128 | 11,371 | 1,327 | 35 | 17,646 | 119 | 3 | 138 |
+| | 2 | 128 | 19,772 | 2,198 | 39 | 30,530 | 200 | 4 | 239 |
+
+- **The application has 11 different circuits**, with 128 jobs and with 512: its circuits take their angles as parameters, so each is read and transpiled once.
+- **On the ideal simulator most of a short run is the reading of those 11 texts.** `qiskit.qasm3.loads` takes 74 ms for a circuit of one layer (8 qubits, 12 two-qubit gates) and 131 ms for one of two layers; the first call takes 140 to 200 ms. Reading and transpiling are 1.3 s of the 1.5 s of a run of 128 jobs. A simulation takes 2 ms.
+- **With noise the run is simulation**: 138 ms per job with one layer and 239 ms with two, where the transpiled circuits have 53 and 111 two-qubit gates on the line. The sums of that row are above the time of the run because the two job threads take turns (next paragraph): a call of one waits while the other computes, and both count the time.
+- **The 5.5 s** that "Measured with Aer" gives for 192 jobs were measured on methane, a machine in use. Where the time of such a run goes is now measured for 128 and 512 jobs: above.
+
+**Two simulations do not run at once in one adapter.** `exp_qpu/aer_gil_check.py`, on the same node: two simulations one after the other, the same two in two threads, and a thread that only counts while one simulation runs. Aer has one thread per simulation, as the adapter gives it.
+
+| Circuit | One after the other | In two threads | The counting thread, of its rate alone |
+|---|---|---|---|
+| 8 qubits, ideal, 200,000 shots | 0.322 s | 0.319 s | 8% |
+| 16 qubits, ideal, 200,000 shots | 0.528 s | 0.529 s | 4% |
+| 8 qubits, noise, 256 shots | 0.199 s | 0.201 s | 19% |
+| 10 qubits, noise, 256 shots | 0.829 s | 0.852 s | 4% |
+| 10 qubits, noise, density matrix | 1.489 s | 1.482 s | 3% |
+
+- **Two threads take as long as one**, and a thread of Python hardly runs meanwhile. So Aer 0.18.4 keeps the interpreter's lock while it simulates (concluded from these times; its source was not read).
+- **What that means for the adapter of `tools/qpu`.** `--workers`, 2 by default, does not make two jobs run at the same time. And the thread that answers a client waits behind a simulation: with jobs of 138 ms, the reading of a circuit took 119 ms where it takes 74. Nothing is wrong in what it answers. An adapter that is to simulate several jobs at once needs a process per job, or Aer's own batch of circuits.
+- **A noisy evaluation gets slow fast.** On methane, a machine in use, one of 256 shots took 0.3 s at 8 qubits, 1.3 s at 10 and 7.3 s at 12 with the method Aer picks. With `--method density_matrix` it took 0.1 s at 8 qubits, and a run of 32 jobs at 12 qubits did not end in 500 s. This is why E12 stops at 10 qubits.
+
+**E12: the application with its jobs on a noisy device model.** The same optimisation, with the same instance and the same seed of the initial assignment and of the optimiser, on four samplers:
+
+- `mock`: the exact sampler of the component, in the process;
+- `aer`: Qiskit Aer through the adapter, the ideal simulator;
+- `aer-map`: Aer as the device model `generic:N:line` without its noise, so that the circuits are transpiled to its gates and to a line;
+- `aer-noise`: the same with its noise. The error rates are made up: it is not the model of a device.
+
+`ring64` (8 blocks of 8 vertices) with one and two layers, 5 seeds; 8 blocks of 10 vertices with one layer, 3 seeds. T 8, R 4: 512 jobs of 256 shots. 52 runs.
+
+- **The cut after is the same on the four, in all 13 settings**, and so is the number of updates accepted.
+- **Why.** An update of a block takes the best assignment that any of its jobs measured, when it is better than the one the block has. An update has 16 jobs of 256 shots: 4,096 measured assignments of a block that has 256 of them, or 1,024. The best one is among them whatever state they are drawn from. So the cut after cannot tell a noisy sampler from an exact one at these sizes, and it does not tell one layer from two either.
+- **E12b: the same with few shots a job** (`ring64` with 8 seeds, the instance of 10 vertices with 5; one and two layers; 272 runs). Settings in which a system ends in the cut that `aer` ends in:
+
+  | Shots a job | Settings | `mock` | `aer-map` | `aer-noise` |
+  |---|---|---|---|---|
+  | 4 (`ring64` only) | 16 | 10 | 16 | 9 |
+  | 16 | 26 | 25 | 26 | 25 |
+  | 64 | 26 | 26 | 26 | 26 |
+
+  - **With 4 shots a job the runs differ, and noise changes the outcome about as often as another exact sampler does**: 7 settings of 16 against 6. The cut after is then -2.00 to +1.75 from that of `aer` with noise, and -0.38 to +1.75 with the mock, at cuts of about 104.
+  - **`aer-map` ends in the cut of `aer` every time.** That is what the same seed and the same outcome probabilities would give; it was not looked into further.
+- **What E12 shows.** The path works end to end with a device model: 512 jobs written by the component, read and transpiled to a line by Qiskit, simulated with noise, and the application ends where it ends without noise.
+- **What it does not show: what noise does to QAOA.** The result of this application is decided by its accept rule, not by the quality of the states. A measure that would see the noise is the estimate each evaluation gives the optimiser (`mean` of `qaoa_eval_t`), which the application computes and writes nowhere.
+- **The time of a run** of 512 jobs of 256 shots: 0.3 s on the mock; 2 to 3 s on Aer without noise; with noise 43 s and 74 s on 8 qubits (one and two layers), and 183 s on 10 qubits.
+
+**Three installs: can M10 and M11 start?** Section 10.6 has them wait for an installation. A separate pass tried the three pieces of software on methane, in a directory outside the repository (`/home/qcao3/qpu_m10_m11_probe`, 7.8 GB), with no account and no provider. Its report, with what was run and what was only read, is `exp_qpu/checks/m4a_night/probe_m10_m11.md`; the main points were run again afterwards.
+
+| | What was run | What it found |
+|---|---|---|
+| **CUDA-Q** 0.17.0, from PyPI (`pip install cudaq`, 1.8 GB) | A circuit built gate by gate at run time, with angles that are a number or a number times a parameter, sampled on the CPU and on an A100; the same from C through a C++ wrapper, with no Python in the process; asynchronous sampling on a QPU chosen by number | It works. The builder has no rxx, ryy or rzz: they are written with the three definitions of this section. A result string has qubit 0 on the left. The seed is set for the process (`cudaq.set_random_seed`); `sample` and `sample_async` take none of their own |
+| CUDA-Q, several QPUs | `nvidia` with `mqpu` on two A100 of guyot (Slurm job 68291) | Two QPUs, one per GPU; both sample, and give the same counts for the same seed |
+| CUDA-Q on leconte | The same on two V100 (Slurm job 68288), with the CUDA 13 and the CUDA 12 packages | It fails: `[custatevec] architecture mismatch`. The install guide asks for compute capability 7.5; a V100 has 7.0 |
+| **Qiskit C API** 2.6.2, built from source (`make c`, 6 minutes, Rust 1.89) | A C program: a circuit with a symbolic parameter, a target of `cx, id, rz, sx, x` on a line built in C, `qk_transpile`, `qk_qpy_dump_file`; the file loaded by Python Qiskit 2.6.2 | It works, and the parameter survives the transpilation. No function of the C API gives a parameter its value, and none reads or writes OpenQASM. `libqiskit.so` needs a `libpython` to load (3.12 here), and starts no interpreter |
+| **QRMI** 0.28.1, built from source (2.5 minutes) | The header (47 functions); its C examples for IBM compiled, not run; a 2-qubit job through the C API on the kind `MAESTRO_LOCAL`, a simulator daemon on a Unix-domain socket | It works without an account, with two more programs from the daemon's vendor (GPL-3.0). A task's status is read without waiting |
+
+What it means for the milestones, as far as the facts go:
+
+- **M11 does not wait for an installation any more**, on a machine with an A100 or on CPUs. Its table can be written. Three facts will shape it:
+  - **The result of `sample_async` has one call, `get()`, which blocks.** There is no test for "ready", no time-out and no wait on several. A backend's `wait` then needs a thread per job in flight.
+  - **CUDA-Q is C++.** The wheel has headers and libraries and no C interface, so the backend is a C++ file, or a second adapter program in Python.
+  - **A job has no seed of its own**, where the mock and the Qiskit adapter draw from the key of an evaluation. Whether CUDA-Q's counts can be made to depend on the key alone, with jobs on several QPUs at once, was not tried.
+- **M10.**
+  - **The first of section 10.4's two open points is answered by reading**: QRMI's own Python client puts the circuit into the input of the Sampler as OpenQASM 3 text (`python/qrmi/primitives/base_sampler.py`), and QPY occurs nowhere in its repository. Whether the service takes QPY there was not determined. The component writes OpenQASM 3 since M4a.
+  - **The C API cannot give a parameter its value, and may not have to.** In the input QRMI's client writes, an entry holds the circuit, an array of parameter values, and the shots: the values travel beside a circuit that stays symbolic.
+  - **There is a way to run a QRMI job end to end without an account** (`MAESTRO_LOCAL`), at the price of a daemon and two GPL-3.0 programs on the test machine.
+  - Still open: the second point of section 10.4 (the input of the program that replaces the server-side Sampler), and everything that needs a service.
+- **M4b is as it was**: it waits for an account.
+
+**What this night does not show.**
+
+- A quantum device, a provider, or QRMI against a service.
+- More than two nodes, and a network faster than Ethernet.
+- The cost of the Qiskit adapter's own protocol work under load: E10 is the adapter of the tests.
+- The noise of an existing device: the device model's error rates are made up.
+- Any Qiskit but 2.6.2 with Aer 0.18.4, and any CUDA-Q but 0.17.0.
+- CUDA-Q's GPU simulators on leconte, which they do not support.
+
 ### Departures from the plan
 
 1. **Inputs are declared `float[64]`, not `angle`** (sections 2.6 and 10.4 said `angle`). It is what Qiskit's own writer declares, and an angle times a real number, which the circuit format needs, is a product I did not find defined for the `angle` type of OpenQASM 3 (from memory of the specification; not checked against it in this pass). The reader takes both.
@@ -3451,7 +3591,7 @@ A reviewer that had the sources (snapshot 2) and none of the reasoning. It chang
 ### For later milestones
 
 - **M4b** adds a backend to the adapter program, and nothing to PaRSEC: the client, the protocol and the guard are there. What it has to settle: the provider's job tags against the session and tag of the protocol; cancelling at the provider what the client gave up on while the adapter could not be reached; the rate limit, for which `device_qpu_submit_interval` exists; and the flag without which the adapter does not start.
-- **A circuit is prepared in the call that submits it**, so a job waits for the transpilation of its circuit. With a device model, a QAOA circuit of 16 qubits takes Qiskit some tens of milliseconds. Making it a task of its own is what section 3.4 foresaw.
+- **A circuit is prepared in the call that submits it**, so a job waits for the transpilation of its circuit. With a device model, a QAOA circuit of 16 qubits takes Qiskit some tens of milliseconds. Measured since, for 8 qubits (E11): reading the text takes 74 to 131 ms, and transpiling 13 to 37 ms. Making it a task of its own is what section 3.4 foresaw.
 - **M10** can use the OpenQASM 3 writer as its test of what it lowers, and the reader for circuits an application brings.
 
 ---
@@ -3704,7 +3844,7 @@ The pool is per rank, because a task runs on the rank its affinity gives it.
    - **One payload kind per vendor.** A task's payload is of one of six kinds (`QiskitPrimitive`, `PasqalCloud`, `AliceBobFelis`, `IQMServer`, `Oqtopus`, `MaestroLocal`). The Qiskit kind holds the input of a primitive, as text, and a program id. This design covers that kind only.
    - **QRMI backs IBM's Slurm plugin**, where a job asks for quantum resources with `--qpu=<names>`, a comma-separated list [Q5]. That fits section 10.3: each name becomes an entry `qrmi@<rank> resource=<name>`. The launch script writes the list from the names, so that every rank numbers the QPUs the same way.
    - **Not verified:**
-     - how the QPY bytes go into the text input of a primitive;
+     - how the QPY bytes go into the text input of a primitive (read since, on 2026-11-28: QRMI's own client puts OpenQASM 3 text there, and no QPY; section 9.9, "Three installs");
      - the input of the program that replaces the server-side Sampler (section 2.6, source 9).
 4. **Circuits written in Qiskit.** An application builds its circuits in Python and gives PaRSEC an OpenQASM 3 file. This needs a reader for the subset of OpenQASM 3 that the native format holds: the thirteen operations of section 9.2, with parameters as `input angle`. The reader is small and in C, with no dependency. A build with the Qiskit C library (M10) can read QPY files as well.
 
@@ -3759,11 +3899,11 @@ M4a and M4b as in section 10.4. M4's files, risks and tests stay as section 7.3 
 
 ### M11: a CUDA-Q backend
 
-Assumption A4 as a backend, for NVQLink-coupled QPUs and for CUDA-Q's simulated multi-QPU platform. It needs a CUDA-Q installation, and nothing here has one. Its milestone table is to be written when an installation exists.
+Assumption A4 as a backend, for NVQLink-coupled QPUs and for CUDA-Q's simulated multi-QPU platform. It needs a CUDA-Q installation, and nothing here has one. Its milestone table is to be written when an installation exists. Since 2026-11-28 one exists, outside the repository: section 9.9, "Three installs".
 
 ## 10.6 What this means for the plan
 
-- **Order.** M9 comes first: it needs nothing from outside, and the three backends are worth more with it. Then M4a. M10, M4b and M11 each wait for something from outside: access to hardware, or an installation.
+- **Order.** M9 comes first: it needs nothing from outside, and the three backends are worth more with it. Then M4a. M10, M4b and M11 each wait for something from outside: access to hardware, or an installation. (The three installations were tried on 2026-11-28, and work: section 9.9, "Three installs". M4b still waits for an account, and M10's acceptance for a provider.)
 - **Experiments that M9 makes possible.** All three were run on 2026-11-27 with mock QPUs (section 9.8, "The checks that were left, and the experiments on several QPUs").
   - E5 with several QPUs: tasks that share jobs across QPUs.
   - E6 with QPUs on several ranks.
