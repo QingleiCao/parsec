@@ -241,6 +241,7 @@ parsec_dtd_ordering_correctly( parsec_execution_stream_t *es,
 
             int get_out = 0, tmp_desc_flow_index, release_parent = 0;
             parsec_dtd_task_t *nextinline = current_desc;
+            int message_reader = 0;  /* a reader counted for the message, until it counts itself */
 
             do {
                 tmp_desc_flow_index = desc_flow_index;
@@ -253,6 +254,18 @@ parsec_dtd_ordering_correctly( parsec_execution_stream_t *es,
                        current_desc->super.data[desc_flow_index].data_in = current_task->super.data[current_dep].data_out;
                         /* We retain local, remote data for each successor */
                         parsec_dtd_retain_data_copy(current_task->super.data[current_dep].data_out);
+                    } else if( !message_reader && parsec_dtd_task_is_local(current_task) &&
+                               !(PARSEC_OUTPUT == desc_op_type || PARSEC_INOUT == desc_op_type) ) {
+                        /* A reader on another rank reads the copy through the message
+                         * that carries it there, and the message counts itself among the
+                         * readers only once it is activated, after this walk. Before that
+                         * the walk may tell the tile that this reader is its last user,
+                         * and from then on a writer inserted on the tile is released by
+                         * its own insertion and checks the readers at once. Count one for
+                         * the message until it counts itself.
+                         */
+                        parsec_dtd_data_copy_reader_retain(current_task->super.data[current_dep].data_out);
+                        message_reader = 1;
                     }
                 }
 
@@ -350,6 +363,11 @@ parsec_dtd_ordering_correctly( parsec_execution_stream_t *es,
                 arg->remote_deps = NULL;
             }
 #endif
+            if( message_reader ) {
+                /* The message now counts itself, or no message was needed: the
+                 * rank of the reader already has the data from an earlier one. */
+                parsec_dtd_data_copy_reader_release(current_task->super.data[current_dep].data_out);
+            }
         }
     }
 }

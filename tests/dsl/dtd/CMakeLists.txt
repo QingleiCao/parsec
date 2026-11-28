@@ -30,6 +30,13 @@ parsec_addtest_executable(C dtd_test_explicit_task_creation SOURCES dtd_test_exp
 parsec_addtest_executable(C dtd_test_task_class_release SOURCES dtd_test_task_class_release.c)
 parsec_addtest_executable(C dtd_test_tp_enqueue_dequeue SOURCES dtd_test_tp_enqueue_dequeue.c)
 parsec_addtest_executable(C dtd_test_interleave_actions SOURCES dtd_test_interleave_actions.c)
+parsec_addtest_executable(C dtd_test_war_remote_reader SOURCES dtd_test_war_remote_reader.c)
+# timer_create() lives in librt before glibc 2.34
+include(CheckLibraryExists)
+check_library_exists(rt timer_create "" PARSEC_TESTS_HAVE_TIMER_CREATE_IN_RT)
+if(PARSEC_TESTS_HAVE_TIMER_CREATE_IN_RT)
+  target_link_libraries(dtd_test_war_remote_reader PRIVATE rt)
+endif(PARSEC_TESTS_HAVE_TIMER_CREATE_IN_RT)
 if( PARSEC_HAVE_MPI )
   parsec_addtest_executable(C dtd_test_ce SOURCES dtd_test_ce.c)
 endif( PARSEC_HAVE_MPI )
