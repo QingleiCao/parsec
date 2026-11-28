@@ -3719,7 +3719,7 @@ So the simulator computes on one thread unless told, and the option decides. The
   - *The results of a job can be taken twice*, and *a tag the adapter has gets a second job*, both in the protocol half and both older than this milestone: the adapter backend asks neither of an adapter that works. `qpu_adapter_sessions` asks both now.
   - *Any option of a target is taken*, later with *an option may be written short* and *an adapter starts where another one listens*: the three tests of what the adapter says.
 - **The last pass, on the last version: 59 of 63.** The four that no test notices, and what holds them:
-  - *`--qpu` is ignored.* By hand, on two A100: with CUDA-Q's platform of two QPUs and `--qpu 1`, blocks of 28 qubits took the second GPU to 2.5 GiB and 94%, and the first to 0.4 GiB and 3% (table above).
+  - *`--qpu` is ignored.* By hand, on two A100: with CUDA-Q's platform of two QPUs and `--qpu 1`, blocks of 28 qubits took the second GPU to 2.5 GiB and 93%, and the first to 0.4 GiB and 6% (table above).
   - *The CPU simulator is not told its threads*, and *`--threads` does not decide where the environment says something.* By hand, by the CPU time of the adapter (table above).
   - *The adapter for the CPU simulator lets CUDA-Q see the GPUs.* By hand on methane, whose A100 the adapter could see: no process on the GPU while it ran the statistical test.
 - **Every bug in what a circuit means is noticed**: 14 of 14 in the lowering, 4 of 4 in the results, 5 of 5 in the reader, 4 of 4 in the seeds and the one job at a time. So are 17 of 17 in the guard script, by its self-test, and 9 of 9 in the protocol half.
